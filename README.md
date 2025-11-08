@@ -1,2 +1,3 @@
-# ontology-based-KGEnerator
-Backward-chaining ontology-based datagenerator for Knowledge Graph Embedding models.
+# Ontology-based data generator for KGE models
+
+Backward-chaining ontology-based data generator for Knowledge Graph Embedding models.
