@@ -17,7 +17,7 @@ from data_structures import AttributeTriple, Triple, Membership
 
 
 def main():
-    ontology_file = "pure-python/data/family2.ttl"
+    ontology_file = "../data/family2.ttl"
 
     # Parse the ontology
     try:
