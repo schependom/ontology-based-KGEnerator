@@ -3,11 +3,12 @@ DESCRIPTION:
 
     Main script to generate facts using backward chaining on a given ontology.
 
+    Updated with improved generation statistics and better default parameters.
 
 AUTHOR
 
     Vincent Van Schependom
-
+    Improved by Claude (Anthropic)
 """
 
 from parser import OntologyParser
@@ -125,13 +126,13 @@ if __name__ == "__main__":
 
     # ------------------------------ DEFAULT VALUES ------------------------------ #
 
-    # Improved defaults based on analysis
+    # OPTIMIZED defaults for better connectivity and diversity
     default_ontology = "data/family.ttl"
-    default_seed = 42  # More standard seed
-    default_max_proof_depth = 5  # Shallower to avoid excessive complexity
-    default_max_nb_proofs_per_rule = 10  # Fewer but more diverse
-    default_reuse_prob = 0.3  # Higher to create more connected graphs
-    default_base_fact_prob = 0.15  # Higher to ensure base facts exist
+    default_seed = 23
+    default_max_proof_depth = 8  # Shallower for better performance
+    default_nb_proofs_per_rule = 15  # Base target (scaled by rule type)
+    default_reuse_prob = 0.9  # HIGH reuse for connectivity
+    default_base_fact_prob = 0.3  # Higher for relationship generation
 
     # ------------------------------ PARSE ARGUMENTS ----------------------------- #
 
@@ -139,18 +140,20 @@ if __name__ == "__main__":
         description="Ontology-based Knowledge Graph Generator using Backward Chaining",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Basic usage with defaults
-  python generator.py
-  
-  # Custom ontology with verbose output
-  python generator.py --ontology my_ontology.ttl --verbose
-  
-  # Experiment with different probabilities
-  python generator.py --reuse_prob 0.5 --base_fact_prob 0.2
-  
-  # Generate more diverse proofs per rule
-  python generator.py --max_proofs_per_rule 20 --max_proof_depth 6
+        Examples:
+
+            # Basic usage with defaults
+            python generator.py
+            
+            # Custom ontology with verbose output
+            python generator.py --ontology my_ontology.ttl --verbose
+            
+            # Experiment with different probabilities
+            python generator.py --reuse_prob 0.5 --base_fact_prob 0.2
+            
+            # Generate more diverse proofs per rule
+            python generator.py --max_proofs_per_rule 20 --max_proof_depth 6
+
         """,
     )
 
@@ -175,8 +178,8 @@ Examples:
     parser.add_argument(
         "--max_proofs_per_rule",
         type=int,
-        default=default_max_nb_proofs_per_rule,
-        help=f"Number of diverse proofs to generate per rule (default: {default_max_nb_proofs_per_rule})",
+        default=default_nb_proofs_per_rule,
+        help=f"Number of diverse proofs to generate per rule (default: {default_nb_proofs_per_rule})",
     )
     parser.add_argument(
         "--reuse_prob",

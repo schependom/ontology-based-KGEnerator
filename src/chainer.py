@@ -107,13 +107,18 @@ class BackwardChainingGenerator:
         self.ind_counter = 0
 
         # A HashSet to quickly check for existing facts
-        # -> avoid duplicates and speed up constraint checking
         self.kg_fact_cache: Set[int] = set()
 
         # ----------------------------------- RULES ---------------------------------- #
 
         self.rules_to_cover: List[ExecutableRule] = list(self.ontology.rules)
-        random.shuffle(self.rules_to_cover)  # Randomize rule order
+
+        # Separate rules by type for two-phase generation
+        self.relationship_rules: List[ExecutableRule] = []
+        self.class_hierarchy_rules: List[ExecutableRule] = []
+        self.other_rules: List[ExecutableRule] = []
+
+        self._categorize_rules()
 
         self.covered_rules: Set[str] = set()
 
@@ -132,11 +137,80 @@ class BackwardChainingGenerator:
         self.individuals_reused = 0
 
     # ---------------------------------------------------------------------------- #
+    #                              CATEGORIZE RULES                                #
+    # ---------------------------------------------------------------------------- #
+
+    def _categorize_rules(self):
+        """Categorize rules by what they generate for prioritization"""
+        for rule in self.rules_to_cover:
+            # Check if conclusion creates a relationship
+            if isinstance(rule.conclusion.predicate, Relation):
+                self.relationship_rules.append(rule)
+            # Check if conclusion creates class membership
+            elif rule.conclusion.predicate == RDF.type:
+                self.class_hierarchy_rules.append(rule)
+            else:
+                self.other_rules.append(rule)
+
+        # Shuffle within categories
+        random.shuffle(self.relationship_rules)
+        random.shuffle(self.class_hierarchy_rules)
+        random.shuffle(self.other_rules)
+
+        if self.verbose:
+            print("Categorized rules:", file=sys.stderr)
+            print(
+                f"  - Relationship rules: {len(self.relationship_rules)}",
+                file=sys.stderr,
+            )
+            print(
+                f"  - Class hierarchy rules: {len(self.class_hierarchy_rules)}",
+                file=sys.stderr,
+            )
+            print(f"  - Other rules: {len(self.other_rules)}", file=sys.stderr)
+
+    # ---------------------------------------------------------------------------- #
+    #                             CALCULATE RULE WEIGHT                            #
+    # ---------------------------------------------------------------------------- #
+
+    def _calculate_rule_target_proofs(
+        self, rule: ExecutableRule, base_target: int
+    ) -> int:
+        """
+        Calculate how many proofs to generate for this rule based on its type.
+        We need to balance relationship rules vs. class hierarchy rules.
+
+        Args:
+            rule:           The rule to calculate target for
+            base_target:    Base number of proofs requested per rule
+
+        Returns:
+            Adjusted number of target proofs
+        """
+        # Relationship rules get MORE proofs (they create graph structure)
+        if isinstance(rule.conclusion.predicate, Relation):
+            return base_target * 4
+
+        # Class hierarchy rules get FEWER proofs (they create isolated individuals)
+        elif rule.conclusion.predicate == RDF.type:
+            return max(2, base_target // 2)
+
+        # Attribute rules get base amount
+        else:
+            return base_target
+
+    # ---------------------------------------------------------------------------- #
     #                              INDEX CONSTRAINTS                               #
     # ---------------------------------------------------------------------------- #
 
     def _index_constraints(self):
-        """Index constraints by relevant properties and classes for efficient lookup"""
+        """
+        Index constraints by relevant properties and classes for efficient lookup.
+        This function populates:
+            - self.all_constraints
+            - self.constraints_by_property
+            - self.constraints_by_class
+        """
         for constraint in self.ontology.constraints:
             self.all_constraints.append(constraint)
 
@@ -164,6 +238,7 @@ class BackwardChainingGenerator:
     def _get_or_create_individual(
         self,
         required_class: Optional[Class] = None,
+        reuse_override: Optional[float] = None,
     ) -> Individual:
         """
         Creates a new individual or reuses an existing one from the KG with a certain probability.
@@ -171,9 +246,15 @@ class BackwardChainingGenerator:
 
         Args:
             required_class: If specified, only reuse individuals that are members of this class.
+            reuse_override: If specified, use this reuse probability instead of self.reuse_prob
         """
+
+        # Determine reuse probability.
+        # -> reuse_override takes precedence over self.reuse_prob (graph-wide)
+        reuse_prob = reuse_override if reuse_override is not None else self.reuse_prob
+
         # Reuse existing individual from KG
-        if self.kg.individuals and random.random() < self.reuse_prob:
+        if self.kg.individuals and random.random() < reuse_prob:
             candidates = self.kg.individuals
 
             # Filter by required class if specified
@@ -185,11 +266,11 @@ class BackwardChainingGenerator:
                 ]
 
             if candidates:
-                if self.verbose:
-                    print(
-                        f"Reusing existing individual (class filter: {required_class.name if required_class else 'none'})",
-                        file=sys.stderr,
-                    )
+                # if self.verbose:
+                #     print(
+                #         f"Reusing existing individual (class filter: {required_class.name if required_class else 'none'})",
+                #         file=sys.stderr,
+                #     )
                 self.individuals_reused += 1
                 return random.choice(candidates)
 
@@ -211,9 +292,17 @@ class BackwardChainingGenerator:
         bindings: Dict[Var, Any],  # Current variable bindings
         create_new: bool = True,  # Whether to create a new Individual for unbound Vars
         required_class: Optional[Class] = None,  # Type hint for new individuals
+        reuse_override: Optional[float] = None,
     ) -> Optional[Individual]:
         """
         Resolves a term to an Individual.
+
+        Args:
+            term:              The Term (Var, Individual) to resolve.
+            bindings:          Current variable bindings.
+            create_new:        Whether to create a new Individual for unbound Vars.
+            required_class:    If specified, new Individuals will be of this class.
+            reuse_override:    If specified, use this reuse probability instead of graph-wide self.reuse_prob.
         """
 
         # -------------------------------- INDIVIDUAL -------------------------------- #
@@ -236,7 +325,9 @@ class BackwardChainingGenerator:
 
             # Not bound and allowed to create
             elif create_new:
-                new_ind = self._get_or_create_individual(required_class=required_class)
+                new_ind = self._get_or_create_individual(
+                    required_class=required_class, reuse_override=reuse_override
+                )
                 bindings[term] = new_ind
                 return new_ind
 
@@ -541,7 +632,15 @@ class BackwardChainingGenerator:
     ) -> str:
         """
         Create a signature representing the structure of the proof.
+        A 'signature' is a sorted concatenation of fact types and predicates/classes used, like "T:knows|M:Person|A:age".
+
         This helps ensure we generate diverse proofs, not just duplicate structures.
+
+        Args:
+            facts:  List of facts in the proof.
+
+        Returns:
+            A string signature representing the proof structure.
         """
         sig_parts = []
         for fact in facts:
@@ -554,7 +653,7 @@ class BackwardChainingGenerator:
         return "|".join(sorted(sig_parts))
 
     # ---------------------------------------------------------------------------- #
-    #                     PURE BACKWARD-CHAINING GENERATOR                         #
+    #                     TWO-PHASE BACKWARD-CHAINING GENERATOR                    #
     # ---------------------------------------------------------------------------- #
 
     def generate(
@@ -565,52 +664,159 @@ class BackwardChainingGenerator:
         """
         Main generation loop. Tries to cover all rules via backward-chaining.
 
+        We do two-phase generation:
+            1) First cover relationship rules to build connectivity
+            2) Then cover class hierarchy and other rules
+
+        This is because relationship rules create the graph structure, while class hierarchy
+        rules (easier to satisfy) tend to create isolated individuals.
+
         Args:
             max_depth:              Maximum recursion depth for backward-chaining.
             num_proofs_per_rule:    Number of diverse proofs to generate per rule.
+
+        Returns:
+            The generated KnowledgeGraph.
         """
-        print("--- Starting Generation ---")
+        #
+        print("=" * 70)
+        print("STARTING TWO-PHASE GENERATION")
+        print("=" * 70)
         print(f"Targeting {len(self.rules_to_cover)} rules.")
 
-        # Copy the rules to cover
-        rules_to_try = self.rules_to_cover.copy()
+        # -------------------------- PHASE 1: RELATIONSHIPS -------------------------- #
 
-        # ---------------------------------------------------------------------------- #
-        #                                LOOP OVER RULES                               #
-        # ---------------------------------------------------------------------------- #
+        print("\n PHASE 1: Building Relationship Graph")
+        print(f"  - Processing {len(self.relationship_rules)} relationship rules.")
+        print("  - Using HIGH reuse probability for connectivity.")
 
-        # Loop over rules
-        for rule in rules_to_try:
+        self._generate_proofs_for_phase(
+            rules=self.relationship_rules,
+            max_depth=max_depth,
+            num_proofs_per_rule=num_proofs_per_rule,
+            phase_name="RELATIONSHIPS",
+        )
+
+        # Print intermediate stats
+        rel_facts = len(self.kg.triples)
+        connected = len(
+            set(
+                [t.subject for t in self.kg.triples]
+                + [t.object for t in self.kg.triples]
+            )
+        )
+        print(
+            f"\n  ✓ Phase 1 complete: {rel_facts} relationships, {connected} connected individuals"
+        )
+
+        # ------------------------- PHASE 2: CLASS HIERARCHY ------------------------- #
+
+        print("\n PHASE 2: Inferring Class Memberships")
+        print(f"  - Processing {len(self.class_hierarchy_rules)} class hierarchy rules")
+        print("  - Using LOWER reuse to allow type diversity")
+
+        self._generate_proofs_for_phase(
+            rules=self.class_hierarchy_rules,
+            max_depth=max_depth,
+            num_proofs_per_rule=num_proofs_per_rule,
+            phase_name="CLASS_HIERARCHY",
+        )
+
+        # -------------------------------- OTHER RULES ------------------------------- #
+        # E.g. attribute rules, ...
+
+        if self.other_rules:
+            print(" PHASE 3: Other Rules")
+            print(f"  - Processing {len(self.other_rules)} other rules")
+
+            self._generate_proofs_for_phase(
+                rules=self.other_rules,
+                max_depth=max_depth,
+                num_proofs_per_rule=num_proofs_per_rule,
+                phase_name="OTHER",
+            )
+
+        # ============================== COMPLETE ================================== #
+
+        self._print_generation_summary()
+        return self.kg
+
+    # ---------------------------------------------------------------------------- #
+    #                                 SINGLE PHASE                                 #
+    # ---------------------------------------------------------------------------- #
+
+    def _generate_proofs_for_phase(
+        self,
+        rules: List[ExecutableRule],
+        max_depth: int,
+        num_proofs_per_rule: int,
+        phase_name: str,
+    ):
+        """
+        Generate proofs for a set of rules in a single phase.
+
+        Args:
+            rules:                  List of rules to cover in this phase.
+            max_depth:              Maximum recursion depth for backward-chaining.
+            num_proofs_per_rule:    Number of diverse proofs to generate per rule.
+            phase_name:             Name of the phase (for logging).
+        """
+        for rule in rules:
+            #
+            # Calculate how many proofs to generate for this rule
+            target_proofs = self._calculate_rule_target_proofs(
+                rule, num_proofs_per_rule
+            )
+
+            # Track successful proofs and attempts
             successful_proofs = 0
             attempts = 0
-            max_attempts = num_proofs_per_rule * 5  # Allow more attempts for diversity
+            max_attempts = target_proofs * 10  # TODO alterable
 
-            # ---------------------------------------------------------------------------- #
-            #                          TRY MULTIPLE DIVERSE PROOFS                         #
-            # ---------------------------------------------------------------------------- #
+            # --------------------------------- MAIN LOOP -------------------------------- #
 
-            while successful_proofs < num_proofs_per_rule and attempts < max_attempts:
+            # We want to generate `target_proofs` diverse proofs for this rule
+            # but the maximum number of attempts is capped to avoid infinite loops
+            while successful_proofs < target_proofs and attempts < max_attempts:
                 attempts += 1
 
-                if self.verbose:
-                    print(
-                        f"----------------\nAttempting to cover rule: {rule.name} "
-                        f"(proof {successful_proofs + 1}/{num_proofs_per_rule}, attempt {attempts}/{max_attempts})",
-                        file=sys.stderr,
-                    )
+                # if self.verbose:
+                #     print(
+                #         f"\n[{phase_name}] Rule: {rule.name} "
+                #         f"(proof {successful_proofs + 1}/{target_proofs}, attempt {attempts})",
+                #         file=sys.stderr,
+                #     )
 
-                # ------------- VARY GENERATION STRATEGY BASED ON PROOF NUMBER -------------- #
+                # --------------------------- GENERATION STRATEGIES -------------------------- #
 
-                # Vary base_fact_prob to explore different proof strategies
-                if successful_proofs < num_proofs_per_rule // 3:
-                    # First third: prefer shallow proofs (more base facts)
-                    proof_base_prob = min(0.4, self.base_fact_prob * 8)
-                elif successful_proofs < 2 * num_proofs_per_rule // 3:
-                    # Second third: prefer deep proofs (fewer base facts)
-                    proof_base_prob = self.base_fact_prob * 0.3
+                # TODO: Finetune the probabilities
+
+                # RELATIONSHIPS
+                #   -> HIGH reuse (creates connectivity)
+                if phase_name == "RELATIONSHIPS":
+                    reuse_override = 0.9
+                    proof_base_prob = 0.4  # Prefer base facts for relationships
+
+                # CLASS MEMBERSHIPS
+                #   -> LOWER reuse (allows type diversity)
+                elif phase_name == "CLASS_HIERARCHY":
+                    reuse_override = 0.2
+
+                    # Vary base fact probability to get diversity
+                    if successful_proofs < target_proofs // 2:
+                        # Shallow proofs in the first half
+                        proof_base_prob = 0.5
+                    else:
+                        # Deeper proofs in the second half
+                        proof_base_prob = 0.1
+
+                # ATTRIBUTES / OTHER
+                #   -> Use graph-wide settings
                 else:
-                    # Last third: normal probability
+                    reuse_override = self.reuse_prob
                     proof_base_prob = self.base_fact_prob
+
+                # -------------------------- SETUP FOR PROOF ATTEMPT ------------------------- #
 
                 # Keep track of variable bindings
                 bindings: Dict[Var, Union[Individual, LiteralValue]] = {}
@@ -618,11 +824,11 @@ class BackwardChainingGenerator:
                 # Collect all facts that were created when trying to prove the premises
                 all_premise_facts: List[Union[Triple, Membership, AttributeTriple]] = []
 
-                # ------------------------ TRY TO SATISFY THE PREMISES ----------------------- #
+                # ------------------------ PROVE ALL PREMISES OF RULE ----------------------- #
 
                 all_premises_satisfied = True
 
-                # Loop over premises and try to satisfy them
+                # Loop over each premise in the rule and try to satisfy it
                 for premise in rule.premises:
                     # Try to satisfy the premise using Backward-Chaining
                     success, facts_for_premise = self._generate_goal(
@@ -632,16 +838,12 @@ class BackwardChainingGenerator:
                         allow_base_case=True,
                         base_fact_prob_override=proof_base_prob,
                         max_depth_context=max_depth,
+                        reuse_override=reuse_override,
                     )
 
                     # If any premise fails, the whole rule fails
                     if not success:
                         all_premises_satisfied = False
-                        if self.verbose:
-                            print(
-                                f"Failed to satisfy premise {premise} for rule {rule.name}.",
-                                file=sys.stderr,
-                            )
                         break
 
                     # Collect all premise facts
@@ -669,10 +871,10 @@ class BackwardChainingGenerator:
                     # Check for duplicate proof structure
                     proof_sig = self._create_proof_signature(generated_facts)
                     if proof_sig in self.proof_structures[rule.name]:
-                        if self.verbose:
-                            print(
-                                "Duplicate proof structure, trying different approach..."
-                            )
+                        # if self.verbose:
+                        #     print(
+                        #         "  Duplicate proof structure, trying different approach..."
+                        #     )
                         continue
 
                     # Check all generated facts for duplicates/constraints
@@ -688,11 +890,9 @@ class BackwardChainingGenerator:
                             fact, proof_cache, proof_being_built=generated_facts
                         ):
                             all_facts_valid = False
-                            if self.verbose:
-                                print(f"Proof failed constraint check for fact: {fact}")
                             break
 
-                        # Valid, so add to proof cache
+                        # Valid, so add to proof-level cache
                         proof_cache.add(hash(fact))
 
                     # ------------------------- ALL FACTS VALID, ADD TO KG ------------------------ #
@@ -702,7 +902,7 @@ class BackwardChainingGenerator:
                         self.proof_structures[rule.name].add(proof_sig)
                         successful_proofs += 1
 
-                        # Add all generated facts to the KG
+                        # Add all generated facts to the KG in correct order
                         for fact in reversed(generated_facts):
                             if hash(fact) not in self.kg_fact_cache:
                                 self._add_fact_to_kg(fact)
@@ -710,21 +910,14 @@ class BackwardChainingGenerator:
                         # Mark rule as covered
                         self.covered_rules.add(rule.name)
 
-                        if self.verbose:
-                            print(
-                                f"Successfully generated proof {successful_proofs} for rule {rule.name}"
-                            )
+                        # if self.verbose:
+                        #     print(
+                        #         f"  Proof {successful_proofs}/{target_proofs} successful"
+                        #     )
 
             # Record number of attempts for this rule
             if rule.name in self.covered_rules:
                 self.nb_proofs_attempted[rule.name] = attempts
-
-        # ---------------------------------------------------------------------------- #
-        #                               END OF GENERATION                              #
-        # ---------------------------------------------------------------------------- #
-
-        self._print_generation_summary()
-        return self.kg
 
     # ---------------------------------------------------------------------------- #
     #                    BACKWARD CHAIN DOWN IN THE PROOF TREE                     #
@@ -738,6 +931,7 @@ class BackwardChainingGenerator:
         allow_base_case: bool = True,
         base_fact_prob_override: Optional[float] = None,
         max_depth_context: Optional[int] = None,
+        reuse_override: Optional[float] = None,
     ) -> Tuple[bool, List[Union[Triple, Membership, AttributeTriple]]]:
         """
         Recursively try to prove the goal by either:
@@ -745,12 +939,13 @@ class BackwardChainingGenerator:
            - creating a base fact that matches the goal
 
         Args:
-            goal:                   The goal pattern to satisfy.
-            depth:                  Remaining recursion depth.
-            bindings:               Current variable bindings.
-            allow_base_case:        Whether to allow generating base facts.
+            goal:                    The goal pattern to satisfy.
+            depth:                   Remaining recursion depth.
+            bindings:                Current variable bindings.
+            allow_base_case:         Whether to allow generating base facts.
             base_fact_prob_override: Override for base_fact_prob (for proof diversity).
-            max_depth_context:      Original max depth (for depth-dependent probability).
+            max_depth_context:       Original max depth (for depth-dependent probability).
+            reuse_override:          Override for reuse probability (for proof diversity).
 
         Returns:
             A tuple (success, generated_facts).
@@ -763,14 +958,26 @@ class BackwardChainingGenerator:
         if max_depth_context is None:
             max_depth_context = depth
 
-        depth_ratio = 1 - (depth / max_depth_context)  # 0 at top, 1 at bottom
+        # -------------------------- ADJUST BASE PROBABILITY ------------------------- #
+
+        # Depth ratio: 1.0 at root, 0.0 at max depth
+        depth_ratio = 1 - (depth / max_depth_context)
         base_prob = (
             base_fact_prob_override if base_fact_prob_override else self.base_fact_prob
         )
 
+        # TODO Finetune the formulas below
+
         # Increase probability of base facts as we go deeper
         adjusted_base_prob = base_prob + (depth_ratio * 0.25)
+
+        # BOOST for relationship goals (they create graph structure!)
+        if isinstance(goal.predicate, Relation):
+            adjusted_base_prob = min(0.8, adjusted_base_prob * 1.5)
+
         adjusted_base_prob = min(0.7, adjusted_base_prob)  # Cap at 70%
+
+        # ---------------------------- RULES AND BINDINGS ---------------------------- #
 
         # Find rules from the ontology that can conclude this goal
         applicable_rules = [
@@ -783,17 +990,17 @@ class BackwardChainingGenerator:
         # ------------------- CREATE A BASE FACT WITH PROBABILITY p ------------------ #
 
         if allow_base_case and random.random() < adjusted_base_prob:
-            if self.verbose:
-                if applicable_rules:
-                    print(
-                        f"Found {len(applicable_rules)} applicable rules, but opting for base case "
-                        f"(prob={adjusted_base_prob:.2f}, depth={depth}/{max_depth_context})"
-                    )
-                else:
-                    print(
-                        f"No applicable rules found, creating base fact for goal {goal} "
-                        f"(depth={depth}/{max_depth_context})"
-                    )
+            # if self.verbose:
+            #     if applicable_rules:
+            #         print(
+            #             f"Found {len(applicable_rules)} applicable rules, but opting for base case "
+            #             f"(prob={adjusted_base_prob:.2f}, depth={depth}/{max_depth_context})"
+            #         )
+            #     else:
+            #         print(
+            #             f"No applicable rules found, creating base fact for goal {goal} "
+            #             f"(depth={depth}/{max_depth_context})"
+            #         )
 
             # Create base fact
             success, base_fact = self._try_create_base_fact(goal, temp_bindings)
@@ -832,6 +1039,7 @@ class BackwardChainingGenerator:
                     allow_base_case=True,
                     base_fact_prob_override=base_fact_prob_override,
                     max_depth_context=max_depth_context,
+                    reuse_override=reuse_override,
                 )
 
                 if not success:
@@ -854,8 +1062,8 @@ class BackwardChainingGenerator:
                     return (True, all_premise_facts + [inferred_fact])
 
         # If we get here, we failed to prove the goal
-        if self.verbose:
-            print(f"Failed to prove goal {goal} at depth {depth}.", file=sys.stderr)
+        # if self.verbose:
+        #     print(f"Failed to prove goal {goal} at depth {depth}.", file=sys.stderr)
         return (False, [])
 
     # ---------------------------------------------------------------------------- #
@@ -863,20 +1071,41 @@ class BackwardChainingGenerator:
     # ---------------------------------------------------------------------------- #
 
     def _try_create_base_fact(
-        self, goal: GoalPattern, bindings: Dict[Var, Any]
+        self,
+        goal: GoalPattern,
+        bindings: Dict[Var, Any],
+        reuse_override: Optional[bool] = None,
     ) -> Tuple[bool, Optional[Union[Triple, Membership, AttributeTriple]]]:
         """
         Tries to create a single base fact matching the goal.
+
+        Args:
+            goal:           The goal pattern to match.
+            bindings:       Current variable bindings.
+            reuse_override: Override for reuse probability (for proof diversity).
         """
 
         # Determine required class for type-aware individual creation
         required_class = None
         if goal.predicate == RDF.type and isinstance(goal.object, Class):
             required_class = goal.object
+        else:
+            # TODO Try to get required class from domain constraints
+            pass
+
+        # if not required_class:
+        #     print(
+        #         f"No required class determined for base fact creation for goal {goal}.",
+        #         file=sys.stderr,
+        #     )
 
         # Resolve subject
         subject = self._resolve_term(
-            goal.subject, bindings, create_new=True, required_class=required_class
+            goal.subject,
+            bindings,
+            create_new=True,
+            required_class=required_class,
+            reuse_override=reuse_override,
         )
         if not subject:
             return (False, None)
@@ -906,12 +1135,18 @@ class BackwardChainingGenerator:
                         range_class = potential_class
                         break
 
+            # Resolve object, just like we did for subject
             object_ind = self._resolve_term(
-                goal.object, bindings, create_new=True, required_class=range_class
+                goal.object,
+                bindings,
+                create_new=True,
+                required_class=range_class,
+                reuse_override=reuse_override,
             )
             if not object_ind:
                 return (False, None)
 
+            # The new triple
             new_fact = Triple(
                 subject=subject,
                 predicate=goal.predicate,
@@ -1094,46 +1329,72 @@ class BackwardChainingGenerator:
     #                         GENERATION SUMMARY & STATISTICS                      #
     # ---------------------------------------------------------------------------- #
 
+    # ---------------------------------- SUMMARY --------------------------------- #
+
     def _print_generation_summary(self) -> None:
-        """Print summary of generation process"""
-        print("\n--- Generation Complete ---")
+        """
+        Print summary of generation process
+        """
+
+        print("\n" + "=" * 70)
+        print("GENERATION COMPLETE")
+        print("=" * 70)
+
         all_rule_names = {r.name for r in self.ontology.rules}
         uncovered_rule_names = all_rule_names - self.covered_rules
 
-        print(f"Covered {len(self.covered_rules)}/{len(all_rule_names)} rules.")
+        print(f"\n Coverage: {len(self.covered_rules)}/{len(all_rule_names)} rules")
 
         if uncovered_rule_names:
-            print(f"\nNot covered rules ({len(uncovered_rule_names)}):")
+            print(f"\n   Uncovered rules ({len(uncovered_rule_names)}):")
             for r_name in sorted(list(uncovered_rule_names))[:10]:
-                print(f"  - {r_name}")
+                print(f"     - {r_name}")
             if len(uncovered_rule_names) > 10:
-                print(f"  ... and {len(uncovered_rule_names) - 10} more.")
+                print(f"     ... and {len(uncovered_rule_names) - 10} more.")
 
-        print(f"\nTotal Individuals: {len(self.kg.individuals)}")
-        print(f"  - Created: {self.individuals_created}")
-        print(f"  - Reused: {self.individuals_reused}")
-        print(f"Total Triples: {len(self.kg.triples)}")
-        print(f"Total Memberships: {len(self.kg.memberships)}")
-        print(f"Total Attribute Triples: {len(self.kg.attribute_triples)}")
+        print("\n Generated Facts:")
+        print(f"   - Total Individuals: {len(self.kg.individuals)}")
+        print(f"     • Created: {self.individuals_created}")
+        print(f"     • Reused: {self.individuals_reused}")
+        print(f"   - Total Triples (relationships): {len(self.kg.triples)}")
+        print(f"   - Total Memberships (types): {len(self.kg.memberships)}")
+        print(f"   - Total Attribute Triples: {len(self.kg.attribute_triples)}")
+
+    # -------------------------------- STATISTICS -------------------------------- #
 
     def print_generation_statistics(self) -> None:
-        """Print detailed statistics about the generated KG"""
+        """
+        Print detailed statistics about the generated KG
+        """
         print("\n" + "=" * 70)
-        print("GENERATION STATISTICS")
+        print("DETAILED GENERATION STATISTICS")
         print("=" * 70)
 
-        # Rule coverage details
-        print("\n RULE COVERAGE")
-        print(f"  Covered: {len(self.covered_rules)}/{len(self.ontology.rules)}")
+        # Rule coverage details by category
+        print("\n RULE COVERAGE BY CATEGORY")
+
+        rel_covered = len(
+            [r for r in self.relationship_rules if r.name in self.covered_rules]
+        )
+        class_covered = len(
+            [r for r in self.class_hierarchy_rules if r.name in self.covered_rules]
+        )
+        other_covered = len(
+            [r for r in self.other_rules if r.name in self.covered_rules]
+        )
+
+        print(f"   Relationship Rules: {rel_covered}/{len(self.relationship_rules)}")
+        print(
+            f"   Class Hierarchy Rules: {class_covered}/{len(self.class_hierarchy_rules)}"
+        )
+        print(f"   Other Rules: {other_covered}/{len(self.other_rules)}")
 
         if self.covered_rules:
-            print("\n  Proofs generated per covered rule:")
+            print("\n   Proofs generated per covered rule:")
             for rule_name in sorted(self.covered_rules):
                 num_proofs = len(self.proof_structures.get(rule_name, set()))
                 attempts = self.nb_proofs_attempted.get(rule_name, 0)
-                print(
-                    f"    {rule_name}: {num_proofs} diverse proofs ({attempts} attempts)"
-                )
+                print(f"     {rule_name}: {num_proofs} proofs ({attempts} attempts)")
 
         # Connectivity analysis
         print("\n GRAPH CONNECTIVITY")
@@ -1149,9 +1410,9 @@ class BackwardChainingGenerator:
             else 0
         )
         print(
-            f"  Connected individuals: {len(connected_individuals)}/{len(self.kg.individuals)} ({connectivity_ratio:.1f}%)"
+            f"   Connected individuals: {len(connected_individuals)}/{len(self.kg.individuals)} ({connectivity_ratio:.1f}%)"
         )
-        print(f"  Isolated individuals: {isolated}")
+        print(f"   Isolated individuals: {isolated}")
 
         # Fact distribution
         all_facts = self.kg.triples + self.kg.memberships + self.kg.attribute_triples
@@ -1159,12 +1420,27 @@ class BackwardChainingGenerator:
         inferred_facts = [f for f in all_facts if f.is_inferred]
 
         print("\n FACT DISTRIBUTION")
-        print(f"  Total facts: {len(all_facts)}")
+        print(f"   Total facts: {len(all_facts)}")
         print(
-            f"  Base facts: {len(base_facts)} ({len(base_facts) / len(all_facts) * 100:.1f}%)"
+            f"   Base facts: {len(base_facts)} ({len(base_facts) / len(all_facts) * 100:.1f}%)"
         )
         print(
-            f"  Inferred facts: {len(inferred_facts)} ({len(inferred_facts) / len(all_facts) * 100:.1f}%)"
+            f"   Inferred facts: {len(inferred_facts)} ({len(inferred_facts) / len(all_facts) * 100:.1f}%)"
+        )
+
+        # Break down by type
+        rel_facts = len(self.kg.triples)
+        mem_facts = len(self.kg.memberships)
+        attr_facts = len(self.kg.attribute_triples)
+        print("\n   By type:")
+        print(
+            f"     Relationships: {rel_facts} ({rel_facts / len(all_facts) * 100:.1f}%)"
+        )
+        print(
+            f"     Memberships: {mem_facts} ({mem_facts / len(all_facts) * 100:.1f}%)"
+        )
+        print(
+            f"     Attributes: {attr_facts} ({attr_facts / len(all_facts) * 100:.1f}%)"
         )
 
         # Relation usage
@@ -1175,7 +1451,7 @@ class BackwardChainingGenerator:
         if relation_counts:
             print("\n RELATION USAGE")
             for rel, count in sorted(relation_counts.items(), key=lambda x: -x[1]):
-                print(f"  {rel}: {count}")
+                print(f"   {rel}: {count}")
 
         # Class membership distribution
         class_counts = defaultdict(int)
@@ -1184,8 +1460,10 @@ class BackwardChainingGenerator:
 
         if class_counts:
             print("\n CLASS MEMBERSHIP DISTRIBUTION")
-            for cls, count in sorted(class_counts.items(), key=lambda x: -x[1]):
-                print(f"  {cls}: {count}")
+            for cls, count in sorted(class_counts.items(), key=lambda x: -x[1])[:15]:
+                print(f"   {cls}: {count}")
+            if len(class_counts) > 15:
+                print(f"   ... and {len(class_counts) - 15} more classes")
 
         # Attribute usage
         attribute_counts = defaultdict(int)
@@ -1193,30 +1471,41 @@ class BackwardChainingGenerator:
             attribute_counts[attr_triple.predicate.name] += 1
 
         if attribute_counts:
-            print("\n ATTRIBUTE USAGE")
+            print("\n  ATTRIBUTE USAGE")
             for attr, count in sorted(attribute_counts.items(), key=lambda x: -x[1]):
-                print(f"  {attr}: {count}")
+                print(f"   {attr}: {count}")
 
         # Generation efficiency
         print("\n GENERATION EFFICIENCY")
-        print(f"  Failed constraint checks: {self.failed_constraint_checks}")
-        print(f"  Duplicate facts encountered: {self.duplicate_facts}")
+        print(f"   Individuals created: {self.individuals_created}")
+        print(f"   Individuals reused: {self.individuals_reused}")
+        if self.individuals_created + self.individuals_reused > 0:
+            reuse_rate = (
+                self.individuals_reused
+                / (self.individuals_created + self.individuals_reused)
+                * 100
+            )
+            print(f"   Actual reuse rate: {reuse_rate:.1f}%")
+        print(f"   Failed constraint checks: {self.failed_constraint_checks}")
+        print(f"   Duplicate facts encountered: {self.duplicate_facts}")
 
         total_attempts = sum(self.nb_proofs_attempted.values())
         if total_attempts > 0:
             success_rate = len(self.covered_rules) / len(self.ontology.rules) * 100
-            print(f"  Total proof attempts: {total_attempts}")
-            print(f"  Success rate: {success_rate:.1f}%")
+            print(f"   Total proof attempts: {total_attempts}")
+            print(f"   Rule coverage rate: {success_rate:.1f}%")
 
         print("\n" + "=" * 70)
+
+    # ---------------------------------------------------------------------------- #
+    #                                 PROOF ATTEMPTS                               #
+    # ---------------------------------------------------------------------------- #
 
     def print_proof_attempts_per_rule(self) -> None:
         """
         Prints the number of proof attempts made per rule (legacy method).
         """
-        print("\n--- Number of Proof Attempts per Rule ---")
+        print("\n--- Proof Attempts per Rule ---")
         for rule_name, attempts in self.nb_proofs_attempted.items():
             num_proofs = len(self.proof_structures.get(rule_name, set()))
-            print(
-                f"  Rule: {rule_name}, Diverse Proofs: {num_proofs}, Attempts: {attempts}"
-            )
+            print(f"  {rule_name}: {num_proofs} proofs, {attempts} attempts")
