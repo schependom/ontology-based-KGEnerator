@@ -4,10 +4,10 @@ Backward-chaining ontology-based data generator for Knowledge Graph Embedding mo
 
 ## Installation
 
-Install the required packages using conda:
+Create a Python environment:
 
 ```bash
-conda create -n KGEnerator python=3.14.0 -y -r requirements.txt
+conda env create -f environment.yaml
 conda activate KGEnerator
 ```
 
@@ -16,12 +16,16 @@ conda activate KGEnerator
 Run the generator script:
 
 ```bash
-python src/generator.py
+python src/generator.py <args>
 ```
 
-I'm working on adding command-line arguments for controlling
+Where `<args>` can include:
 
--   $p_r$: the probability of reusing an existing individual
--   $p_b$: the probability of generating a base fact in the proof tree
--   maximum depth of the proof tree
--   number of proofs to try to prove each rule in the ontology
+| Argument                   | Description                                                   | Default               |
+| -------------------------- | ------------------------------------------------------------- | --------------------- |
+| `--ontology`               | Path to the ontology file                                     | `../data/family2.ttl` |
+| `--seed`                   | Random seed for reproducibility                               | `23`                  |
+| `--max_proof_depth`        | Maximum depth of the proof tree                               | `10`                  |
+| `--max_nb_proofs_per_rule` | Number of proofs to try to prove each rule in the ontology    | `10`                  |
+| `--reuse_prob`             | Probability $p_r$ of reusing an existing individual           | `0.7`                 |
+| `--base_fact_prob`         | Probability $p_b$ of generating a base fact in the proof tree | `0.3`                 |

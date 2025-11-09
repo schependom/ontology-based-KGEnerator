@@ -39,10 +39,20 @@ def remove_uri_prefix(uri: str) -> str:
 
 
 class OntologyParser:
-    def __init__(self, filepath: str, filetype: str = "turtle"):
+    def __init__(
+        self,
+        filepath: str,
+        filetype: Optional[str] = "turtle",
+        seed: Optional[int] = None,
+    ):
         """
         Parses an OWL ontology and extracts classes, relations, rules, and constraints.
+
+        Args:
+            filepath (str):             Path to the ontology file.
+            filetype (str, optional):   Format of the ontology file (default: "turtle").
         """
+
         self.graph = rdflib.Graph()
         self.graph.parse(filepath, format=filetype)
 

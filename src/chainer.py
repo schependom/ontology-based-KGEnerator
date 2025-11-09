@@ -50,15 +50,34 @@ class BackwardChainingGenerator:
     #                                     INIT                                     #
     # ---------------------------------------------------------------------------- #
 
-    def __init__(self, parsed_ontology: OntologyParser):
+    def __init__(
+        self,
+        parsed_ontology: OntologyParser,
+        seed: Optional[int],
+        reuse_prob: float,
+        base_fact_prob: float,
+    ):
         """
         Initializes the generator with a parsed ontology.
+
+        Args:
+            parsed_ontology:    An instance of OntologyParser containing the parsed ontology.
+            seed:               Optional random seed for reproducibility.
+            reuse_prob:         Probability of reusing an existing individual.
+            base_fact_prob:     Probability of generating a base fact in the proof tree.
         """
+
+        # Set seed
+        random.seed(seed)
 
         # ----------------------- ONTOLOGY AND KNOWLEDGE GRAPH ----------------------- #
 
         # Type OntologyParser
         self.ontology = parsed_ontology
+
+        # Set probabilities
+        self.reuse_prob = reuse_prob
+        self.base_fact_prob = base_fact_prob
 
         # Initialize empty KG with classes, relations, attributes from ontology
         self.kg = KnowledgeGraph(
@@ -93,16 +112,12 @@ class BackwardChainingGenerator:
 
     def _get_or_create_individual(
         self,
-        reuse_probability: float = 0.3,
     ) -> Individual:
         """
         Creates a new individual or reuses an existing one from the KG with a certain probability.
-
-        Args:
-            reuse_probability: Probability of reusing an existing individual.
         """
         # Reuse existing individual from KG
-        if self.kg.individuals and random.random() < reuse_probability:
+        if self.kg.individuals and random.random() < self.reuse_prob:
             print("Reusing existing individual!", file=sys.stderr)
             return random.choice(self.kg.individuals)
 
@@ -463,7 +478,9 @@ class BackwardChainingGenerator:
     # ---------------------------------------------------------------------------- #
 
     def generate(
-        self, max_depth: int = 5, num_proofs_per_rule: int = 1
+        self,
+        max_depth: int,
+        num_proofs_per_rule: int,
     ) -> KnowledgeGraph:
         """
         Main generation loop. Tries to cover all rules via backward-chaining.
@@ -642,7 +659,6 @@ class BackwardChainingGenerator:
         depth: int,
         bindings: Dict[Var, Any],
         allow_base_case: bool = True,
-        base_case_probability: float = 0.5,
     ) -> Tuple[bool, List[Union[Triple, Membership, AttributeTriple]]]:
         """
         Recursively try to prove the goal by either:
@@ -679,7 +695,7 @@ class BackwardChainingGenerator:
 
         # ------------------- CREATE A BASE FACT WITH PROPABILITY p ------------------ #
 
-        if allow_base_case and random.random() < base_case_probability:
+        if allow_base_case and random.random() < self.base_fact_prob:
             print(f"Generating base fact for goal {goal}.")
             if applicable_rules:
                 print(
