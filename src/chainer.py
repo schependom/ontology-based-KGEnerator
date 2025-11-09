@@ -21,6 +21,7 @@ AUTHOR
     Vincent Van Schependom
 """
 
+from collections import defaultdict
 import random
 import sys
 from typing import List, Union, Dict, Set, Tuple, Optional, Any
@@ -56,6 +57,7 @@ class BackwardChainingGenerator:
         seed: Optional[int],
         reuse_prob: float,
         base_fact_prob: float,
+        verbose: bool,
     ):
         """
         Initializes the generator with a parsed ontology.
@@ -65,10 +67,17 @@ class BackwardChainingGenerator:
             seed:               Optional random seed for reproducibility.
             reuse_prob:         Probability of reusing an existing individual.
             base_fact_prob:     Probability of generating a base fact in the proof tree.
+            verbose:            Whether to enable verbose output for debugging.
         """
 
         # Set seed
         random.seed(seed)
+
+        self.verbose = verbose
+
+        # ------------- KEEP TRACK OF NUMBER OF PROOFS ATTEMPTED PER RULE ------------ #
+
+        self.nb_proofs_attempted: defaultdict[str, int] = defaultdict(int)
 
         # ----------------------- ONTOLOGY AND KNOWLEDGE GRAPH ----------------------- #
 
@@ -118,7 +127,12 @@ class BackwardChainingGenerator:
         """
         # Reuse existing individual from KG
         if self.kg.individuals and random.random() < self.reuse_prob:
-            print("Reusing existing individual!", file=sys.stderr)
+            if self.verbose:
+                if self.verbose:
+                    print(
+                        "Reusing existing individual due to reuse probability.",
+                        file=sys.stderr,
+                    )
             return random.choice(self.kg.individuals)
 
         # Create a new one
@@ -248,9 +262,7 @@ class BackwardChainingGenerator:
             return True  # Valid, because it already exists
 
         # 2. On-the-fly constraint checking
-        if not self._satisfies_constraints(
-            fact, proof_fact_cache, proof_being_built=proof_being_built
-        ):
+        if not self._satisfies_constraints(fact, proof_being_built=proof_being_built):
             # print(f"CONSTRAINT VIOLATION on {fact}")
             return False  # VIOLATION!
 
@@ -522,10 +534,11 @@ class BackwardChainingGenerator:
             # num_proofs_per_rule attempts to cover this rule
             for proof_no in range(num_proofs_per_rule):
                 #
-                print(
-                    f"Attempting to cover rule: {rule.name} (proof nb. {proof_no + 1}/{num_proofs_per_rule})",
-                    file=sys.stderr,
-                )
+                if self.verbose:
+                    print(
+                        f"----------------\nAttempting to cover rule: {rule.name} (proof nb. {proof_no + 1}/{num_proofs_per_rule})",
+                        file=sys.stderr,
+                    )
 
                 # # Stop if already covered
                 # if rule.name in self.covered_rules:
@@ -557,10 +570,11 @@ class BackwardChainingGenerator:
                     # If any premise fails, the whole rule fails
                     if not success:
                         all_premises_satisfied = False
-                        print(
-                            f"Failed to satisfy premise {premise} for rule {rule.name}. Trying next proof...",
-                            file=sys.stderr,
-                        )
+                        if self.verbose:
+                            print(
+                                f"Failed to satisfy premise {premise} for rule {rule.name}. Trying next proof...",
+                                file=sys.stderr,
+                            )
                         # Break out of the premise loop (try next proof (and thus new bindings))
                         # Because not all premises are satisfied, we continue to the next proof attempt
                         break
@@ -578,10 +592,11 @@ class BackwardChainingGenerator:
                     )
 
                     if not inferred_fact:
-                        print(
-                            f"Failed to create inferred fact for rule {rule.name}. Trying next proof...",
-                            file=sys.stderr,
-                        )
+                        if self.verbose:
+                            print(
+                                f"Failed to create inferred fact for rule {rule.name}. Trying next proof...",
+                                file=sys.stderr,
+                            )
                         # Go to the next proof attempt (next for loop iteration)
                         continue
 
@@ -605,13 +620,16 @@ class BackwardChainingGenerator:
                             fact, proof_cache, proof_being_built=generated_facts
                         ):
                             all_facts_valid = False
-                            print(f"Proof failed constraint check for fact: {fact}")
+                            if self.verbose:
+                                print(f"Proof failed constraint check for fact: {fact}")
                             break
 
                         # Valid, so add to proof cache
                         proof_cache.add(hash(fact))
 
                     # ------------------------- ALL FACTS VALID, ADD TO KG ------------------------ #
+
+                    self.nb_proofs_attempted[rule.name] = proof_no
 
                     if all_facts_valid:
                         # Add all generated facts to the KG (in reverse order to respect dependencies)
@@ -684,11 +702,11 @@ class BackwardChainingGenerator:
             r for r in self.ontology.rules if r.conclusion.matches(goal)
         ]
 
-        if not applicable_rules:
-            print(
-                f"No applicable rules found to prove goal {goal} at depth {depth}. However, 'allow_base_case'={allow_base_case}, trying base case if allowed.",
-                file=sys.stderr,
-            )
+        # if not applicable_rules:
+        #     print(
+        #         f"No applicable rules found to prove goal {goal} at depth {depth}. However, 'allow_base_case'={allow_base_case}, trying base case if allowed.",
+        #         file=sys.stderr,
+        #     )
 
         # Copy bindings to a temp variable for this proof attempt
         temp_bindings = bindings.copy()
@@ -696,11 +714,15 @@ class BackwardChainingGenerator:
         # ------------------- CREATE A BASE FACT WITH PROPABILITY p ------------------ #
 
         if allow_base_case and random.random() < self.base_fact_prob:
-            print(f"Generating base fact for goal {goal}.")
-            if applicable_rules:
-                print(
-                    f"Also found {len(applicable_rules)} applicable rules, but opting for base case, due to probability."
-                )
+            if self.verbose:
+                if applicable_rules:
+                    print(
+                        f"Found {len(applicable_rules)} applicable rules, but opting for base case, due to probability."
+                    )
+                else:
+                    print(
+                        f"No applicable rules found and due to randomness, must create base fact for goal {goal}."
+                    )
 
             # Create base fact
             success, base_fact = self._try_create_base_fact(goal, temp_bindings)
@@ -713,10 +735,11 @@ class BackwardChainingGenerator:
             else:
                 # Failed to create base fact (e.g., constraint or duplicate)
                 # => Try the rules instead (if any)
-                print(
-                    f"Failed to create base fact for goal {goal}. Trying applicable rules instead.",
-                    file=sys.stderr,
-                )
+                if self.verbose:
+                    print(
+                        f"Failed to create base fact for goal {goal}. Trying applicable rules instead.",
+                        file=sys.stderr,
+                    )
 
         # Shuffle applicable_rules to introduce randomness
         random.shuffle(applicable_rules)
@@ -779,6 +802,8 @@ class BackwardChainingGenerator:
         # If we get here, we failed to prove the goal
         # because there were no applicable rules
         # or all attempts failed
+        if self.verbose:
+            print(f"Failed to prove goal {goal} at depth {depth}.", file=sys.stderr)
         return (False, [])
 
     # ---------------------------------------------------------------------------- #
@@ -1021,3 +1046,15 @@ class BackwardChainingGenerator:
                 file=sys.stderr,
             )
             return None
+
+    # ---------------------------------------------------------------------------- #
+    #                   PRINT NUMBER OF PROOFS ATTEMPTED PER RULE                  #
+    # ---------------------------------------------------------------------------- #
+
+    def print_proof_attempts_per_rule(self) -> None:
+        """
+        Prints the number of proof attempts made per rule.
+        """
+        print("\n--- Number of Proof Attempts per Rule ---")
+        for rule_name, attempts in self.nb_proofs_attempted.items():
+            print(f"  Rule: {rule_name}, Proof Attempts: {attempts}")

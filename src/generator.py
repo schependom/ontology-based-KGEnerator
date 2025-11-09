@@ -24,6 +24,7 @@ def main(
     max_nb_proofs_per_rule: int,
     reuse_prob: float,
     base_fact_prob: float,
+    verbose: bool = False,
 ):
     """
     Main function to run the ontology-based data generator.
@@ -51,6 +52,7 @@ def main(
         seed=seed,
         reuse_prob=reuse_prob,
         base_fact_prob=base_fact_prob,
+        verbose=verbose,
     )
 
     # Generate facts
@@ -93,6 +95,8 @@ def main(
     if inferred_facts == 0:
         print("  (No inferred facts generated)")
 
+    generator.print_proof_attempts_per_rule()
+
 
 if __name__ == "__main__":
     #
@@ -102,12 +106,12 @@ if __name__ == "__main__":
 
     # ------------------------------ DEFAULT VALUES ------------------------------ #
 
-    default_ontology = "../data/family2.ttl"
+    default_ontology = "data/family.ttl"
     default_seed = 23
     default_max_proof_depth = 10
-    default_max_nb_proofs_per_rule = 10
-    default_reuse_prob = 0.7
-    default_base_fact_prob = 0.3
+    default_max_nb_proofs_per_rule = 100
+    default_reuse_prob = 0.1
+    default_base_fact_prob = 0.01
 
     # ------------------------------ PARSE ARGUMENTS ----------------------------- #
 
@@ -150,6 +154,11 @@ if __name__ == "__main__":
         default=default_base_fact_prob,
         help=f"Probability $p_b$ of generating a base fact in the proof tree (default: {default_base_fact_prob})",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",  # store as boolean flag
+        help="Enable verbose output for debugging. (default: False)",
+    )
 
     args = parser.parse_args()
 
@@ -164,4 +173,5 @@ if __name__ == "__main__":
         max_nb_proofs_per_rule=args.max_proofs_per_rule,
         reuse_prob=args.reuse_prob,
         base_fact_prob=args.base_fact_prob,
+        verbose=args.verbose,
     )
