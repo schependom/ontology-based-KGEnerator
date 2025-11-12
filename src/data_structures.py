@@ -49,6 +49,9 @@ class Class:
     def __hash__(self):
         return hash(self.name)
 
+    def __repr__(self) -> str:
+        return self.name
+
 
 @dataclass
 class Relation:
@@ -65,6 +68,9 @@ class Relation:
     def __hash__(self):
         return hash(self.name)
 
+    def __repr__(self) -> str:
+        return self.name
+
 
 @dataclass
 class Attribute:
@@ -80,6 +86,9 @@ class Attribute:
 
     def __hash__(self):
         return hash(self.name)
+
+    def __repr__(self) -> str:
+        return self.name
 
 
 @dataclass
@@ -103,6 +112,9 @@ class Individual:
 
     def __hash__(self):
         return hash(self.name)
+
+    def __repr__(self) -> str:
+        return self.name
 
 
 @dataclass
@@ -146,6 +158,12 @@ class Membership:
         """Converts this fact to a ground Atom (Atom)."""
         return Atom(self.individual, RDF.type, self.cls)
 
+    def __repr__(self) -> str:
+        if self.is_member:
+            return f"<{self.individual}, memberOf, {self.cls}>"
+        else:
+            return f"<{self.individual}, ~memberOf, {self.cls}>"
+
 
 @dataclass
 class Triple:
@@ -183,6 +201,12 @@ class Triple:
         """Converts this fact to a ground Atom (Atom)."""
         return Atom(self.subject, self.predicate, self.object)
 
+    def __repr__(self) -> str:
+        if self.positive:
+            return f"<{self.subject}, {self.predicate}, {self.object}>"
+        else:
+            return f"<{self.subject}, ~{self.predicate}, {self.object}>"
+
 
 @dataclass
 class AttributeTriple:
@@ -218,6 +242,9 @@ class AttributeTriple:
         """Converts this fact to a ground Atom (Atom)."""
         return Atom(self.subject, self.predicate, self.value)
 
+    def __repr__(self) -> str:
+        return f"<{self.subject}, {self.predicate}, {self.value}>"
+
 
 @dataclass
 class KnowledgeGraph:
@@ -232,6 +259,26 @@ class KnowledgeGraph:
     triples: List[Triple]
     memberships: List[Membership]
     attribute_triples: List[AttributeTriple]
+
+    def print(self) -> None:
+        """Prints a summary of the knowledge graph."""
+        print("Knowledge Graph Summary:")
+        print(f"  Nb of Attributes: {len(self.attributes)}")
+        print(f"  Nb of Classes: {len(self.classes)}")
+        print(f"  Nb of Relations: {len(self.relations)}")
+        print(f"  Nb of Individuals: {len(self.individuals)}")
+        print(f"  Nb of Triples: {len(self.triples)}")
+        print(f"  Nb of Memberships: {len(self.memberships)}")
+        print(f"  Nb of Attribute Triples: {len(self.attribute_triples)}\n")
+        print("Triples:")
+        for triple in self.triples:
+            print(f"    {triple}")
+        print("Memberships:")
+        for membership in self.memberships:
+            print(f"    {membership}")
+        print("Attribute Triples:")
+        for attr_triple in self.attribute_triples:
+            print(f"    {attr_triple}")
 
 
 @dataclass
