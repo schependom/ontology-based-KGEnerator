@@ -1,10 +1,25 @@
+"""
+DESCRIPTION
+
+    Parses an OWL ontology file (.ttl) and extracts classes, relations,
+    attributes, executable rules, and constraints for use in backward chaining.
+
+WORKFLOW
+
+    1. Load the ontology using rdflib.
+    2. Identify and create Class, Relation, and Attribute entities.
+    3. Translate OWL/RDFS axioms into ExecutableRule and Constraint objects.
+
+AUTHOR
+
+    Vincent Van Schependom
+"""
+
 from rdflib.namespace import RDF, RDFS, OWL, XSD
 from rdflib.term import BNode, URIRef, Literal
 import rdflib
 
-from dataclasses import dataclass
-from typing import List, Union, Set, Dict, Optional, Any
-import sys
+from typing import List, Union, Set, Dict, Optional
 
 from data_structures import (
     Individual,
@@ -149,7 +164,7 @@ class OntologyParser:
         Parses the ontology schema to discover all Classes, Relations, and Attributes.
         """
 
-        # 1. Find explicit declarations
+        # Find explicit declarations
         for s in self.graph.subjects(RDF.type, OWL.Class):
             self._get_or_create_class(s)
 
@@ -159,7 +174,7 @@ class OntologyParser:
         for s in self.graph.subjects(RDF.type, OWL.DatatypeProperty):
             self._get_or_create_attribute(s)
 
-        # 2. Find property types that imply ObjectProperty
+        #  ind property types that imply ObjectProperty
         prop_types = [
             OWL.SymmetricProperty,
             OWL.TransitiveProperty,
@@ -170,7 +185,7 @@ class OntologyParser:
             for s in self.graph.subjects(RDF.type, prop_type):
                 self._get_or_create_relation(s)
 
-        # 3. Handle FunctionalProperty (can be Object or Datatype)
+        #  Handle FunctionalProperty (can be Object or Datatype)
         for s in self.graph.subjects(RDF.type, OWL.FunctionalProperty):
             # If already typed, we're good. If not, we must deduce.
             uri_str = str(s)
@@ -192,7 +207,7 @@ class OntologyParser:
                 else:
                     self._get_or_create_relation(s)  # Default to relation
 
-        # 4. Find implicit entities from axiom usage
+        # Find implicit entities from axiom usage
         # We must iterate all triples, but this is safer.
 
         # rdfs:subClassOf

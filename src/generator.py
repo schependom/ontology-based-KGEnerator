@@ -1,9 +1,29 @@
+"""
+DESCRIPTION:
+
+    Main script to generate facts using backward chaining on a given ontology.
+
+    Workflow:
+
+        - Parse the ontology using OntologyParser.
+        - Initialize BackwardChainer with parsed rules.
+        - For each rule, generate all possible proof trees.
+        - Traverse each proof tree to extract ground atoms.
+        - Convert ground atoms into KnowledgeGraph facts (Triples, Memberships, etc.).
+        - Store facts in KnowledgeGraph, ensuring no duplicates.
+
+AUTHOR
+
+    Vincent Van Schependom
+"""
+
 import sys
 import argparse
+import traceback
 from typing import Dict, Set
 from rdflib.namespace import RDF
 
-# Import all our custom modules
+# Custom imports
 from data_structures import (
     KnowledgeGraph,
     Individual,
@@ -21,12 +41,10 @@ from parser import OntologyParser
 from chainer import BackwardChainer
 
 
-class KnowledgeGraphGenerator:
+class KGenerator:
     """
-    Orchestrates the full data generation pipeline:
-    1. Parses an ontology.
-    2. Uses a BackwardChainer to generate all possible proof trees.
-    3. Populates a KnowledgeGraph with the facts from these proofs.
+    Knowledge Graph data Generator (KGenerator).
+    Orchestrates the full data generation pipeline.
     """
 
     def __init__(self, ontology_file: str, max_recursion: int = 2):
@@ -37,19 +55,20 @@ class KnowledgeGraphGenerator:
             ontology_file (str): Path to the .ttl ontology file.
             max_recursion (int): The maximum depth for recursive rules.
         """
-        print(f"Loading and parsing ontology from: {ontology_file}")
-        self.parser = OntologyParser(ontology_file)
 
+        print(f"Loading and parsing ontology from: {ontology_file}")
+
+        self.parser = OntologyParser(ontology_file)
         self.chainer = BackwardChainer(
             all_rules=self.parser.rules, max_recursion_depth=max_recursion
         )
 
-        # Schema stores from the parser
+        # Store schemas from the parser
         self.schema_classes = self.parser.classes
         self.schema_relations = self.parser.relations
         self.schema_attributes = self.parser.attributes
 
-        # Stores for the generated Knowledge Graph data
+        # Store the data that we will populate a KnowledgeGraph class with
         # We use dictionaries for deduplication
         self.individuals: Dict[str, Individual] = {}  # name -> Individual
         self.triples: Dict[tuple, Triple] = {}  # (s, p, o) -> Triple
@@ -61,27 +80,42 @@ class KnowledgeGraphGenerator:
         # Set to track proofs we've already processed to avoid duplicate work
         # This is vital for proof trees that form a DAG (Directed Acyclic Graph)
         self.processed_proofs: Set[Proof] = set()
+        # For example, if proof A has sub-proofs B and C,
+        # and both B and C have sub-proof D, we only want to process D once
 
     def _register_individual(self, term: Term) -> None:
-        """Adds an Individual to our store if it's not present."""
+        """
+        Adds an Individual to our store if it's not present.
+        """
         if isinstance(term, Individual):
             if term.name not in self.individuals:
                 self.individuals[term.name] = term
+        else:
+            print(f"Warning: Expected Individual term, got: {term}")
 
     def _add_atom_and_proof(self, atom: Atom, proof: Proof) -> None:
         """
         Converts a ground Atom into a KG fact (Triple, Membership, etc.)
         and adds it to our stores. If the fact already exists, it appends
         the proof to the fact's proof list.
+
+        Args:
+            atom (Atom):    The ground atom to add.
+            proof (Proof):  The proof object that derived this atom.
         """
+
+        # A goal of a proof must always be ground!
         if not atom.is_ground():
             # This should not happen if chainer is correct
             print(f"Warning: Skipping non-ground atom: {atom}")
             return
 
+        # Extract subject, predicate, object from goal Atom
+        # Note that these are Terms that are guaranteed to be ground
         s, p, o = atom.subject, atom.predicate, atom.object
 
-        # Case 1: Class Membership (e.g., rdf:type(Ind_0, Person))
+        # ----------------------------- CLASS MEMBERSHIPS ---------------------------- #
+
         if p == RDF.type and isinstance(o, Class):
             self._register_individual(s)
             key = (s.name, o.name)
@@ -93,7 +127,8 @@ class KnowledgeGraphGenerator:
             # Add this proof to the fact's proof list
             self.memberships[key].proofs.append(proof)
 
-        # Case 2: Relational Triple (e.g., parent(Ind_0, Ind_1))
+        # ---------------------------- RELATIONAL TRIPLES ---------------------------- #
+
         elif isinstance(o, Individual) and isinstance(p, Relation):
             self._register_individual(s)
             self._register_individual(o)
@@ -106,7 +141,8 @@ class KnowledgeGraphGenerator:
             # Add this proof to the fact's proof list
             self.triples[key].proofs.append(proof)
 
-        # Case 3: Attribute Triple (e.g., hasAge(Ind_0, "30"))
+        # ----------------------------- ATTRIBUTE TRIPLES ---------------------------- #
+
         elif isinstance(p, Attribute):
             self._register_individual(s)
             # Note: object (o) is a LiteralValue here
@@ -126,13 +162,17 @@ class KnowledgeGraphGenerator:
         Runs the full generation process by iterating through all rules,
         generating all possible proofs, and building the KnowledgeGraph.
         """
+
         all_rules = self.parser.rules
+
+        # No rules means no data
         if not all_rules:
             print("Warning: No rules found in the ontology. No data will be generated.")
             return self.build_knowledge_graph()
 
         print(f"Starting data generation from {len(all_rules)} rules...")
 
+        # Iterate through all rules as starting points for proof generation
         for i, rule in enumerate(all_rules):
             print(f"\n[{i + 1}/{len(all_rules)}] Generating from rule: {rule.name}")
 
@@ -140,20 +180,27 @@ class KnowledgeGraphGenerator:
             proof_generator = self.chainer.generate_proof_trees(rule.name)
 
             top_level_proofs = 0
+
+            # For all top-level proofs generated from this rule,
+            # traverse the proof tree and extract all ground atoms
             for top_level_proof in proof_generator:
+                # Count this top-level proof
                 top_level_proofs += 1
 
-                # We traverse the entire proof tree (a DAG) from the top
-                # and add every single atom (goal, intermediate, base)
-                # to our KG.
+                # We traverse the entire proof tree (a Directed Acyclic Graph) from the top
+                # and add every single atom (goal, intermediate, base) to our KG.
 
                 stack = [top_level_proof]
+
+                # Depth-first traversal of the proof tree
                 while stack:
+                    # Pop a proof from the stack
                     current_proof = stack.pop()
 
                     # If we've seen this exact proof object, skip
                     if current_proof in self.processed_proofs:
                         continue
+
                     self.processed_proofs.add(current_proof)
 
                     # Add the goal of this proof to our KG
@@ -169,6 +216,8 @@ class KnowledgeGraphGenerator:
                 print(f"  -> Found and processed {top_level_proofs} proof tree(s).")
 
         print("\n--- Data generation complete. ---")
+
+        # Return a KnowledgeGraph object with all collected data
         return self.build_knowledge_graph()
 
     def build_knowledge_graph(self) -> KnowledgeGraph:
@@ -192,32 +241,39 @@ def main():
     """
     Main entry point for the script.
     """
+
+    # ------------------------------ PARSE ARGUMENTS ----------------------------- #
+
+    default_ontology_path = "data/family.ttl"
+    default_max_recursion = 4
+
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator"
     )
     parser.add_argument(
-        "ontology_file",
+        "ontology_path",
         type=str,
-        help="Path to the ontology file (e.g., 'my_ontology.ttl')",
+        default=default_ontology_path,
+        help=f"Path to the ontology file (default: '{default_ontology_path}')",
     )
     parser.add_argument(
         "--max-recursion",
         type=int,
-        default=2,
-        help="Maximum depth for recursive rules (default: 2)",
+        default=default_max_recursion,
+        help=f"Maximum depth for recursive rules (default: {default_max_recursion})",
     )
     args = parser.parse_args()
 
-    try:
-        # 1. Initialize Generator
-        generator = KnowledgeGraphGenerator(
-            args.ontology_file, max_recursion=args.max_recursion
-        )
+    # ---------------------------- RUN GENERATION PIPELINE ----------------------- #
 
-        # 2. Run Generation
+    try:
+        # Initialize Generator
+        generator = KGenerator(args.ontology_path, max_recursion=args.max_recursion)
+
+        # Run Generation
         kg = generator.generate_data()
 
-        # 3. Print Summary
+        # Print Summary
         print("\n--- Knowledge Graph Generation Summary ---")
         print(f"  Schema Classes:    {len(kg.classes)}")
         print(f"  Schema Relations:  {len(kg.relations)}")
@@ -231,15 +287,15 @@ def main():
 
         kg.print()
 
+    # ------------------------------ ERROR HANDLING ------------------------------ #
+
     except FileNotFoundError:
         print(
-            f"Error: Ontology file not found at '{args.ontology_file}'", file=sys.stderr
+            f"Error: Ontology file not found at '{args.ontology_path}'", file=sys.stderr
         )
         sys.exit(1)
     except Exception as e:
         print(f"\nAn unexpected error occurred:\n{e}", file=sys.stderr)
-        import traceback
-
         traceback.print_exc()
         sys.exit(1)
 

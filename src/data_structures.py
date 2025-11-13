@@ -426,72 +426,107 @@ class Constraint:
 @dataclass(frozen=True)  # Proofs are immutable and hashable
 class Proof:
     """
-    Represents a proof tree for a single ground goal (Atom).
-    A proof is either for a base fact (rule=None) or a derived fact.
-    This structure matches your description of two proof types.
+    Represents a proof tree for a single GROUND goal (Atom).
+
+    A proof is either for
+        - a base fact
+            -> if no rules can be applied to prove a goal
+            -> leaf in the proof tree
+            -> rule=None
+        - a derived fact
+            -> if a rule was applied to prove the goal
+            -> node in the proof tree
+            -> rule=ExecutableRule, sub_proofs=[Proof, ...]
     """
 
     # The ground atom this proof satisfies.
     goal: Atom
 
-    # The rule whose conclusion was unified with the goal.
+    # The rule (ExecutableRule) whose conclusion (ExecutableRule.conclusion)
+    # was unified with the goal (grounded Atom).
     # If 'None', this proof represents a base fact (a leaf in the tree).
     rule: Optional[ExecutableRule] = None
 
     # The list of proofs for the premises of the rule.
     # Must be empty if rule is None.
     sub_proofs: Tuple["Proof", ...] = field(default_factory=tuple)
+    # We use a Tuple instead of List to make Proof hashable
 
-    # Tracks {rule_name: count} for recursive rules
-    recursion_tracker: frozenset[Tuple[str, int]] = field(default_factory=frozenset)
-    # a frozenset is a set which is immutable and hashable
+    # recursive_use_counts
+    #   -> tracks {rule_name: count} for recursive rules.
+    #   -> is an immutable, hashable set
+    recursive_use_counts: frozenset[Tuple[str, int]] = field(default_factory=frozenset)
+    # field() returns an empty frozenset
 
     def __post_init__(self):
-        # Enforce consistency
+        # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
             raise ValueError("Base fact proof (rule=None) cannot have sub-proofs.")
+
+        # A derived fact proof must have the same number of sub-proofs as premises
+        # in the rule it tries to prove.
         if self.rule is not None and len(self.sub_proofs) != len(self.rule.premises):
             raise ValueError(
                 f"Proof for rule '{self.rule.name}' must have "
                 f"{len(self.rule.premises)} sub-proofs, but "
                 f"{len(self.sub_proofs)} were given."
             )
+
+        # The goal of a proof must be ground.
         if not self.goal.is_ground():
-            # This should be enforced by the chaining engine
             raise ValueError(f"Proof goal '{self.goal}' must be a ground atom.")
+
+    def is_base_fact(self) -> bool:
+        """
+        Checks if this proof represents a base fact (leaf).
+        """
+        return self.rule is None
 
     def get_base_facts(self) -> Set[Atom]:
         """
-        Traverses the proof tree and returns the set of all base facts
-        (leaves) this proof depends on. This is your "minimal set of atoms".
+        Traverses the proof tree and returns the set of all base facts (leaves) this proof depends on.
         """
+
+        # This is a base fact (a leaf)
         if self.rule is None:
-            # This is a base fact (a leaf)
             return {self.goal}
 
+        # Derived fact: gather base facts from sub-proofs
         base_facts: Set[Atom] = set()
         for sp in self.sub_proofs:
             base_facts.update(sp.get_base_facts())
         return base_facts
 
     def get_recursion_depth(self, rule: ExecutableRule) -> int:
-        """Gets the number of times this recursive rule was used in this proof path."""
-        for name, count in self.recursion_tracker:
+        """
+        Gets the number of times the given recursive rule was used in this proof path.
+        """
+        for name, count in self.recursive_use_counts:
             if name == rule.name:
                 return count
         return 0
 
     def get_max_recursion_depth(self) -> int:
-        """Gets the maximum depth of any recursive rule in this proof."""
-        if not self.recursion_tracker:
+        """
+        Gets the maximum depth of any recursive rule in this proof.
+        """
+        # Check if there are any recursive rules used
+        if not self.recursive_use_counts:
             return 0
-        return max(count for _, count in self.recursion_tracker)
+
+        # If there are, return the max count
+        return max(count for _, count in self.recursive_use_counts)
 
     @staticmethod
     def create_base_proof(atom: Atom) -> "Proof":
-        """Creates a proof for a base fact (a leaf)."""
+        """
+        Creates a proof for a base fact (a leaf).
+        """
+        # Goal must be a ground atom
         if not atom.is_ground():
             raise ValueError("Base fact proof must be for a ground atom.")
+
+        # Return a proof with no rule and no sub-proofs for the base fact (ground Atom)
         return Proof(goal=atom, rule=None, sub_proofs=tuple())
 
     @staticmethod
@@ -501,25 +536,27 @@ class Proof:
         """
         Creates a proof for a derived fact (a node), tracking recursion.
         """
+        # Goal must be a ground atom
         if not goal.is_ground():
             raise ValueError("Derived proof goal must be a ground atom.")
 
-        # Combine recursion trackers from sub-proofs
+        # Combine recursive_use_counts from sub-proofs
         new_counts: Dict[str, int] = {}
         for sp in sub_proofs:
-            for name, count in sp.recursion_tracker:
-                # We take the *max* depth from any sub-proof branch
-                # to correctly track the longest chain.
+            for name, count in sp.recursive_use_counts:
+                # We take the MAX depth from any sub-proof branch for each rule
+                # to make sure that the depth doesn't get underestimated.
                 new_counts[name] = max(new_counts.get(name, 0), count)
 
-        # Add this rule if it's recursive
+        # Update this rule's count if it's recursive
         if rule.is_recursive():
             name = rule.name
             new_counts[name] = new_counts.get(name, 0) + 1
 
+        # Return the proof
         return Proof(
             goal=goal,
             rule=rule,
             sub_proofs=tuple(sub_proofs),
-            recursion_tracker=frozenset(new_counts.items()),
+            recursive_use_counts=frozenset(new_counts.items()),
         )
