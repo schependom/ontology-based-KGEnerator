@@ -19,7 +19,8 @@ from rdflib.namespace import RDF, RDFS, OWL, XSD
 from rdflib.term import BNode, URIRef, Literal
 import rdflib
 
-from typing import List, Union, Set, Dict, Optional
+
+from typing import List, Union, Set, Dict, Optional, Any
 
 from data_structures import (
     Individual,
@@ -88,8 +89,18 @@ class OntologyParser:
         # Helper map for constraint propagation
         self.sub_property_map: Dict[str, Set[Relation]] = {}
 
+        print(f"--- Starting Schema Parse ({filepath}) ---")
         self._parse_schema()
+        print("--- Schema Parse Complete ---")
+        print(f"  Classes Found:    {len(self.classes)}")
+        print(f"  Relations Found:  {len(self.relations)}")
+        print(f"  Attributes Found: {len(self.attributes)}")
+        print("--- Starting Rule Parse ---")
         self._parse_rules_and_constraints()
+        print("--- Rule Parse Complete ---")
+        print(f"  Rules Created:      {len(self.rules)}")
+        print(f"  Constraints Created: {len(self.constraints)}")
+        print("----------------------------------")
 
     # ---------------------------------------------------------------------------- #
     #                                 SCHEMA PARSING                               #
@@ -108,6 +119,7 @@ class OntologyParser:
 
         # Avoid creating a class if it's already a property
         if name in self.relations or name in self.attributes:
+            print(f"Warning: URI {uri_str} used as both class and property.")
             return None
 
         # Create new class
@@ -130,6 +142,7 @@ class OntologyParser:
 
         # Avoid creating a relation if it's a class or attribute
         if name in self.classes or name in self.attributes:
+            print(f"Warning: URI {uri_str} used as both relation and other.")
             return None
 
         index = len(self.relations)
@@ -151,6 +164,7 @@ class OntologyParser:
 
         # Avoid creating an attribute if it's a class or relation
         if name in self.classes or name in self.relations:
+            print(f"Warning: URI {uri_str} used as both attribute and other.")
             return None
 
         index = len(self.attributes)
@@ -174,7 +188,7 @@ class OntologyParser:
         for s in self.graph.subjects(RDF.type, OWL.DatatypeProperty):
             self._get_or_create_attribute(s)
 
-        #  ind property types that imply ObjectProperty
+        #  find property types that imply ObjectProperty
         prop_types = [
             OWL.SymmetricProperty,
             OWL.TransitiveProperty,
@@ -260,8 +274,18 @@ class OntologyParser:
 
         # owl:inverseOf
         for s, o in self.graph.subject_objects(OWL.inverseOf):
+            # This is just for discovery, rule creation is separate
             self._get_or_create_relation(s)
             self._get_or_create_relation(o)
+
+        # owl:propertyChainAxiom
+        for s, o in self.graph.subject_objects(OWL.propertyChainAxiom):
+            # Discover the head property
+            self._get_or_create_relation(s)
+            # Discover all properties in the chain
+            chain = self._walk_rdf_list(o)
+            for prop_uri in chain:
+                self._get_or_create_relation(prop_uri)
 
         # someValuesFrom / allValuesFrom
         for s in self.graph.subjects(OWL.onProperty, None):
@@ -280,11 +304,6 @@ class OntologyParser:
                     else:
                         self._get_or_create_relation(prop)
                         self._get_or_create_class(val_class)
-
-        print("--- Ontology Parsing Results ---")
-        print(f"Total classes found: {len(self.classes)}")
-        print(f"Total relations found: {len(self.relations)}")
-        print(f"Total attributes found: {len(self.attributes)}")
 
     def _deduce_property_type(self, p: URIRef) -> str:
         """Helper to deduce if a property is Object or Datatype. Returns 'relation' or 'attribute'."""
@@ -307,6 +326,20 @@ class OntologyParser:
         else:
             self._get_or_create_relation(p)
             return "relation"
+
+    def _walk_rdf_list(self, list_node: BNode) -> List[URIRef]:
+        """Walks an RDF list (like in propertyChainAxiom) and returns a Python list of its items."""
+        items: List[URIRef] = []
+        curr = list_node
+        while curr and curr != RDF.nil:
+            item = self.graph.value(curr, RDF.first)
+            if item and isinstance(item, URIRef):
+                items.append(item)
+            else:
+                # Invalid list item
+                break
+            curr = self.graph.value(curr, RDF.rest)
+        return items
 
     # ---------------------------------------------------------------------------- #
     #                               HELPER FUNCTIONS                               #
@@ -336,10 +369,13 @@ class OntologyParser:
         Translates OWL/RDFS axioms into executable rules and constraints
         using the pre-parsed schema entities.
         """
+        rule_count_before = len(self.rules)
 
         # --- rdfs:subClassOf ---
         # <A, rdfs:subClassOf, B>  =>  (X, type, A) -> (X, type, B)
-        for s, o in self.graph.subject_objects(RDFS.subClassOf):
+        axioms = list(self.graph.subject_objects(RDFS.subClassOf))
+        print(f"  Found {len(axioms)} rdfs:subClassOf axioms...")
+        for s, o in axioms:
             if isinstance(s, BNode) or isinstance(o, BNode):
                 self._parse_complex_subclass(s, o)
             else:
@@ -352,10 +388,14 @@ class OntologyParser:
                         premises=[Atom(Var("X"), RDF.type, class_s)],
                     )
                     self.rules.append(rule)
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- rdfs:subPropertyOf ---
         # <P1, rdfs:subPropertyOf, P2>  =>  (X, P1, Y) -> (X, P2, Y)
-        for s, o in self.graph.subject_objects(RDFS.subPropertyOf):
+        axioms = list(self.graph.subject_objects(RDFS.subPropertyOf))
+        print(f"  Found {len(axioms)} rdfs:subPropertyOf axioms...")
+        for s, o in axioms:
             rel_s = self.get_object_property(s)
             rel_o = self.get_object_property(o)
             if rel_s and rel_o:
@@ -379,11 +419,15 @@ class OntologyParser:
                     premises=[Atom(Var("X"), attr_s, Var("Value"))],
                 )
                 self.rules.append(rule)
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- rdfs:domain ---
         # <P, rdfs:domain, C>  =>  (X, P, Y) -> (X, type, C)
         # <A, rdfs:domain, C>  =>  (X, A, V) -> (X, type, C)
-        for s, o in self.graph.subject_objects(RDFS.domain):
+        axioms = list(self.graph.subject_objects(RDFS.domain))
+        print(f"  Found {len(axioms)} rdfs:domain axioms...")
+        for s, o in axioms:
             class_o = self.get_class(o)
             if not class_o:
                 continue
@@ -405,11 +449,15 @@ class OntologyParser:
                     premises=[Atom(Var("X"), attr_s, Var("Value"))],
                 )
                 self.rules.append(rule)
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- rdfs:range ---
         # <P, rdfs:range, C>  =>  (X, P, Y) -> (Y, type, C) (ObjectProperty)
         # <A, rdfs:range, D>  =>  (X, A, V) -> V is of type D (DatatypeProperty)
-        for s, o in self.graph.subject_objects(RDFS.range):
+        axioms = list(self.graph.subject_objects(RDFS.range))
+        print(f"  Found {len(axioms)} rdfs:range axioms...")
+        for s, o in axioms:
             rel_s = self.get_object_property(s)
             class_o = self.get_class(o)
             if rel_s and class_o:
@@ -433,13 +481,26 @@ class OntologyParser:
                         ],  # Store the attribute and the XSD type (e.g., XSD.string)
                     )
                 )
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- owl:inverseOf ---
         # <P1, owl:inverseOf, P2> => (X, P1, Y) -> (Y, P2, X)
         #                        and (Y, P2, X) -> (X, P1, Y)
-        for s, o in self.graph.subject_objects(OWL.inverseOf):
+        axioms = list(self.graph.subject_objects(OWL.inverseOf))
+        print(f"  Found {len(axioms)} owl:inverseOf axioms...")
+        if not axioms:
+            print(f"    WARNING: No owl:inverseOf axioms found. This might be the bug.")
+
+        for s, o in axioms:
             rel_s = self.get_object_property(s)
             rel_o = self.get_object_property(o)
+
+            if not rel_s:
+                print(f"    WARNING: Could not find relation for subject: {s}")
+            if not rel_o:
+                print(f"    WARNING: Could not find relation for object: {o}")
+
             if rel_s and rel_o:
                 # Rule 1
                 self.rules.append(
@@ -457,10 +518,16 @@ class OntologyParser:
                         premises=[Atom(Var("Y"), rel_o, Var("X"))],
                     )
                 )
+        print(
+            f"    -> {len(self.rules) - rule_count_before} rules created (2 per axiom)."
+        )
+        rule_count_before = len(self.rules)
 
         # --- owl:SymmetricProperty ---
         # <P, rdf:type, owl:SymmetricProperty> => (X, P, Y) -> (Y, P, X)
-        for s in self.graph.subjects(RDF.type, OWL.SymmetricProperty):
+        axioms = list(self.graph.subjects(RDF.type, OWL.SymmetricProperty))
+        print(f"  Found {len(axioms)} owl:SymmetricProperty axioms...")
+        for s in axioms:
             rel_s = self.get_object_property(s)
             if rel_s:
                 self.rules.append(
@@ -470,10 +537,14 @@ class OntologyParser:
                         premises=[Atom(Var("X"), rel_s, Var("Y"))],
                     )
                 )
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- owl:TransitiveProperty ---
         # <P, rdf:type, owl:TransitiveProperty> => (X, P, Y), (Y, P, Z) -> (X, P, Z)
-        for s in self.graph.subjects(RDF.type, OWL.TransitiveProperty):
+        axioms = list(self.graph.subjects(RDF.type, OWL.TransitiveProperty))
+        print(f"  Found {len(axioms)} owl:TransitiveProperty axioms...")
+        for s in axioms:
             rel_s = self.get_object_property(s)
             if rel_s:
                 self.rules.append(
@@ -486,10 +557,70 @@ class OntologyParser:
                         ],
                     )
                 )
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
+
+        # --- owl:propertyChainAxiom ---
+        # <P, owl:propertyChainAxiom, (Q R S)> => Q(X,V1), R(V1,V2), S(V2,Z) -> P(X,Z)
+        axioms = list(self.graph.subject_objects(OWL.propertyChainAxiom))
+        print(f"  Found {len(axioms)} owl:propertyChainAxiom axioms...")
+        for s, o in axioms:
+            prop_chain_uris = self._walk_rdf_list(o)
+            if len(prop_chain_uris) < 1:
+                print(f"    Warning: Skipping empty property chain for {s}")
+                continue
+
+            head_prop = self.get_object_property(s)
+            if not head_prop:
+                print(
+                    f"    Warning: Skipping property chain for unknown head property {s}"
+                )
+                continue
+
+            chain_relations: List[Relation] = []
+            valid_chain = True
+            for prop_uri in prop_chain_uris:
+                rel = self.get_object_property(prop_uri)
+                if not rel:
+                    print(
+                        f"    Warning: Skipping chain for {head_prop.name}. Unknown relation {prop_uri} in chain."
+                    )
+                    valid_chain = False
+                    break
+                chain_relations.append(rel)
+
+            if not valid_chain:
+                continue
+
+            # Create variables
+            v_start = Var("X")
+            v_end = Var("Z")
+            vars = (
+                [v_start]
+                + [Var(f"V{i}") for i in range(len(chain_relations) - 1)]
+                + [v_end]
+            )
+
+            premises: List[Atom] = []
+            for i in range(len(chain_relations)):
+                premise = Atom(vars[i], chain_relations[i], vars[i + 1])
+                premises.append(premise)
+
+            # Create the rule
+            rule = ExecutableRule(
+                name=f"chain_{head_prop.name}",
+                conclusion=Atom(v_start, head_prop, v_end),
+                premises=premises,
+            )
+            self.rules.append(rule)
+        print(f"    -> {len(self.rules) - rule_count_before} rules created.")
+        rule_count_before = len(self.rules)
 
         # --- owl:disjointWith ---
         # <A, owl:disjointWith, B> => Constraint
-        for s, o in self.graph.subject_objects(OWL.disjointWith):
+        axioms = list(self.graph.subject_objects(OWL.disjointWith))
+        print(f"  Found {len(axioms)} owl:disjointWith constraints...")
+        for s, o in axioms:
             class_s = self.get_class(s)
             class_o = self.get_class(o)
             if class_s and class_o:
@@ -502,7 +633,9 @@ class OntologyParser:
                 )
 
         # --- owl:FunctionalProperty ---
-        for s in self.graph.subjects(RDF.type, OWL.FunctionalProperty):
+        axioms = list(self.graph.subjects(RDF.type, OWL.FunctionalProperty))
+        print(f"  Found {len(axioms)} owl:FunctionalProperty constraints...")
+        for s in axioms:
             rel_s = self.get_object_property(s)
             if rel_s:
                 self.constraints.append(
@@ -524,7 +657,9 @@ class OntologyParser:
                 )
 
         # --- owl:IrreflexiveProperty ---
-        for s in self.graph.subjects(RDF.type, OWL.IrreflexiveProperty):
+        axioms = list(self.graph.subjects(RDF.type, OWL.IrreflexiveProperty))
+        print(f"  Found {len(axioms)} owl:IrreflexiveProperty constraints...")
+        for s in axioms:
             prop = self.get_object_property(s)  # e.g., hasParent
             if prop:
                 # Add constraint for the property itself
@@ -545,10 +680,6 @@ class OntologyParser:
                                 terms=[sub_prop],
                             )
                         )
-
-        print(f"Total rules parsed: {len(self.rules)}")
-        print(f"Total constraints parsed: {len(self.constraints)}")
-        print("----------------------------------")
 
     # ---------------------------------------------------------------------------- #
     #                                    COMPLEX                                   #
@@ -571,7 +702,10 @@ class OntologyParser:
                 prop = next(self.graph.objects(s, OWL.onProperty))
                 some_class = next(self.graph.objects(s, OWL.someValuesFrom))
 
-                rel_p = self.get_object_property(prop)  # Can only be ObjectProperty
+                rel_p = self.get_object_property(prop)
+                if not rel_p:  # Could be DatatypeProperty
+                    return
+
                 class_c = self.get_class(some_class)
                 class_a = self.get_class(o)  # The conclusion
 
