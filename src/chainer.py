@@ -5,17 +5,11 @@ DESCRIPTION
 
 WORKFLOW
 
-    - Shuffle the rules
-    - Keep track of generated facts' (hash-set) hashes to avoid duplicates
-    - For each rule, try to cover it by backward-chaining
-        - Each proof has its own variable bindings
-        - Track proof structures to ensure diversity
-        - If a proof (binding) fails, try again up to N times
-        - Keep proof-level hash-set to avoid duplicates within a proof
-        - When generating a fact, check constraints against:
-            - the main KG (kg_fact_cache)
-            - the proof being built (proof_fact_cache)
-    - Append hash of each generated fact to the KG-level hash set
+    - Initialize BackwardChainer with all rules from the ontology parser.
+    - Start from a "goal rule" and attempt to prove its conclusion.
+        - Recursively find proofs for each premise of the rule.
+        - Generate new individuals as needed for unbound variables.
+        - Track recursive rule usage to prevent infinite loops.
 
 AUTHOR
 
@@ -23,1200 +17,586 @@ AUTHOR
 """
 
 from collections import defaultdict
-import random
-import sys
-from typing import List, Union, Dict, Set, Tuple, Optional, Any
-from rdflib.namespace import RDF, OWL, RDFS, XSD
-
 from data_structures import (
+    Atom,
+    ExecutableRule,
+    Proof,
+    Var,
+    Term,
     Individual,
     Class,
     Relation,
     Attribute,
-    KnowledgeGraph,
-    Triple,
-    Membership,
-    AttributeTriple,
-    LiteralValue,
-    Var,
-    Term,
-    Constraint,
-    GoalPattern,
-    ExecutableRule,
 )
-from parser import OntologyParser
+from rdflib.namespace import RDF
+from typing import List, Dict, Set, Optional, Iterator, Tuple, Any
+import itertools
 
 
-class BackwardChainingGenerator:
-    # ---------------------------------------------------------------------------- #
-    #                                     INIT                                     #
-    # ---------------------------------------------------------------------------- #
+class BackwardChainer:
+    """
+    Generates proof trees and synthetic data via backward chaining.
+
+    This engine starts with a "goal rule" and tries to find all possible
+    proof trees for its conclusion, generating new individuals along the way.
+    """
 
     def __init__(
         self,
-        parsed_ontology: OntologyParser,
-        seed: Optional[int],
-        reuse_prob: float,
-        base_fact_prob: float,
-        verbose: bool,
+        all_rules: List[ExecutableRule],
+        max_recursion_depth: int = 2,
     ):
         """
-        Initializes the generator with a parsed ontology.
+        Initializes the chainer.
 
         Args:
-            parsed_ontology:    An instance of OntologyParser containing the parsed ontology.
-            seed:               Optional random seed for reproducibility.
-            reuse_prob:         Probability of reusing an existing individual.
-            base_fact_prob:     Base probability of generating a base fact in the proof tree.
-            verbose:            Whether to enable verbose output for debugging.
+            all_rules (List[ExecutableRule]):   All rules from the ontology parser.
+            max_recursion_depth (int):          Max number of times a recursive rule can be used in a single proof path.
+        """
+        # Dict {rule_name: ExecutableRule}
+        self.all_rules = {rule.name: rule for rule in all_rules}
+        self.max_recursion_depth = max_recursion_depth
+
+        # Initialize a Dict[Tuple, List[ExecutableRule]] for fast rule lookup based on the head
+        self.rules_by_head = self._index_rules(all_rules)
+
+        # Counters for generating unique entities
+        self._var_rename_counter = 0
+        self._individual_counter = 0
+
+    def _get_atom_key(self, atom: Atom) -> Optional[Tuple]:
+        """
+        Creates a hashable key for an atom to index rules.
+
+        Classes:    (rdf:type, 'Person')
+        Relations:  ('hasParent', None)
+        Attributes: ('age', None)
         """
 
-        # Set seed
-        random.seed(seed)
+        pred = atom.predicate
+        obj = atom.object
 
-        self.verbose = verbose
-
-        # ------------- KEEP TRACK OF NUMBER OF PROOFS ATTEMPTED PER RULE ------------ #
-
-        self.nb_proofs_attempted: defaultdict[str, int] = defaultdict(int)
-        self.proof_structures: Dict[str, Set[str]] = defaultdict(set)
-
-        # ----------------------- ONTOLOGY AND KNOWLEDGE GRAPH ----------------------- #
-
-        # Type OntologyParser
-        self.ontology = parsed_ontology
-
-        # Set probabilities
-        self.reuse_prob = reuse_prob
-        self.base_fact_prob = base_fact_prob
-
-        # Initialize empty KG with classes, relations, attributes from ontology
-        self.kg = KnowledgeGraph(
-            classes=list(self.ontology.classes.values()),
-            relations=list(self.ontology.relations.values()),
-            attributes=list(self.ontology.attributes.values()),
-            individuals=[],
-            triples=[],
-            memberships=[],
-            attribute_triples=[],
-        )
-
-        # ----------------------------- HELPER VARIABLES ----------------------------- #
-
-        # ind_counter keeps track of the next individual index to assign
-        self.ind_counter = 0
-
-        # A HashSet to quickly check for existing facts
-        # -> avoid duplicates and speed up constraint checking
-        self.kg_fact_cache: Set[int] = set()
-
-        # ----------------------------------- RULES ---------------------------------- #
-
-        self.rules_to_cover: List[ExecutableRule] = list(self.ontology.rules)
-        random.shuffle(self.rules_to_cover)  # Randomize rule order
-
-        self.covered_rules: Set[str] = set()
-
-        # -------------------------- INDEXED CONSTRAINTS ----------------------------- #
-
-        self.constraints_by_property: Dict[str, List[Constraint]] = defaultdict(list)
-        self.constraints_by_class: Dict[str, List[Constraint]] = defaultdict(list)
-        self.all_constraints: List[Constraint] = []
-        self._index_constraints()
-
-        # ---------------------------- GENERATION STATS ------------------------------ #
-
-        self.failed_constraint_checks = 0
-        self.duplicate_facts = 0
-        self.individuals_created = 0
-        self.individuals_reused = 0
-
-    # ---------------------------------------------------------------------------- #
-    #                              INDEX CONSTRAINTS                               #
-    # ---------------------------------------------------------------------------- #
-
-    def _index_constraints(self):
-        """Index constraints by relevant properties and classes for efficient lookup"""
-        for constraint in self.ontology.constraints:
-            self.all_constraints.append(constraint)
-
-            if constraint.constraint_type == OWL.FunctionalProperty:
-                prop = constraint.terms[0]
-                self.constraints_by_property[prop.name].append(constraint)
-
-            elif constraint.constraint_type == OWL.disjointWith:
-                for cls in constraint.terms:
-                    self.constraints_by_class[cls.name].append(constraint)
-
-            elif constraint.constraint_type == RDFS.range:
-                if len(constraint.terms) >= 1:
-                    prop = constraint.terms[0]
-                    self.constraints_by_property[prop.name].append(constraint)
-
-            elif constraint.constraint_type == OWL.IrreflexiveProperty:
-                prop = constraint.terms[0]
-                self.constraints_by_property[prop.name].append(constraint)
-
-    # ---------------------------------------------------------------------------- #
-    #                             CREATE/GET INDIVIDUAL                            #
-    # ---------------------------------------------------------------------------- #
-
-    def _get_or_create_individual(
-        self,
-        required_class: Optional[Class] = None,
-    ) -> Individual:
-        """
-        Creates a new individual or reuses an existing one from the KG with a certain probability.
-        If required_class is specified, only reuse individuals of that class.
-
-        Args:
-            required_class: If specified, only reuse individuals that are members of this class.
-        """
-        # Reuse existing individual from KG
-        if self.kg.individuals and random.random() < self.reuse_prob:
-            candidates = self.kg.individuals
-
-            # Filter by required class if specified
-            if required_class:
-                candidates = [
-                    ind
-                    for ind in self.kg.individuals
-                    if required_class in ind.get_class_memberships()
-                ]
-
-            if candidates:
-                if self.verbose:
-                    print(
-                        f"Reusing existing individual (class filter: {required_class.name if required_class else 'none'})",
-                        file=sys.stderr,
-                    )
-                self.individuals_reused += 1
-                return random.choice(candidates)
-
-        # Create a new one
-        self.ind_counter += 1
-        self.individuals_created += 1
-        name = f"ind_{self.ind_counter}"
-        ind = Individual(index=self.ind_counter, name=name, classes=[])
-        self.kg.individuals.append(ind)
-        return ind
-
-    # ---------------------------------------------------------------------------- #
-    #                            BIND TERM TO INDIVIDUAL                           #
-    # ---------------------------------------------------------------------------- #
-
-    def _resolve_term(
-        self,
-        term: Term,  # The Term (Var, Individual) to resolve
-        bindings: Dict[Var, Any],  # Current variable bindings
-        create_new: bool = True,  # Whether to create a new Individual for unbound Vars
-        required_class: Optional[Class] = None,  # Type hint for new individuals
-    ) -> Optional[Individual]:
-        """
-        Resolves a term to an Individual.
-        """
-
-        # -------------------------------- INDIVIDUAL -------------------------------- #
-
-        if isinstance(term, Individual):
-            return term
-
-        # ------------------------------------ VAR ----------------------------------- #
-
-        elif isinstance(term, Var):
-            # Already bound
-            if term in bindings:
-                bound_val = bindings[term]
-                if isinstance(bound_val, Individual):
-                    # Bound to an Individual
-                    return bound_val
-                else:
-                    # Bound to a non-Individual (e.g., literal)
-                    return None
-
-            # Not bound and allowed to create
-            elif create_new:
-                new_ind = self._get_or_create_individual(required_class=required_class)
-                bindings[term] = new_ind
-                return new_ind
-
-            # Not bound and not allowed to create
-            else:
-                if self.verbose:
-                    print(
-                        f"Warning: Var {term} not bound and create_new=False.",
-                        file=sys.stderr,
-                    )
-                return None
-
-        # --------------------------- Not individual or var -------------------------- #
-
-        else:
-            # Term can be Var, Individual, Class, Relation, Attribute or URIRef
-            if self.verbose:
-                print(
-                    f"Warning: Unable to resolve term {term}, because it is not an Individual or Var.",
-                    file=sys.stderr,
-                )
+        # Cannot index on a variable predicate
+        if isinstance(pred, Var):
             return None
 
-    # ---------------------------------------------------------------------------- #
-    #                                   ADD FACT                                   #
-    # ---------------------------------------------------------------------------- #
+        # Key on (rdf:type, ClassName)
+        if pred == RDF.type and not isinstance(obj, Var):
+            if isinstance(obj, Class):
+                # Class membership
+                return (RDF.type, obj.name)
+            else:
+                print(f"Warning: Unexpected object for rdf:type: {obj}")
+                return (RDF.type, str(obj))
 
-    def _add_fact_to_kg(self, fact: Union[Triple, Membership, AttributeTriple]):
+        # Key on (PredicateName, None)
+        else:
+            if isinstance(pred, (Relation, Attribute)):
+                return (pred.name, None)
+            else:
+                return (str(pred), None)
+
+    def _index_rules(
+        self, rules: List[ExecutableRule]
+    ) -> Dict[Tuple, List[ExecutableRule]]:
         """
-        Internal helper to add a fact to the KG and kg_fact_cache.
+        Indexes rules by their conclusion (head atom) for faster lookup.
 
         Args:
-            fact: The fact to add.
-
-        Note:
-            - Assumes the fact has already been checked for duplicates/constraints!!
-            - Updates the kg_fact_cache accordingly.
-        """
-
-        # ------------------------------- UPDATE CACHE ------------------------------- #
-
-        # Update the hashset cache (used to check for duplicates)
-        self.kg_fact_cache.add(hash(fact))
-
-        # --------------------------------- ADD TO KG -------------------------------- #
-
-        if isinstance(fact, Membership):
-            self.kg.memberships.append(fact)
-            fact.individual.classes.append(
-                fact  # Update individual's class memberships as well
-            )
-        elif isinstance(fact, Triple):
-            self.kg.triples.append(fact)
-        elif isinstance(fact, AttributeTriple):
-            self.kg.attribute_triples.append(fact)
-
-    # ---------------------------------------------------------------------------- #
-    #                                  CHECK FACT                                  #
-    # ---------------------------------------------------------------------------- #
-
-    def _valid_fact(
-        self,
-        fact: Union[Triple, Membership, AttributeTriple],
-        proof_fact_cache: Set[int],
-        proof_being_built: List[Union[Triple, Membership, AttributeTriple]] = [],
-    ) -> bool:
-        """
-        Checks that a fact does not violate constraints.
-        If it is already in the KG, it is considered valid.
-
-        Uses two caches:
-            - main kg_fact_cache (duplicates)
-            - a temporary proof_fact_cache for the current proof.
-
-        Args:
-            fact:               The fact to check.
-            proof_fact_cache:   A set of fact hashes for the current proof-being-built.
-        """
-
-        # Hash of the fact to be checked
-        fact_hash = hash(fact)
-
-        # Check for duplicates 1) in main KG and 2) in the current chain-being-built = current proof
-        if fact_hash in self.kg_fact_cache or fact_hash in proof_fact_cache:
-            self.duplicate_facts += 1
-            return True  # Valid, because it already exists
-
-        # 2. On-the-fly constraint checking
-        if not self._satisfies_constraints(fact, proof_being_built=proof_being_built):
-            self.failed_constraint_checks += 1
-            return False  # VIOLATION!
-
-        return True
-
-    # ---------------------------------------------------------------------------- #
-    #                              CONSTRAINT CHECKING                             #
-    # ---------------------------------------------------------------------------- #
-
-    def _satisfies_constraints(
-        self,
-        new_fact: Union[Triple, Membership, AttributeTriple],
-        proof_being_built: List[Union[Triple, Membership, AttributeTriple]] = [],
-    ) -> bool:
-        """
-        Checks if adding `new_fact` would violate any constraint.
-        Uses indexed constraints for efficiency.
-
-        Args:
-            new_fact:           The new fact to check.
-            proof_being_built:  Facts currently being built in this proof.
-        Returns:
-            True if no constraints are violated, False otherwise.
-        """
-
-        # Get relevant constraints based on fact type
-        relevant_constraints = []
-
-        if isinstance(new_fact, Triple):
-            relevant_constraints.extend(
-                self.constraints_by_property.get(new_fact.predicate.name, [])
-            )
-        elif isinstance(new_fact, Membership):
-            relevant_constraints.extend(
-                self.constraints_by_class.get(new_fact.cls.name, [])
-            )
-        elif isinstance(new_fact, AttributeTriple):
-            relevant_constraints.extend(
-                self.constraints_by_property.get(new_fact.predicate.name, [])
-            )
-
-        # Helper to get all triples for a subject+predicate combination
-        def get_all_triples(subj, prop):
-            # Check already-asserted facts
-            for t in self.kg.triples:
-                if t.subject == subj and t.predicate == prop:
-                    yield t
-
-            # Check chain-being-built
-            for t in proof_being_built:
-                if isinstance(t, Triple) and t.subject == subj and t.predicate == prop:
-                    yield t
-
-        # Helper to get all attributes for a subject+predicate combination
-        def get_all_attributes(subj, prop):
-            # Check already-asserted attribute triples
-            for at in self.kg.attribute_triples:
-                if at.subject == subj and at.predicate == prop:
-                    yield at
-
-            # Check chain-being-built
-            for at in proof_being_built:
-                if (
-                    isinstance(at, AttributeTriple)
-                    and at.subject == subj
-                    and at.predicate == prop
-                ):
-                    yield at
-
-        # ---------------------------------------------------------------------------- #
-        #                             CHECK ALL CONSTRAINTS                            #
-        # ---------------------------------------------------------------------------- #
-
-        # Loop over relevant constraints
-        for constraint in relevant_constraints:
-            #
-            # -------------------------- owl:disjointWith(A, B) -------------------------- #
-
-            if constraint.constraint_type == OWL.disjointWith:
-                class_a, class_b = constraint.terms
-
-                # The fact HAS to be a Membership to be have constraint_type disjointWith
-                if isinstance(new_fact, Membership):
-                    # Get the individual from the Membership
-                    ind = new_fact.individual
-
-                    # Get all classes from main KG
-                    ind_classes = ind.get_class_memberships()
-
-                    # Get classes from chain-being-built
-                    for cls in proof_being_built:
-                        if isinstance(cls, Membership) and cls.individual == ind:
-                            ind_classes.add(cls.cls)
-
-                    # Check for disjoint violation in KG and chain being built
-                    if new_fact.cls == class_a and class_b in ind_classes:
-                        return False
-                    if new_fact.cls == class_b and class_a in ind_classes:
-                        return False
-
-            # ----------------------- owl:FunctionalProperty(P) ------------------------ #
-
-            elif constraint.constraint_type == OWL.FunctionalProperty:
-                prop = constraint.terms[0]
-                subj = new_fact.subject
-
-                # Check Relation
-                if (
-                    isinstance(prop, Relation)
-                    and isinstance(new_fact, Triple)
-                    and new_fact.predicate == prop
-                ):
-                    for existing_triple in get_all_triples(subj, prop):
-                        if existing_triple.object != new_fact.object:
-                            return False
-
-                # Check Attribute
-                if (
-                    isinstance(prop, Attribute)
-                    and isinstance(new_fact, AttributeTriple)
-                    and new_fact.predicate == prop
-                ):
-                    for existing_attr_triple in get_all_attributes(subj, prop):
-                        if existing_attr_triple.value != new_fact.value:
-                            return False
-
-            # --------------------- rdfs:range (for DatatypeProperty) -------------------- #
-
-            elif constraint.constraint_type == RDFS.range and isinstance(
-                new_fact, AttributeTriple
-            ):
-                if len(constraint.terms) < 2:
-                    if self.verbose:
-                        print(
-                            f"Warning: Malformed rdfs:range constraint: {constraint}",
-                            file=sys.stderr,
-                        )
-                    continue
-
-                prop, data_type_uri = constraint.terms
-                if new_fact.predicate == prop:
-                    value = new_fact.value
-                    if data_type_uri == XSD.string and not isinstance(value, str):
-                        return False
-                    if data_type_uri == XSD.integer and not isinstance(value, int):
-                        return False
-                    if data_type_uri == XSD.float and not isinstance(value, float):
-                        return False
-                    if data_type_uri == XSD.boolean and not isinstance(value, bool):
-                        return False
-
-            # -------------------- rdfs:range (for ObjectTypeProperty) ------------------- #
-
-            elif constraint.constraint_type == RDFS.range and isinstance(
-                new_fact, Triple
-            ):
-                if len(constraint.terms) < 2:
-                    if self.verbose:
-                        print(
-                            f"Warning: Malformed rdfs:range constraint: {constraint}",
-                            file=sys.stderr,
-                        )
-                    continue
-
-                prop, expected_class = constraint.terms
-
-                if new_fact.predicate == prop:
-                    obj = new_fact.object
-                    obj_classes = obj.get_class_memberships()
-
-                    # Also check proof_being_built for class memberships
-                    for fact in proof_being_built:
-                        if isinstance(fact, Membership) and fact.individual == obj:
-                            obj_classes.add(fact.cls)
-
-                    if expected_class not in obj_classes:
-                        return False
-
-            # ------------------------ owl:IrreflexiveProperty(P) ------------------------ #
-
-            elif constraint.constraint_type == OWL.IrreflexiveProperty:
-                prop = constraint.terms[0]
-                if isinstance(new_fact, Triple) and new_fact.predicate == prop:
-                    if new_fact.subject == new_fact.object:
-                        if self.verbose:
-                            print(
-                                f"VIOLATION: Irreflexive property {prop.name} on {new_fact.subject.name}"
-                            )
-                        return False
-
-                    # Check subproperties
-                    for subproperty in self.ontology.get_subproperties(prop):
-                        if (
-                            isinstance(new_fact, Triple)
-                            and new_fact.predicate == subproperty
-                            and new_fact.subject == new_fact.object
-                        ):
-                            if self.verbose:
-                                print(
-                                    f"VIOLATION: Irreflexive property {subproperty.name} on {new_fact.subject.name}! "
-                                    f"The superproperty {prop.name} is irreflexive."
-                                )
-                            return False
-
-        return True  # No violations found
-
-    # ---------------------------------------------------------------------------- #
-    #                            CREATE PROOF SIGNATURE                            #
-    # ---------------------------------------------------------------------------- #
-
-    def _create_proof_signature(
-        self, facts: List[Union[Triple, Membership, AttributeTriple]]
-    ) -> str:
-        """
-        Create a signature representing the structure of the proof.
-        This helps ensure we generate diverse proofs, not just duplicate structures.
-        """
-        sig_parts = []
-        for fact in facts:
-            if isinstance(fact, Triple):
-                sig_parts.append(f"T:{fact.predicate.name}")
-            elif isinstance(fact, Membership):
-                sig_parts.append(f"M:{fact.cls.name}")
-            elif isinstance(fact, AttributeTriple):
-                sig_parts.append(f"A:{fact.predicate.name}")
-        return "|".join(sorted(sig_parts))
-
-    # ---------------------------------------------------------------------------- #
-    #                     PURE BACKWARD-CHAINING GENERATOR                         #
-    # ---------------------------------------------------------------------------- #
-
-    def generate(
-        self,
-        max_depth: int,
-        num_proofs_per_rule: int,
-    ) -> KnowledgeGraph:
-        """
-        Main generation loop. Tries to cover all rules via backward-chaining.
-
-        Args:
-            max_depth:              Maximum recursion depth for backward-chaining.
-            num_proofs_per_rule:    Number of diverse proofs to generate per rule.
-        """
-        print("--- Starting Generation ---")
-        print(f"Targeting {len(self.rules_to_cover)} rules.")
-
-        # Copy the rules to cover
-        rules_to_try = self.rules_to_cover.copy()
-
-        # ---------------------------------------------------------------------------- #
-        #                                LOOP OVER RULES                               #
-        # ---------------------------------------------------------------------------- #
-
-        # Loop over rules
-        for rule in rules_to_try:
-            successful_proofs = 0
-            attempts = 0
-            max_attempts = num_proofs_per_rule * 5  # Allow more attempts for diversity
-
-            # ---------------------------------------------------------------------------- #
-            #                          TRY MULTIPLE DIVERSE PROOFS                         #
-            # ---------------------------------------------------------------------------- #
-
-            while successful_proofs < num_proofs_per_rule and attempts < max_attempts:
-                attempts += 1
-
-                if self.verbose:
-                    print(
-                        f"----------------\nAttempting to cover rule: {rule.name} "
-                        f"(proof {successful_proofs + 1}/{num_proofs_per_rule}, attempt {attempts}/{max_attempts})",
-                        file=sys.stderr,
-                    )
-
-                # ------------- VARY GENERATION STRATEGY BASED ON PROOF NUMBER -------------- #
-
-                # Vary base_fact_prob to explore different proof strategies
-                if successful_proofs < num_proofs_per_rule // 3:
-                    # First third: prefer shallow proofs (more base facts)
-                    proof_base_prob = min(0.4, self.base_fact_prob * 8)
-                elif successful_proofs < 2 * num_proofs_per_rule // 3:
-                    # Second third: prefer deep proofs (fewer base facts)
-                    proof_base_prob = self.base_fact_prob * 0.3
-                else:
-                    # Last third: normal probability
-                    proof_base_prob = self.base_fact_prob
-
-                # Keep track of variable bindings
-                bindings: Dict[Var, Union[Individual, LiteralValue]] = {}
-
-                # Collect all facts that were created when trying to prove the premises
-                all_premise_facts: List[Union[Triple, Membership, AttributeTriple]] = []
-
-                # ------------------------ TRY TO SATISFY THE PREMISES ----------------------- #
-
-                all_premises_satisfied = True
-
-                # Loop over premises and try to satisfy them
-                for premise in rule.premises:
-                    # Try to satisfy the premise using Backward-Chaining
-                    success, facts_for_premise = self._generate_goal(
-                        premise,
-                        max_depth - 1,
-                        bindings,
-                        allow_base_case=True,
-                        base_fact_prob_override=proof_base_prob,
-                        max_depth_context=max_depth,
-                    )
-
-                    # If any premise fails, the whole rule fails
-                    if not success:
-                        all_premises_satisfied = False
-                        if self.verbose:
-                            print(
-                                f"Failed to satisfy premise {premise} for rule {rule.name}.",
-                                file=sys.stderr,
-                            )
-                        break
-
-                    # Collect all premise facts
-                    all_premise_facts.extend(facts_for_premise)
-
-                # -------------------------- ALL PREMISES SATISFIED -------------------------- #
-
-                if all_premises_satisfied:
-                    # All premises are satisfied, now create the conclusion
-                    inferred_fact = self._create_inferred_fact(
-                        rule.conclusion, bindings, is_inferred=True
-                    )
-
-                    if not inferred_fact:
-                        if self.verbose:
-                            print(
-                                f"Failed to create inferred fact for rule {rule.name}.",
-                                file=sys.stderr,
-                            )
-                        continue
-
-                    # Combine all facts: premises + inferred conclusion
-                    generated_facts = all_premise_facts + [inferred_fact]
-
-                    # Check for duplicate proof structure
-                    proof_sig = self._create_proof_signature(generated_facts)
-                    if proof_sig in self.proof_structures[rule.name]:
-                        if self.verbose:
-                            print(
-                                "Duplicate proof structure, trying different approach..."
-                            )
-                        continue
-
-                    # Check all generated facts for duplicates/constraints
-                    all_facts_valid = True
-
-                    # If a fact is valid, it is added to this temporary proof-level cache
-                    proof_cache: Set[int] = set()
-
-                    # ----------------------- CHECK FACTS IN REVERSE ORDER ----------------------- #
-
-                    for fact in reversed(generated_facts):
-                        if not self._valid_fact(
-                            fact, proof_cache, proof_being_built=generated_facts
-                        ):
-                            all_facts_valid = False
-                            if self.verbose:
-                                print(f"Proof failed constraint check for fact: {fact}")
-                            break
-
-                        # Valid, so add to proof cache
-                        proof_cache.add(hash(fact))
-
-                    # ------------------------- ALL FACTS VALID, ADD TO KG ------------------------ #
-
-                    if all_facts_valid:
-                        # Record successful proof structure
-                        self.proof_structures[rule.name].add(proof_sig)
-                        successful_proofs += 1
-
-                        # Add all generated facts to the KG
-                        for fact in reversed(generated_facts):
-                            if hash(fact) not in self.kg_fact_cache:
-                                self._add_fact_to_kg(fact)
-
-                        # Mark rule as covered
-                        self.covered_rules.add(rule.name)
-
-                        if self.verbose:
-                            print(
-                                f"Successfully generated proof {successful_proofs} for rule {rule.name}"
-                            )
-
-            # Record number of attempts for this rule
-            if rule.name in self.covered_rules:
-                self.nb_proofs_attempted[rule.name] = attempts
-
-        # ---------------------------------------------------------------------------- #
-        #                               END OF GENERATION                              #
-        # ---------------------------------------------------------------------------- #
-
-        self._print_generation_summary()
-        return self.kg
-
-    # ---------------------------------------------------------------------------- #
-    #                    BACKWARD CHAIN DOWN IN THE PROOF TREE                     #
-    # ---------------------------------------------------------------------------- #
-
-    def _generate_goal(
-        self,
-        goal: GoalPattern,
-        depth: int,
-        bindings: Dict[Var, Any],
-        allow_base_case: bool = True,
-        base_fact_prob_override: Optional[float] = None,
-        max_depth_context: Optional[int] = None,
-    ) -> Tuple[bool, List[Union[Triple, Membership, AttributeTriple]]]:
-        """
-        Recursively try to prove the goal by either:
-           - finding a rule that concludes the goal, and trying to prove its premises
-           - creating a base fact that matches the goal
-
-        Args:
-            goal:                   The goal pattern to satisfy.
-            depth:                  Remaining recursion depth.
-            bindings:               Current variable bindings.
-            allow_base_case:        Whether to allow generating base facts.
-            base_fact_prob_override: Override for base_fact_prob (for proof diversity).
-            max_depth_context:      Original max depth (for depth-dependent probability).
+            rules (List[ExecutableRule]): List of all rules.
 
         Returns:
-            A tuple (success, generated_facts).
+            Dict[Tuple, List[ExecutableRule]]: Mapping from atom keys to rules.
         """
-        # Hit depth limit
-        if depth <= 0:
-            return (False, [])
+        index: Dict[Tuple, List[ExecutableRule]] = defaultdict(
+            list
+        )  # automatically creates lists on new keys
 
-        # Calculate depth-dependent base fact probability
-        if max_depth_context is None:
-            max_depth_context = depth
+        # Index each rule by its conclusion
+        for rule in rules:
+            key = self._get_atom_key(rule.conclusion)
+            if key is not None:
+                index[key].append(rule)
+            else:
+                print(f"Warning: Cannot index rule with variable predicate: {rule}")
 
-        depth_ratio = 1 - (depth / max_depth_context)  # 0 at top, 1 at bottom
-        base_prob = (
-            base_fact_prob_override if base_fact_prob_override else self.base_fact_prob
+        # Return the completed index dictionary
+        return index
+
+    def _get_fresh_individual(self) -> Individual:
+        """
+        Generates a new, unique Individual.
+
+        Returns:
+            Individual: A new individual with a unique name.
+        """
+
+        idx = self._individual_counter
+        self._individual_counter += 1
+
+        return Individual(index=idx, name=f"Ind_{idx}")
+
+    def _get_vars_in_atom(self, atom: Atom) -> Set[Var]:
+        """
+        Returns all Var objects present in an atom.
+        """
+        vars: Set[Var] = set()
+        if isinstance(atom.subject, Var):
+            vars.add(atom.subject)
+        if isinstance(atom.predicate, Var):
+            vars.add(atom.predicate)
+        if isinstance(atom.object, Var):
+            vars.add(atom.object)
+        return vars
+
+    def _rename_rule_vars(self, rule: ExecutableRule) -> ExecutableRule:
+        """
+        Crete a new rule with all variables renamed to be unique.
+
+        e.g., (X, P, Y) -> (X, Q, Z)  becomes
+              (X_1, P, Y_1) -> (X_1, Q, Z_1)
+
+        Above, the triples are Atoms and the tuple items are Terms.
+
+        Args:
+            rule (ExecutableRule): The rule to rename variables for.
+
+        Returns:
+            ExecutableRule: A new rule instance with renamed variables.
+        """
+
+        # Update the counter
+        self._var_rename_counter += 1
+
+        # Create a unique suffix
+        suffix = f"_{self._var_rename_counter}"
+
+        # A map from old Var to new Var
+        var_map: Dict[Var, Var] = {}
+
+        def get_renamed_var(v: Var) -> Var:
+            # If the variable is not yet renamed, do so now
+            if v not in var_map:
+                var_map[v] = Var(v.name + suffix)
+
+            # If it is already renamed, return that renamed Var
+            return var_map[v]
+
+        # Rename one Term (part of an Atom, ground or not (Var))
+        def rename_term(t: Term) -> Term:
+            return get_renamed_var(t) if isinstance(t, Var) else t
+
+        renamed_conclusion = Atom(
+            subject=rename_term(rule.conclusion.subject),
+            predicate=rename_term(rule.conclusion.predicate),
+            object=rename_term(rule.conclusion.object),
         )
-
-        # Increase probability of base facts as we go deeper
-        adjusted_base_prob = base_prob + (depth_ratio * 0.25)
-        adjusted_base_prob = min(0.7, adjusted_base_prob)  # Cap at 70%
-
-        # Find rules from the ontology that can conclude this goal
-        applicable_rules = [
-            r for r in self.ontology.rules if r.conclusion.matches(goal)
+        renamed_premises = [
+            Atom(
+                subject=rename_term(p.subject),
+                predicate=rename_term(p.predicate),
+                object=rename_term(p.object),
+            )
+            for p in rule.premises
         ]
 
-        # Copy bindings to a temp variable for this proof attempt
-        temp_bindings = bindings.copy()
-
-        # ------------------- CREATE A BASE FACT WITH PROBABILITY p ------------------ #
-
-        if allow_base_case and random.random() < adjusted_base_prob:
-            if self.verbose:
-                if applicable_rules:
-                    print(
-                        f"Found {len(applicable_rules)} applicable rules, but opting for base case "
-                        f"(prob={adjusted_base_prob:.2f}, depth={depth}/{max_depth_context})"
-                    )
-                else:
-                    print(
-                        f"No applicable rules found, creating base fact for goal {goal} "
-                        f"(depth={depth}/{max_depth_context})"
-                    )
-
-            # Create base fact
-            success, base_fact = self._try_create_base_fact(goal, temp_bindings)
-
-            if success and base_fact:
-                # Commit successful bindings back to the parent scope
-                bindings.update(temp_bindings)
-                return (True, [base_fact])
-            else:
-                # Failed to create base fact => Try the rules instead (if any)
-                if self.verbose:
-                    print(
-                        f"Failed to create base fact for goal {goal}. Trying applicable rules instead.",
-                        file=sys.stderr,
-                    )
-
-        # Shuffle applicable_rules to introduce randomness
-        random.shuffle(applicable_rules)
-
-        # ------------------------- TRY APPLICABLE RULES ---------------------------- #
-
-        for rule in applicable_rules:
-            rule_to_try: ExecutableRule = rule
-
-            # Collect all premise facts generated when trying to prove the premises
-            all_premise_facts: List[Union[Triple, Membership, AttributeTriple]] = []
-            all_premises_satisfied = True
-
-            # Loop over premises and try to satisfy them
-            for premise in rule_to_try.premises:
-                # Try to prove the premise using BC on a lower depth
-                success, facts_for_premise = self._generate_goal(
-                    premise,
-                    depth - 1,
-                    temp_bindings,
-                    allow_base_case=True,
-                    base_fact_prob_override=base_fact_prob_override,
-                    max_depth_context=max_depth_context,
-                )
-
-                if not success:
-                    all_premises_satisfied = False
-                    break
-
-                # Collect all premise facts
-                all_premise_facts.extend(facts_for_premise)
-
-            # Goal proven if all premises are satisfied
-            if all_premises_satisfied:
-                # Create inferred fact that we were trying to prove (the goal)
-                inferred_fact = self._create_inferred_fact(
-                    rule_to_try.conclusion, temp_bindings, is_inferred=True
-                )
-
-                if inferred_fact:
-                    # Commit successful bindings to previous level of the proof tree
-                    bindings.update(temp_bindings)
-                    return (True, all_premise_facts + [inferred_fact])
-
-        # If we get here, we failed to prove the goal
-        if self.verbose:
-            print(f"Failed to prove goal {goal} at depth {depth}.", file=sys.stderr)
-        return (False, [])
-
-    # ---------------------------------------------------------------------------- #
-    #                                   BASE FACT                                  #
-    # ---------------------------------------------------------------------------- #
-
-    def _try_create_base_fact(
-        self, goal: GoalPattern, bindings: Dict[Var, Any]
-    ) -> Tuple[bool, Optional[Union[Triple, Membership, AttributeTriple]]]:
-        """
-        Tries to create a single base fact matching the goal.
-        """
-
-        # Determine required class for type-aware individual creation
-        required_class = None
-        if goal.predicate == RDF.type and isinstance(goal.object, Class):
-            required_class = goal.object
-
-        # Resolve subject
-        subject = self._resolve_term(
-            goal.subject, bindings, create_new=True, required_class=required_class
+        # Return a new rule instance
+        return ExecutableRule(
+            name=rule.name, conclusion=renamed_conclusion, premises=renamed_premises
         )
-        if not subject:
-            return (False, None)
 
-        # ------------------------------ CREATE NEW FACT ----------------------------- #
-
-        #### CLASS MEMBERSHIP ####
-        if goal.predicate == RDF.type and isinstance(goal.object, Class):
-            new_fact = Membership(
-                individual=subject,
-                cls=goal.object,
-                is_member=True,
-                is_inferred=False,
-            )
-
-        #### RELATION ####
-        elif isinstance(goal.predicate, Relation):
-            # Try to get required class from range constraints
-            range_class = None
-            for constraint in self.constraints_by_property.get(goal.predicate.name, []):
-                if (
-                    constraint.constraint_type == RDFS.range
-                    and len(constraint.terms) >= 2
-                ):
-                    _, potential_class = constraint.terms
-                    if isinstance(potential_class, Class):
-                        range_class = potential_class
-                        break
-
-            object_ind = self._resolve_term(
-                goal.object, bindings, create_new=True, required_class=range_class
-            )
-            if not object_ind:
-                return (False, None)
-
-            new_fact = Triple(
-                subject=subject,
-                predicate=goal.predicate,
-                object=object_ind,
-                positive=True,
-                is_inferred=False,
-            )
-
-        #### ATTRIBUTE ####
-        elif isinstance(goal.predicate, Attribute):
-            value = self._generate_literal_value(goal.object, goal.predicate, bindings)
-            if value is None:
-                return (False, None)
-
-            new_fact = AttributeTriple(
-                subject=subject,
-                predicate=goal.predicate,
-                value=value,
-                is_inferred=False,
-            )
-        else:
-            return (False, None)
-
-        # --------------------- check constraints and duplicates --------------------- #
-
-        if self._valid_fact(
-            new_fact, proof_fact_cache=set(), proof_being_built=[new_fact]
-        ):
-            return (True, new_fact)
-        else:
-            return (False, None)
-
-    # ---------------------------------------------------------------------------- #
-    #                                CREATE LITERAL                                #
-    # ---------------------------------------------------------------------------- #
-
-    def _generate_literal_value(
-        self, var: Var, attr: Attribute, bindings: Dict[Var, Any]
-    ) -> Optional[LiteralValue]:
+    def _unify(self, goal: Atom, pattern: Atom) -> Optional[Dict[Var, Term]]:
         """
-        Generates a random literal value for an attribute.
-        """
-        # Already bound?
-        if var in bindings:
-            val = bindings[var]
-            if isinstance(val, (str, int, float, bool)):
-                return val
-            else:
-                return None
-
-        # Find range constraint for this attribute
-        data_type_uri = None
-        for constraint in self.constraints_by_property.get(attr.name, []):
-            if constraint.constraint_type == RDFS.range and len(constraint.terms) >= 2:
-                data_type_uri = constraint.terms[1]
-                break
-
-        # Assign a random value of the appropriate type
-        value: LiteralValue
-        if data_type_uri == XSD.string:
-            value = f"{attr.name}_{random.randint(1000, 9999)}"
-        elif data_type_uri == XSD.integer:
-            value = random.randint(1, 100)
-        elif data_type_uri == XSD.float:
-            value = round(random.random() * 100.0, 2)
-        elif data_type_uri == XSD.boolean:
-            value = random.choice([True, False])
-        else:
-            # Default to string if no range is specified
-            value = f"val_{random.randint(100, 999)}"
-
-        # Bind the variable
-        bindings[var] = value
-        return value
-
-    # ---------------------------------------------------------------------------- #
-    #                             CREATE INFERRED FACT                             #
-    # ---------------------------------------------------------------------------- #
-
-    def _create_inferred_fact(
-        self,
-        conclusion: GoalPattern,
-        bindings: Dict[Var, Any],
-        is_inferred: bool = True,
-    ) -> Optional[Union[Triple, Membership, AttributeTriple]]:
-        """
-        Creates an inferred fact from a satisfied rule's conclusion.
+        Attempts to unify a GROUND goal atom with a rule's conclusion pattern.
 
         Args:
-            conclusion:     The conclusion goal pattern from the rule.
-            bindings:       Current variable bindings.
-            is_inferred:    Whether the created fact is inferred (True) or base (False).
+            goal:     A ground atom we want to prove  (e.g., parent(Ind_A, Ind_C))
+            pattern:  A rule head with variables      (e.g., parent(X_1, Y_1))
 
         Returns:
-            The created fact, or None if creation failed.
+            A substitution mapping from Var to Term if unification succeeds,
+            or None if unification fails.
         """
 
-        # Resolve subject based on current bindings
-        subject = self._resolve_term(conclusion.subject, bindings, create_new=False)
+        # Keep track of substitutions per Var, e.g.
+        # { Var('X_1'): Individual('Ind_A'), ... }
+        subst: Dict[Var, Term] = {}
 
-        if not subject:
-            if self.verbose:
-                print(
-                    f"Warning: Unbound subject variable {conclusion.subject} in conclusion {conclusion}.",
-                    file=sys.stderr,
-                )
-            subject = self._resolve_term(conclusion.subject, bindings, create_new=True)
-            if not subject:
-                return None
+        def unify_terms(t1: Term, t2: Term) -> bool:
+            """
+            Unify two terms, updating subst as needed.
 
-        # ---------------------------- CREATE MEMBERSHIP ----------------------------- #
+            Args:
+                t1: First term (ground)
+                t2: Second term (could be Var or ground)
 
-        if conclusion.predicate == RDF.type and isinstance(conclusion.object, Class):
-            return Membership(
-                individual=subject,
-                cls=conclusion.object,
-                is_member=True,
-                is_inferred=is_inferred,
-            )
+            Returns
+                True on success, False on failure.
+            """
 
-        # ----------------------------- CREATE TRIPLE ------------------------------- #
+            # If the second term t2 is a variable, try to bind it
+            if isinstance(t2, Var):
+                if t2 in subst and subst[t2] != t1:
+                    # Variable already bound to different value
+                    return False  # could not unify
 
-        elif isinstance(conclusion.predicate, Relation):
-            object_ind = self._resolve_term(
-                conclusion.object, bindings, create_new=False
-            )
+                # Not already bound or same binding
+                subst[t2] = t1
+                # Successful binding
+                return True
 
-            if not object_ind:
-                if self.verbose:
-                    print(
-                        f"Warning: Unbound object variable {conclusion.object} in conclusion {conclusion}.",
-                        file=sys.stderr,
-                    )
-                object_ind = self._resolve_term(
-                    conclusion.object, bindings, create_new=True
-                )
-                if not object_ind:
-                    return None
-
-            return Triple(
-                subject=subject,
-                predicate=conclusion.predicate,
-                object=object_ind,
-                positive=True,
-                is_inferred=is_inferred,
-            )
-
-        #### ATTRIBUTE ####
-        elif isinstance(conclusion.predicate, Attribute):
-            value = None
-
-            if isinstance(conclusion.object, Var):
-                value = bindings.get(conclusion.object)
+            # If the second term t2 is ground, then t1 must match it
             else:
-                value = conclusion.object
+                return t1 == t2
 
-            if value is None:
-                if self.verbose:
-                    print(
-                        f"Warning: Unbound value variable {conclusion.object} in conclusion {conclusion}."
-                    )
-                return None
-
-            return AttributeTriple(
-                subject=subject,
-                predicate=conclusion.predicate,
-                value=value,
-                is_inferred=is_inferred,
-            )
-
-        else:
-            if self.verbose:
-                print(
-                    f"Warning: Unable to create inferred fact for conclusion {conclusion}. Unknown predicate type.",
-                    file=sys.stderr,
-                )
+        # We assume that goal.subject, predicate, object are all ground
+        if not unify_terms(goal.subject, pattern.subject):
+            return None
+        if not unify_terms(goal.predicate, pattern.predicate):
+            return None
+        if not unify_terms(goal.object, pattern.object):
             return None
 
-    # ---------------------------------------------------------------------------- #
-    #                         GENERATION SUMMARY & STATISTICS                      #
-    # ---------------------------------------------------------------------------- #
+        return subst
 
-    def _print_generation_summary(self) -> None:
-        """Print summary of generation process"""
-        print("\n--- Generation Complete ---")
-        all_rule_names = {r.name for r in self.ontology.rules}
-        uncovered_rule_names = all_rule_names - self.covered_rules
+    def generate_proof_trees(self, start_rule_name: str) -> Iterator[Proof]:
+        """
+        Main entry point to generate proof trees starting from a specific rule.
 
-        print(f"Covered {len(self.covered_rules)}/{len(all_rule_names)} rules.")
+        Args:
+            start_rule_name (str): The name of the rule to use as the
+                                   starting point (e.g., "transitive_hasAncestor").
 
-        if uncovered_rule_names:
-            print(f"\nNot covered rules ({len(uncovered_rule_names)}):")
-            for r_name in sorted(list(uncovered_rule_names))[:10]:
-                print(f"  - {r_name}")
-            if len(uncovered_rule_names) > 10:
-                print(f"  ... and {len(uncovered_rule_names) - 10} more.")
+        Yields:
+            Proof: A complete, ground proof tree.
+        """
+        if start_rule_name not in self.all_rules:
+            print(f"Error: Rule '{start_rule_name}' not found.")
+            return
 
-        print(f"\nTotal Individuals: {len(self.kg.individuals)}")
-        print(f"  - Created: {self.individuals_created}")
-        print(f"  - Reused: {self.individuals_reused}")
-        print(f"Total Triples: {len(self.kg.triples)}")
-        print(f"Total Memberships: {len(self.kg.memberships)}")
-        print(f"Total Attribute Triples: {len(self.kg.attribute_triples)}")
+        # ------------------------------ RUNNING EXAMPLE ----------------------------- #
+        #
+        # Let's assume we want to prove the following rule:
+        #       hasParent(X, Y) ∧ hasParent(Y, Z) → hasGrandparent(X, Z)
+        #
+        # This is expressed in owl 2 rl as:
+        #       :hasGrandparent owl:propertyChainAxiom ( :hasParent :hasParent ) .
+        #
+        # Which is parsed into an ExecutableRule with:
+        #       conclusion  =   Atom(Var('X'), hasGrandparent, Var('Z'))
+        #       premises    = [ Atom(Var('X'), hasParent, Var('Y')),
+        #                       Atom(Var('Y'), hasParent, Var('Z')) ]
+        # ---------------------------------------------------------------------------- #
 
-    def print_generation_statistics(self) -> None:
-        """Print detailed statistics about the generated KG"""
-        print("\n" + "=" * 70)
-        print("GENERATION STATISTICS")
-        print("=" * 70)
+        # The 'raw', i.e. unrenamed, starting rule
+        start_rule = self.all_rules[start_rule_name]
+        # e.g. ExecutableRule(
+        #   conclusion=Atom(Var('X'), hasGrandparent, Var('Z')),
+        #   premises=[Atom(Var('X'), hasParent, Var('Y')), Atom(Var('Y'), hasParent, Var('Z'))]
+        # )
 
-        # Rule coverage details
-        print("\n RULE COVERAGE")
-        print(f"  Covered: {len(self.covered_rules)}/{len(self.ontology.rules)}")
+        # Rename rule vars
+        rule = self._rename_rule_vars(start_rule)
+        # e.g. ExecutableRule(
+        #   conclusion=Atom(Var('X_1'), hasGrandparent, Var('Z_1')),
+        #   premises=[Atom(Var('X_1'), hasParent, Var('Y_1')), Atom(Var('Y_1'), hasParent, Var('Z_1'))]
+        # )
 
-        if self.covered_rules:
-            print("\n  Proofs generated per covered rule:")
-            for rule_name in sorted(self.covered_rules):
-                num_proofs = len(self.proof_structures.get(rule_name, set()))
-                attempts = self.nb_proofs_attempted.get(rule_name, 0)
-                print(
-                    f"    {rule_name}: {num_proofs} diverse proofs ({attempts} attempts)"
+        # Create initial substitution
+        #   -> generate individuals for all variables in the rule's conclusion
+        subst: Dict[Var, Term] = {}
+        conclusion_vars = self._get_vars_in_atom(rule.conclusion)
+        # e.g. X_1, Z_1
+
+        if not conclusion_vars:
+            # If the head has no variables, like Atom(Ind_A, hasParent, Ind_B),
+            # it is already a fact and the generator can't start from it.
+            print(
+                f"Error: Rule '{start_rule_name}' conclusion has no variables. It is a fact."
+            )
+            return
+
+        # Generate individuals for all conclusion variables
+        for var in conclusion_vars:
+            subst[var] = self._get_fresh_individual()
+            # e.g. subst = {
+            #           Var('X_1'): Individual('Ind_0'),
+            #           Var('Z_1'): Individual('Ind_1')
+            #      }
+
+        # Create the ground goal we intend to prove
+        ground_goal = rule.conclusion.substitute(subst)
+        # e.g. Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
+
+        # ------------------- Find all sub-proofs for the premises ------------------- #
+
+        # This is the same logic as the recursive step in _find_proofs
+
+        # A frozenset is a mutable unordered collection, good for tracking
+        # recursive rule usage in proof paths like this.
+        recursive_use_counts = frozenset()
+        # The set will look like this:
+        #   { ('rule_name_1', count_1), ('rule_name_2', count_2), ... }
+        # Where the count is how many times that rule has been used in the current proof path.
+        # If the count exceeds max_recursion_depth, we skip that rule.
+
+        if rule.is_recursive():
+            # If the starting rule is recursive, we count its first usage
+            recursive_use_counts = frozenset([(rule.name, 1)])
+
+        # Find unbound variables in premises and substitute them based on subst dictionary from above
+        #   -> this new list can still contain variables that need grounding!
+        premises_with_bound_vars = [p.substitute(subst) for p in rule.premises]
+        # e.g. [ Atom(Individual('Ind_0'), hasParent, Var('Y_1')),
+        #        Atom(Var('Y_1'), hasParent, Individual('Ind_1')) ]
+
+        # Find any new variables (after the substitutions above) and add
+        # them to the unbound variables set
+        unbound_vars: Set[Var] = set()
+        for p in premises_with_bound_vars:
+            unbound_vars.update(self._get_vars_in_atom(p))
+        # e.g. { Var('Y_1') }
+
+        # Generate individuals for any unbound variables in the premises,
+        # because before we try to prove these premises, they must be ground
+        for var in unbound_vars:
+            if var not in subst:
+                # Should always be true
+                # e.g. 'Y_1' not in subst = { 'X_1': Ind_0, 'Z_1': Ind_1 }
+                subst[var] = self._get_fresh_individual()
+
+        # e.g. subst = {
+        #           Var('X_1'): Individual('Ind_0'),
+        #           Var('Z_1'): Individual('Ind_1'),
+        #           Var('Y_1'): Individual('Ind_2')     # new
+        #      }
+
+        # Final grounding of premises
+        ground_premises = [p.substitute(subst) for p in premises_with_bound_vars]
+        # e.g. [ Atom(Individual('Ind_0'), hasParent, Individual('Ind_2')),
+        #        Atom(Individual('Ind_2'), hasParent, Individual('Ind_1')) ]
+
+        # Keep track of all Iterator objects that are yielding sub-proofs for each premise
+        premise_sub_proof_iters = []
+
+        # Handle the case of zero-premise rules
+        if not ground_premises:
+            print("WARNING: Rule with no premises encountered.")
+
+            # This rule has no premises, so it's a generator of base facts.
+            yield Proof.create_base_proof(ground_goal)
+            return
+
+        failed_to_prove_a_premise = False
+
+        # Find proofs for all (now ground) premises
+        for premise in ground_premises:
+            # Get all Iterator[Proof]'s for this premise
+            # and pass the current recursion tracker
+            iter_proofs = self._find_proofs_recursive(premise, recursive_use_counts)
+
+            if not list(iter_proofs):
+                # No proofs found for this premise, so the whole rule fails
+                failed_to_prove_a_premise = True
+                break
+
+            # Collect the iterator
+            premise_sub_proof_iters.append(list(iter_proofs))
+
+        # Check if any premise failed to find a proof
+        if failed_to_prove_a_premise:
+            return  # This whole proof for the goal fails
+
+        # E.g., right now we have:
+        #   premise_sub_proof_iters = [
+        #       [Proof1_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_0, Ind_2), ...],
+        #       [Proof1_for_parent(Ind_2, Ind_1), Proof2_for_parent(Ind_2, Ind_1), ...],
+        #   ]
+
+        # Yield all combinations of sub-proofs by taking the Cartesian product of the iterators
+
+        # e.g., for two premises A and B:
+        #   for proof_A in proofs_for_A:
+        #       for proof_B in proofs_for_B:
+        #           yield Proof(goal, rule, [proof_A, proof_B])
+
+        # for the grandparent example, we get that all_sub_proof_combinations will yield:
+        #   (Proof1_for_parent(Ind_0, Ind_2), Proof1_for_parent(Ind_2, Ind_1))
+        #   (Proof1_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_2, Ind_1))
+        #   (Proof2_for_parent(Ind_0, Ind_2), Proof1_for_parent(Ind_2, Ind_1))
+        #   (Proof2_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_2, Ind_1))
+        for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
+            yield Proof.create_derived_proof(
+                goal=ground_goal,  # grounded goal atom
+                rule=start_rule,  # unrenamed rule
+                sub_proofs=list(sub_proof_combination),
+            )
+
+    def _find_proofs_recursive(
+        self, goal_atom: Atom, recursive_use_counts: frozenset[Tuple[str, int]]
+    ) -> Iterator[Proof]:
+        """
+        Recursively finds all possible proof trees for a given ground atom.
+
+        Args:
+            goal_atom (Atom):               A *ground* atom to prove (e.g., parent(Ind_A, Ind_C)).
+            recursive_use_counts (frozenset):  Tracks recursive rule usage.
+
+        Yields:
+            Proof: A valid proof tree for the goal_atom.
+        """
+
+        # ------------------------------ RUNNING EXAMPLE ----------------------------- #
+        #
+        # Let's resume the running example of proving grandparent based on 2 x parent.
+        #
+        # Assume that in the generate_proof_trees function above, our goal was
+        #       rule.conclusion = Atom(Var('X'), hasGrandparent, Var('Z'))
+        # which got grounded to
+        #       goal_atom = Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
+        # leading - after creating individuals for the premises atoms - to the subst dictionary:
+        #       subst = {
+        #                   Var('X'): Individual('Ind_0'),
+        #                   Var('Z'): Individual('Ind_1'),
+        #                   Var('Y'): Individual('Ind_2')    # generated for the premises
+        #               }
+        # So, we now want to prove the premises:
+        #       Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+        #       Atom(Individual('Ind_2'), hasParent, Individual('Ind_1'))
+        # That's where this recursive function comes in.
+        #
+        # Let's assume that the function is called for the first premise:
+        #       goal_atom = Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+        #
+        # ---------------------------------------------------------------------------- #
+
+        # Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+        # gets converted to a hashable key for rule lookup:
+        #   e.g. key = ('hasParent', None)
+        key = self._get_atom_key(goal_atom)
+
+        # Find all rules whose conclusion matches this atom,
+        # i.e. rules we could apply to prove our goal_atom
+        matching_rules = self.rules_by_head.get(key, [])
+        #   e.g. [ ExecutableRule(  conclusion  =   Atom(Var('X'), hasParent, Var('Y')),
+        #                           premises    = [ Atom(Var('Y'), hasChild, Var('X'))  ]),
+        #          ... ]
+        # These rules are not renamed yet!
+
+        # ---------------------------------------------------------------------------- #
+        #                                   BASE CASE                                  #
+        # ---------------------------------------------------------------------------- #
+
+        # If we can't use rules to prove the goal atom, it must be a base fact.
+        if not matching_rules:
+            yield Proof.create_base_proof(goal_atom)
+            return
+
+        # ---------------------------------------------------------------------------- #
+        #                                RECURSIVE CASE                                #
+        # ---------------------------------------------------------------------------- #
+
+        # Try all matching rules to prove the goal atom
+        for original_rule in matching_rules:
+            #
+            # If the rule is recursive
+            #   -> check if we've hit max recursion depth
+            #   -> update the recursion tracker
+            if original_rule.is_recursive():
+                #
+                # Get the number of times this rule has been used recursively so far
+                current_recursive_uses = dict(recursive_use_counts).get(
+                    original_rule.name, 0
                 )
 
-        # Connectivity analysis
-        print("\n GRAPH CONNECTIVITY")
-        connected_individuals = set()
-        for triple in self.kg.triples:
-            connected_individuals.add(triple.subject)
-            connected_individuals.add(triple.object)
+                # Skip this rule if we've hit max recursion depth
+                if current_recursive_uses >= self.max_recursion_depth:
+                    continue
 
-        isolated = len(self.kg.individuals) - len(connected_individuals)
-        connectivity_ratio = (
-            len(connected_individuals) / len(self.kg.individuals) * 100
-            if self.kg.individuals
-            else 0
-        )
-        print(
-            f"  Connected individuals: {len(connected_individuals)}/{len(self.kg.individuals)} ({connectivity_ratio:.1f}%)"
-        )
-        print(f"  Isolated individuals: {isolated}")
+                # Make a new recursion tracker with updated count
+                new_counts = dict(recursive_use_counts)
+                new_counts[original_rule.name] = current_recursive_uses + 1
+                new_recursive_use_counts = frozenset(new_counts.items())
 
-        # Fact distribution
-        all_facts = self.kg.triples + self.kg.memberships + self.kg.attribute_triples
-        base_facts = [f for f in all_facts if not f.is_inferred]
-        inferred_facts = [f for f in all_facts if f.is_inferred]
+            else:
+                # Non-recursive rule, no changes to recursion tracker
+                new_recursive_use_counts = recursive_use_counts
 
-        print("\n FACT DISTRIBUTION")
-        print(f"  Total facts: {len(all_facts)}")
-        print(
-            f"  Base facts: {len(base_facts)} ({len(base_facts) / len(all_facts) * 100:.1f}%)"
-        )
-        print(
-            f"  Inferred facts: {len(inferred_facts)} ({len(inferred_facts) / len(all_facts) * 100:.1f}%)"
-        )
+            # Rename the rule variables
+            rule = self._rename_rule_vars(original_rule)
+            # e.g. ExecutableRule(  conclusion  =   Atom(Var('X_3'), hasParent, Var('Y_3')),
+            #                       premises    = [ Atom(Var('Y_3'), hasChild, Var('X_3'))  ])
 
-        # Relation usage
-        relation_counts = defaultdict(int)
-        for triple in self.kg.triples:
-            relation_counts[triple.predicate.name] += 1
+            # Unify our ground goal with the rule conclusion (that has variables)
+            #       Recall that _unify(t1, t2) returns a substitution dict from Var to Term
+            #       and t1 needs to be GROUND.
+            subst = self._unify(goal_atom, rule.conclusion)
+            # e.g. unifying goal_atom       = Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+            #      with     rule.conclusion = Atom(Var('X_3'), hasParent, Var('Y_3'))
+            #      yields   subst = {
+            #                   Var('X_3'): Individual('Ind_0'),
+            #                   Var('Y_3'): Individual('Ind_2')
+            #               }
+            if subst is None:
+                # Should not happen
+                print(
+                    f"Warning: Unification failed between goal {goal_atom} and rule conclusion {rule.conclusion}"
+                )
+                continue
 
-        if relation_counts:
-            print("\n RELATION USAGE")
-            for rel, count in sorted(relation_counts.items(), key=lambda x: -x[1]):
-                print(f"  {rel}: {count}")
+            # Substitute the found substitutions into the rule premises
+            premises_with_bound_vars = [p.substitute(subst) for p in rule.premises]
+            # e.g. [ Atom(Individual('Ind_2'), hasChild, Individual('Ind_0')) ]
 
-        # Class membership distribution
-        class_counts = defaultdict(int)
-        for membership in self.kg.memberships:
-            class_counts[membership.cls.name] += 1
+            # Find any new variables in the premises (after substitution)
+            unbound_vars: Set[Var] = set()
+            for p in premises_with_bound_vars:
+                unbound_vars.update(self._get_vars_in_atom(p))
 
-        if class_counts:
-            print("\n CLASS MEMBERSHIP DISTRIBUTION")
-            for cls, count in sorted(class_counts.items(), key=lambda x: -x[1]):
-                print(f"  {cls}: {count}")
+            # Generate individuals for any unbound variables in the premises
+            for var in unbound_vars:
+                if var not in subst:
+                    # The if above should always be true
+                    subst[var] = self._get_fresh_individual()
 
-        # Attribute usage
-        attribute_counts = defaultdict(int)
-        for attr_triple in self.kg.attribute_triples:
-            attribute_counts[attr_triple.predicate.name] += 1
+            # Final grounding of premises
+            ground_premises = [p.substitute(subst) for p in premises_with_bound_vars]
 
-        if attribute_counts:
-            print("\n ATTRIBUTE USAGE")
-            for attr, count in sorted(attribute_counts.items(), key=lambda x: -x[1]):
-                print(f"  {attr}: {count}")
+            if not ground_premises:
+                print("WARNING: Rule with no premises encountered.")
+                # This is also a form of "base fact" for the chain.
+                yield Proof.create_derived_proof(
+                    goal=goal_atom, rule=original_rule, sub_proofs=[]
+                )
+                continue
 
-        # Generation efficiency
-        print("\n GENERATION EFFICIENCY")
-        print(f"  Failed constraint checks: {self.failed_constraint_checks}")
-        print(f"  Duplicate facts encountered: {self.duplicate_facts}")
+            # Get all Iterators that yield the proofs for the premises
+            # of the current rule
+            premise_sub_proof_iters = []
 
-        total_attempts = sum(self.nb_proofs_attempted.values())
-        if total_attempts > 0:
-            success_rate = len(self.covered_rules) / len(self.ontology.rules) * 100
-            print(f"  Total proof attempts: {total_attempts}")
-            print(f"  Success rate: {success_rate:.1f}%")
+            failed_to_prove_a_premise = False
 
-        print("\n" + "=" * 70)
+            # Try to prove all premises
+            for premise in ground_premises:
+                # Recurse
+                proofs = list(
+                    self._find_proofs_recursive(premise, new_recursive_use_counts)
+                )
 
-    def print_proof_attempts_per_rule(self) -> None:
-        """
-        Prints the number of proof attempts made per rule (legacy method).
-        """
-        print("\n--- Number of Proof Attempts per Rule ---")
-        for rule_name, attempts in self.nb_proofs_attempted.items():
-            num_proofs = len(self.proof_structures.get(rule_name, set()))
-            print(
-                f"  Rule: {rule_name}, Diverse Proofs: {num_proofs}, Attempts: {attempts}"
-            )
+                if not proofs:
+                    # This premise is unprovable, so this rule fails
+                    failed_to_prove_a_premise = True
+                    break
+                premise_sub_proof_iters.append(proofs)
+
+            # Check if any premise failed to find a proof
+            if failed_to_prove_a_premise:
+                continue  # Try the next rule
+
+            # Yield all combinations of sub-proofs by taking the Cartesian product of the iterators
+            for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
+                yield Proof.create_derived_proof(
+                    goal=goal_atom,
+                    rule=original_rule,
+                    sub_proofs=list(sub_proof_combination),
+                )
