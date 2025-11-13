@@ -251,7 +251,7 @@ def main():
         description="Ontology-based Knowledge Graph Data Generator"
     )
     parser.add_argument(
-        "ontology_path",
+        "--ontology-path",
         type=str,
         default=default_ontology_path,
         help=f"Path to the ontology file (default: '{default_ontology_path}')",

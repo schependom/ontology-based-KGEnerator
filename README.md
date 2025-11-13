@@ -21,14 +21,10 @@ python src/generator.py <args>
 
 Where `<args>` can include:
 
-| Argument                   | Description                                                   |
-| -------------------------- | ------------------------------------------------------------- |
-| `--ontology`               | Path to the ontology file                                     |
-| `--seed`                   | Random seed for reproducibility                               |
-| `--max_proof_depth`        | Maximum depth of the proof tree                               |
-| `--max_nb_proofs_per_rule` | Number of proofs to try to prove each rule in the ontology    |
-| `--reuse_prob`             | Probability $p_r$ of reusing an existing individual           |
-| `--base_fact_prob`         | Probability $p_b$ of generating a base fact in the proof tree |
+| Argument                | Description                                              |
+| ----------------------- | -------------------------------------------------------- |
+| `--ontology-path`       | Path to the ontology file in turtle format.              |
+| `--max-recursion-depth` | Maximum depth for recursive rule applications in proofs. |
 
 To see more information and the default values, run:
 

@@ -57,7 +57,7 @@
              rdf:type owl:TransitiveProperty ;
              rdf:type owl:IrreflexiveProperty .
 
-:hasGrandparent owl:propertyChainAxiom ( :hasParent :hasParent ) .
+# :hasGrandparent owl:propertyChainAxiom ( :hasParent :hasParent ) .
 
 # Rule: (X, hasParent, Y) -> (X, hasAncestor, Y)
 :hasParent rdfs:subPropertyOf :hasAncestor .
