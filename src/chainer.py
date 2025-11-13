@@ -393,15 +393,17 @@ class BackwardChainer:
         for premise in ground_premises:
             # Get all Iterator[Proof]'s for this premise
             # and pass the current recursion tracker
-            iter_proofs = self._find_proofs_recursive(premise, recursive_use_counts)
+            proof_list = list(
+                self._find_proofs_recursive(premise, recursive_use_counts)
+            )
 
-            if not list(iter_proofs):
+            if not proof_list:
                 # No proofs found for this premise, so the whole rule fails
                 failed_to_prove_a_premise = True
                 break
 
-            # Collect the iterator
-            premise_sub_proof_iters.append(list(iter_proofs))
+            # Collect the list of proofs
+            premise_sub_proof_iters.append(proof_list)
 
         # Check if any premise failed to find a proof
         if failed_to_prove_a_premise:
@@ -579,15 +581,17 @@ class BackwardChainer:
             # Try to prove all premises
             for premise in ground_premises:
                 # Recurse
-                proofs = list(
-                    self._find_proofs_recursive(premise, new_recursive_use_counts)
+                proof_list = list(
+                    self._find_proofs_recursive(premise, recursive_use_counts)
                 )
 
-                if not proofs:
-                    # This premise is unprovable, so this rule fails
+                if not proof_list:
+                    # No proofs found for this premise, so the whole rule fails
                     failed_to_prove_a_premise = True
                     break
-                premise_sub_proof_iters.append(proofs)
+
+                # Collect the list of proofs
+                premise_sub_proof_iters.append(proof_list)
 
             # Check if any premise failed to find a proof
             if failed_to_prove_a_premise:
