@@ -17,6 +17,21 @@
            rdfs:range :Person ;
            rdf:type owl:IrreflexiveProperty .
 
+:hasGrandparent rdf:type owl:ObjectProperty ;
+             rdf:type owl:IrreflexiveProperty ;
+             rdfs:domain :Person ;
+             rdfs:range :Person .
+
+:hasGrandfather rdf:type owl:ObjectProperty ;
+            rdfs:subPropertyOf :hasGrandparent ;
+            rdfs:domain :Person ;
+            rdfs:range :Person .
+
+:hasGrandfather owl:propertyChainAxiom ( :hasParent :hasFather ) .
+
+:hasFather rdfs:range :Man ;
+           rdfs:subPropertyOf :hasParent .
+
 :hasChild   rdf:type owl:ObjectProperty ;
             owl:inverseOf :hasParent ;
             rdf:type owl:IrreflexiveProperty ;

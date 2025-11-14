@@ -38,7 +38,7 @@ from data_structures import (
     Term,
 )
 from parser import OntologyParser
-from chainer import BackwardChainer
+from verbose_chainer import BackwardChainer
 
 
 class KGenerator:
