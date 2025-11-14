@@ -16,8 +16,7 @@ DESCRIPTION:
 
 AUTHOR
 
-    Based on user request.
-    Improved by Gemini.
+    Vincent Van Schependom
 """
 
 from rdflib import Graph, URIRef, Literal, BNode
