@@ -322,7 +322,7 @@ class Var:
     name: str
 
     def __repr__(self):
-        return f"?{self.name}"
+        return f"{self.name}"
 
 
 @dataclass(frozen=True)  # Atoms are immutable and hashable

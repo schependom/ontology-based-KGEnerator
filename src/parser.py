@@ -1,592 +1,417 @@
 """
-DESCRIPTION
+DESCRIPTION:
 
-    Parses an OWL ontology file (.ttl) and extracts classes, relations,
-    attributes, executable rules, and constraints for use in backward chaining.
+    Ontology Parser (OntologyParser)
 
-WORKFLOW
+    Parses an OWL/RDFS ontology file (e.g., .ttl) and translates
+    OWL 2 RL axioms into executable rules and constraints for
+    the backward chainer.
 
-    1. Load the ontology using rdflib.
-    2. Identify and create Class, Relation, and Attribute entities.
-    3. Translate OWL/RDFS axioms into ExecutableRule and Constraint objects.
+    It populates:
+        - self.rules: List[ExecutableRule]
+        - self.constraints: List[Constraint]
+        - self.classes: Dict[str, Class]
+        - self.relations: Dict[str, Relation]
+        - self.attributes: Dict[str, Attribute]
 
 AUTHOR
 
-    Vincent Van Schependom
+    Based on user request.
+    Improved by Gemini.
 """
 
+from rdflib import Graph, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS, OWL, XSD
-from rdflib.term import BNode, URIRef, Literal
-import rdflib
+from typing import Dict, List, Set, Optional, Tuple, Union
 
-from typing import List, Union, Set, Dict, Optional
-
+# Custom imports from your provided files
 from data_structures import (
+    KnowledgeGraph,
     Individual,
     Class,
     Relation,
     Attribute,
-    Var,
-    Term,
+    Triple,
+    Membership,
+    AttributeTriple,
     Atom,
+    Proof,
+    Term,
+    Var,
     ExecutableRule,
     Constraint,
 )
 
 
-# ---------------------------------------------------------------------------- #
-#                                    HELPER                                    #
-# ---------------------------------------------------------------------------- #
-
-
-def remove_uri_prefix(uri: str) -> str:
-    """Removes common URI prefixes for better readability."""
-    if "#" in uri:
-        return uri.split("#")[-1]
-    if "/" in uri:
-        return uri.split("/")[-1]
-    return uri
-
-
-# ---------------------------------------------------------------------------- #
-#                                 ACTUAL PARSER                                #
-# ---------------------------------------------------------------------------- #
-
-
 class OntologyParser:
-    def __init__(
-        self,
-        filepath: str,
-        filetype: Optional[str] = "turtle",
-        seed: Optional[int] = None,
-    ):
+    """
+    Parses an ontology file and extracts schema, rules, and constraints.
+    """
+
+    def __init__(self, ontology_file: str):
         """
-        Parses an OWL ontology and extracts classes, relations, rules, and constraints.
+        Initializes the parser, loads the graph, and parses the ontology.
 
         Args:
-            filepath (str):             Path to the ontology file.
-            filetype (str, optional):   Format of the ontology file (default: "turtle").
+            ontology_file (str): Path to the .ttl ontology file.
         """
+        self.graph = Graph()
+        try:
+            self.graph.parse(ontology_file, format="turtle")
+        except Exception as e:
+            print(f"Error parsing ontology file: {e}")
+            raise
 
-        self.graph = rdflib.Graph()
-        self.graph.parse(filepath, format=filetype)
+        # Storage for schema elements
+        self.classes: Dict[str, Class] = {}
+        self.relations: Dict[str, Relation] = {}
+        self.attributes: Dict[str, Attribute] = {}
 
-        # Entity storage
-        self.classes: Dict[str, Class] = {}  # name -> Class
-        self.relations: Dict[str, Relation] = {}  # name -> Relation
-        self.attributes: Dict[str, Attribute] = {}  # name -> Attribute
+        # Index counters
+        self._class_idx = 0
+        self._rel_idx = 0
+        self._attr_idx = 0
 
-        # Entity sets for quick lookup by URI
-        self._class_uris: Set[str] = set()
-        self._relation_uris: Set[str] = set()
-        self._attribute_uris: Set[str] = set()
-
-        # Output lists
+        # Storage for parsed rules and constraints
         self.rules: List[ExecutableRule] = []
         self.constraints: List[Constraint] = []
 
-        # Helper map for constraint propagation
-        self.sub_property_map: Dict[str, Set[Relation]] = {}
+        # Re-usable variables for rule creation
+        self.X = Var("X")
+        self.Y = Var("Y")
+        self.Z = Var("Z")
 
-        self._parse_schema()
+        # --- Main parsing pipeline ---
+        print("Discovering schema (Classes, Properties)...")
+        self._discover_schema()
+        print("Parsing ontology axioms into rules and constraints...")
+        self._setup_handlers()
         self._parse_rules_and_constraints()
+        print("Ontology parsing complete.")
 
-    # ---------------------------------------------------------------------------- #
-    #                                 SCHEMA PARSING                               #
-    # ---------------------------------------------------------------------------- #
+    def _get_clean_name(self, uri: URIRef) -> str:
+        """
+        Removes the URI prefix to get a clean name.
+        e.g., "http://example.org/family#hasParent" -> "hasParent"
+        """
+        if (
+            isinstance(uri, BNode)
+            or isinstance(uri, Literal)
+            or not isinstance(uri, URIRef)
+        ):
+            return str(uri)
 
-    def _get_or_create_class(self, uri: URIRef) -> Optional[Class]:
-        """Gets or creates a Class from a URI."""
-        if isinstance(uri, BNode) or isinstance(uri, Literal):
-            return None
+        name_str = str(uri)
 
-        uri_str = str(uri)
-        name = remove_uri_prefix(uri_str)
+        # Try to use rdflib's built-in qname (prefixed name)
+        try:
+            qname = self.graph.namespace_manager.qname(uri)
+            if ":" in qname and not qname.startswith("http"):
+                return qname.split(":", 1)[-1]
+        except:
+            pass  # Fallback to manual split
 
-        if name in self.classes:
-            return self.classes[name]
+        # Manual fallback
+        if "#" in name_str:
+            return name_str.split("#")[-1]
 
-        # Avoid creating a class if it's already a property
-        if name in self.relations or name in self.attributes:
-            return None
+        return name_str.split("/")[-1]
 
-        # Create new class
-        index = len(self.classes)
-        cls = Class(index, name)
-        self.classes[name] = cls
-        self._class_uris.add(uri_str)
-        return cls
+    # --- Schema Get-or-Create Methods ---
 
-    def _get_or_create_relation(self, uri: URIRef) -> Optional[Relation]:
-        """Gets or creates a Relation (ObjectProperty) from a URI."""
-        if isinstance(uri, BNode) or isinstance(uri, Literal):
-            return None
+    def _get_class(self, uri: URIRef) -> Class:
+        """Gets or creates a Class object from a URI."""
+        name = self._get_clean_name(uri)
+        if name not in self.classes:
+            self.classes[name] = Class(index=self._class_idx, name=name)
+            self._class_idx += 1
+        return self.classes[name]
 
-        uri_str = str(uri)
-        name = remove_uri_prefix(uri_str)
+    def _get_relation(self, uri: URIRef) -> Relation:
+        """Gets or creates a Relation (ObjectProperty) object from a URI."""
+        name = self._get_clean_name(uri)
+        if name not in self.relations:
+            self.relations[name] = Relation(index=self._rel_idx, name=name)
+            self._rel_idx += 1
+        return self.relations[name]
 
+    def _get_attribute(self, uri: URIRef) -> Attribute:
+        """Gets or creates an Attribute (DatatypeProperty) object from a URI."""
+        name = self._get_clean_name(uri)
+        if name not in self.attributes:
+            self.attributes[name] = Attribute(index=self._attr_idx, name=name)
+            self._attr_idx += 1
+        return self.attributes[name]
+
+    def _get_term(self, uri: URIRef) -> Union[Relation, Attribute]:
+        """
+        Gets or creates a property (Relation or Attribute).
+        Checks the graph for its type. Defaults to Relation if unknown.
+        """
+        name = self._get_clean_name(uri)
         if name in self.relations:
             return self.relations[name]
-
-        # Avoid creating a relation if it's a class or attribute
-        if name in self.classes or name in self.attributes:
-            return None
-
-        index = len(self.relations)
-        rel = Relation(index, name)
-        self.relations[name] = rel
-        self._relation_uris.add(uri_str)
-        return rel
-
-    def _get_or_create_attribute(self, uri: URIRef) -> Optional[Attribute]:
-        """Gets or creates an Attribute (DatatypeProperty) from a URI."""
-        if isinstance(uri, BNode) or isinstance(uri, Literal):
-            return None
-
-        uri_str = str(uri)
-        name = remove_uri_prefix(uri_str)
-
         if name in self.attributes:
             return self.attributes[name]
 
-        # Avoid creating an attribute if it's a class or relation
-        if name in self.classes or name in self.relations:
-            return None
+        # If unknown, check its type in the graph
+        if (uri, RDF.type, OWL.DatatypeProperty) in self.graph:
+            return self._get_attribute(uri)
 
-        index = len(self.attributes)
-        attr = Attribute(index, name)
-        self.attributes[name] = attr
-        self._attribute_uris.add(uri_str)
-        return attr
+        # Default to Relation (ObjectProperty)
+        return self._get_relation(uri)
 
-    def _parse_schema(self) -> None:
+    def _discover_schema(self) -> None:
         """
-        Parses the ontology schema to discover all Classes, Relations, and Attributes.
+        Pre-populates the schema dicts by finding explicit declarations
+        of classes and properties in the graph.
         """
+        # Find Classes
+        for s in self.graph.subjects(predicate=RDF.type, object=OWL.Class):
+            if isinstance(s, URIRef):
+                self._get_class(s)
+        for s in self.graph.subjects(predicate=RDF.type, object=RDFS.Class):
+            if isinstance(s, URIRef):
+                self._get_class(s)
 
-        # Find explicit declarations
-        for s in self.graph.subjects(RDF.type, OWL.Class):
-            self._get_or_create_class(s)
+        # Find Object Properties (Relations)
+        for s in self.graph.subjects(predicate=RDF.type, object=OWL.ObjectProperty):
+            if isinstance(s, URIRef):
+                self._get_relation(s)
 
-        for s in self.graph.subjects(RDF.type, OWL.ObjectProperty):
-            self._get_or_create_relation(s)
+        # Find Datatype Properties (Attributes)
+        for s in self.graph.subjects(predicate=RDF.type, object=OWL.DatatypeProperty):
+            if isinstance(s, URIRef):
+                self._get_attribute(s)
 
-        for s in self.graph.subjects(RDF.type, OWL.DatatypeProperty):
-            self._get_or_create_attribute(s)
+    def _parse_rdf_list(self, node: BNode) -> List[URIRef]:
+        """Helper to parse an RDF list (used for property chains)."""
+        chain: List[URIRef] = []
+        curr = node
+        while curr and curr != RDF.nil:
+            item = self.graph.value(subject=curr, predicate=RDF.first)
+            if item and isinstance(item, URIRef):
+                chain.append(item)
+            curr = self.graph.value(subject=curr, predicate=RDF.rest)
+        return chain
 
-        #  ind property types that imply ObjectProperty
-        prop_types = [
-            OWL.SymmetricProperty,
-            OWL.TransitiveProperty,
-            OWL.InverseFunctionalProperty,
-            OWL.IrreflexiveProperty,
-        ]
-        for prop_type in prop_types:
-            for s in self.graph.subjects(RDF.type, prop_type):
-                self._get_or_create_relation(s)
-
-        #  Handle FunctionalProperty (can be Object or Datatype)
-        for s in self.graph.subjects(RDF.type, OWL.FunctionalProperty):
-            # If already typed, we're good. If not, we must deduce.
-            uri_str = str(s)
-            if (
-                uri_str not in self._relation_uris
-                and uri_str not in self._attribute_uris
-            ):
-                # Deduce from range: if range is a datatype, it's an Attribute.
-                is_attr = False
-                for o_range in self.graph.objects(s, RDFS.range):
-                    if (o_range, RDF.type, RDFS.Datatype) in self.graph or str(
-                        o_range
-                    ).startswith(str(XSD)):
-                        is_attr = True
-                        break
-
-                if is_attr:
-                    self._get_or_create_attribute(s)
-                else:
-                    self._get_or_create_relation(s)  # Default to relation
-
-        # Find implicit entities from axiom usage
-        # We must iterate all triples, but this is safer.
-
-        # rdfs:subClassOf
-        for s, o in self.graph.subject_objects(RDFS.subClassOf):
-            self._get_or_create_class(s)
-            self._get_or_create_class(o)
-
-        # owl:disjointWith
-        for s, o in self.graph.subject_objects(OWL.disjointWith):
-            self._get_or_create_class(s)
-            self._get_or_create_class(o)
-
-        # rdfs:domain
-        for p, c in self.graph.subject_objects(RDFS.domain):
-            self._get_or_create_class(c)
-            # We don't know p's type, but _parse_rules will need it.
-            # Let's try to find it.
-            if str(p) not in self._relation_uris and str(p) not in self._attribute_uris:
-                self._deduce_property_type(p)
-
-        # rdfs:range
-        for p, c in self.graph.subject_objects(RDFS.range):
-            # If range is a datatype, p is an Attribute
-            if (c, RDF.type, RDFS.Datatype) in self.graph or str(c).startswith(
-                str(XSD)
-            ):
-                self._get_or_create_attribute(p)
-            else:
-                # Otherwise, p is a Relation and c is a Class
-                self._get_or_create_relation(p)
-                self._get_or_create_class(c)
-
-        # rdfs:subPropertyOf
-        for s, o in self.graph.subject_objects(RDFS.subPropertyOf):
-            # Assume same type for s and o. Deduce if unknown.
-            if str(s) in self._relation_uris or str(o) in self._relation_uris:
-                self._get_or_create_relation(s)
-                self._get_or_create_relation(o)
-            elif str(s) in self._attribute_uris or str(o) in self._attribute_uris:
-                self._get_or_create_attribute(s)
-                self._get_or_create_attribute(o)
-            else:
-                # Both unknown. Deduce from range.
-                if self._deduce_property_type(s) == "attribute":
-                    self._get_or_create_attribute(s)
-                    self._get_or_create_attribute(o)
-                else:
-                    self._get_or_create_relation(s)
-                    self._get_or_create_relation(o)
-
-        # owl:inverseOf
-        for s, o in self.graph.subject_objects(OWL.inverseOf):
-            self._get_or_create_relation(s)
-            self._get_or_create_relation(o)
-
-        # someValuesFrom / allValuesFrom
-        for s in self.graph.subjects(OWL.onProperty, None):
-            if (s, RDF.type, OWL.Restriction) in self.graph:
-                prop = next(self.graph.objects(s, OWL.onProperty), None)
-                val_class = next(
-                    self.graph.objects(s, OWL.someValuesFrom), None
-                ) or next(self.graph.objects(s, OWL.allValuesFrom), None)
-
-                if prop and val_class:
-                    # someValuesFrom can be on Datatype or Object properties
-                    if (val_class, RDF.type, RDFS.Datatype) in self.graph or str(
-                        val_class
-                    ).startswith(str(XSD)):
-                        self._get_or_create_attribute(prop)
-                    else:
-                        self._get_or_create_relation(prop)
-                        self._get_or_create_class(val_class)
-
-        print("--- Ontology Parsing Results ---")
-        print(f"Total classes found: {len(self.classes)}")
-        print(f"Total relations found: {len(self.relations)}")
-        print(f"Total attributes found: {len(self.attributes)}")
-
-    def _deduce_property_type(self, p: URIRef) -> str:
-        """Helper to deduce if a property is Object or Datatype. Returns 'relation' or 'attribute'."""
-        if str(p) in self._relation_uris:
-            return "relation"
-        if str(p) in self._attribute_uris:
-            return "attribute"
-
-        is_attr = False
-        for o_range in self.graph.objects(p, RDFS.range):
-            if (o_range, RDF.type, RDFS.Datatype) in self.graph or str(
-                o_range
-            ).startswith(str(XSD)):
-                is_attr = True
-                break
-
-        if is_attr:
-            self._get_or_create_attribute(p)
-            return "attribute"
-        else:
-            self._get_or_create_relation(p)
-            return "relation"
-
-    # ---------------------------------------------------------------------------- #
-    #                               HELPER FUNCTIONS                               #
-    # ---------------------------------------------------------------------------- #
-
-    def get_class(self, term: Union[URIRef, str]) -> Optional[Class]:
-        """Retrieve a class by its URI or name."""
-        name = remove_uri_prefix(str(term))
-        return self.classes.get(name)
-
-    def get_object_property(self, term: Union[URIRef, str]) -> Optional[Relation]:
-        """Retrieve an object property (relation) by its URI or name."""
-        name = remove_uri_prefix(str(term))
-        return self.relations.get(name)
-
-    def get_attribute_property(self, term: Union[URIRef, str]) -> Optional[Attribute]:
-        """Retrieve an attribute property by its URI or name."""
-        name = remove_uri_prefix(str(term))
-        return self.attributes.get(name)
-
-    # ---------------------------------------------------------------------------- #
-    #                          PARSE RULES AND CONSTRAINTS                         #
-    # ---------------------------------------------------------------------------- #
+    def _setup_handlers(self) -> None:
+        """Initializes the predicate-to-handler mapping."""
+        self.handlers = {
+            # RDFS Rules
+            RDFS.subClassOf: self._handle_subClassOf,
+            RDFS.subPropertyOf: self._handle_subPropertyOf,
+            RDFS.domain: self._handle_domain,
+            RDFS.range: self._handle_range,
+            # OWL 2 RL Property Rules
+            OWL.inverseOf: self._handle_inverseOf,
+            OWL.propertyChainAxiom: self._handle_propertyChainAxiom,
+            # OWL 2 RL Constraints / Type-based rules
+            RDF.type: self._handle_rdf_type,
+            OWL.disjointWith: self._handle_disjointWith,
+        }
 
     def _parse_rules_and_constraints(self) -> None:
         """
-        Translates OWL/RDFS axioms into executable rules and constraints
-        using the pre-parsed schema entities.
+        Main parsing loop. Iterates all triples and calls the appropriate
+        handler based on the predicate.
         """
-
-        # --- rdfs:subClassOf ---
-        # <A, rdfs:subClassOf, B>  =>  (X, type, A) -> (X, type, B)
-        for s, o in self.graph.subject_objects(RDFS.subClassOf):
-            if isinstance(s, BNode) or isinstance(o, BNode):
-                self._parse_complex_subclass(s, o)
-            else:
-                class_s = self.get_class(s)
-                class_o = self.get_class(o)
-                if class_s and class_o:
-                    rule = ExecutableRule(
-                        name=f"subClassOf_{class_s.name}_{class_o.name}",
-                        conclusion=Atom(Var("X"), RDF.type, class_o),
-                        premises=[Atom(Var("X"), RDF.type, class_s)],
-                    )
-                    self.rules.append(rule)
-
-        # --- rdfs:subPropertyOf ---
-        # <P1, rdfs:subPropertyOf, P2>  =>  (X, P1, Y) -> (X, P2, Y)
-        for s, o in self.graph.subject_objects(RDFS.subPropertyOf):
-            rel_s = self.get_object_property(s)
-            rel_o = self.get_object_property(o)
-            if rel_s and rel_o:
-                rule = ExecutableRule(
-                    name=f"subPropertyOf_{rel_s.name}_{rel_o.name}",
-                    conclusion=Atom(Var("X"), rel_o, Var("Y")),
-                    premises=[Atom(Var("X"), rel_s, Var("Y"))],
-                )
-                self.rules.append(rule)
-                # Populate sub_property_map
-                if rel_o.name not in self.sub_property_map:
-                    self.sub_property_map[rel_o.name] = set()
-                self.sub_property_map[rel_o.name].add(rel_s)
-
-            attr_s = self.get_attribute_property(s)
-            attr_o = self.get_attribute_property(o)
-            if attr_s and attr_o:
-                rule = ExecutableRule(
-                    name=f"subPropertyOf_{attr_s.name}_{attr_o.name}",
-                    conclusion=Atom(Var("X"), attr_o, Var("Value")),
-                    premises=[Atom(Var("X"), attr_s, Var("Value"))],
-                )
-                self.rules.append(rule)
-
-        # --- rdfs:domain ---
-        # <P, rdfs:domain, C>  =>  (X, P, Y) -> (X, type, C)
-        # <A, rdfs:domain, C>  =>  (X, A, V) -> (X, type, C)
-        for s, o in self.graph.subject_objects(RDFS.domain):
-            class_o = self.get_class(o)
-            if not class_o:
+        for s, p, o in self.graph:
+            # We only care about triples where the predicate is a URI
+            if not isinstance(p, URIRef):
                 continue
 
-            rel_s = self.get_object_property(s)
-            if rel_s:
+            # Find the handler for this predicate
+            handler = self.handlers.get(p)
+            if handler:
+                try:
+                    # Call the specific handler
+                    handler(s, p, o)
+                except Exception as e:
+                    print(f"Warning: Error handling triple ({s}, {p}, {o}): {e}")
+            else:
+                print(
+                    f"Info: No handler for predicate {p}, skipping triple ({s}, {p}, {o})"
+                )
+
+    # --- Individual Axiom Handlers ---
+
+    def _handle_subClassOf(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # cax-sco: (C1 rdfs:subClassOf C2) -> (?X rdf:type C1) -> (?X rdf:type C2)
+            c1 = self._get_class(s)
+            c2 = self._get_class(o)
+            rule = ExecutableRule(
+                name=f"rdfs_subClassOf_{c1.name}_{c2.name}",
+                conclusion=Atom(self.X, RDF.type, c2),
+                premises=[Atom(self.X, RDF.type, c1)],
+            )
+            self.rules.append(rule)
+
+    def _handle_subPropertyOf(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # cax-spo: (P1 rdfs:subPropertyOf P2) -> (?X P1 ?Y) -> (?X P2 ?Y)
+            p1 = self._get_term(s)
+            p2 = self._get_term(o)
+            rule = ExecutableRule(
+                name=f"rdfs_subPropertyOf_{p1.name}_{p2.name}",
+                conclusion=Atom(self.X, p2, self.Y),
+                premises=[Atom(self.X, p1, self.Y)],
+            )
+            self.rules.append(rule)
+
+    def _handle_domain(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # prp-dom: (P rdfs:domain C) -> (?X P ?Y) -> (?X rdf:type C)
+            prop = self._get_term(s)
+            cls = self._get_class(o)
+            rule = ExecutableRule(
+                name=f"rdfs_domain_{prop.name}_{cls.name}",
+                conclusion=Atom(self.X, RDF.type, cls),
+                premises=[Atom(self.X, prop, self.Y)],
+            )
+            self.rules.append(rule)
+
+    def _handle_range(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # prp-rng: (P rdfs:range C) -> (?X P ?Y) -> (?Y rdf:type C)
+            prop = self._get_term(s)
+            cls = self._get_class(o)
+            rule = ExecutableRule(
+                name=f"rdfs_range_{prop.name}_{cls.name}",
+                conclusion=Atom(self.Y, RDF.type, cls),
+                premises=[Atom(self.X, prop, self.Y)],
+            )
+            self.rules.append(rule)
+
+    def _handle_inverseOf(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # prp-inv1: (P1 owl:inverseOf P2) -> (?X P1 ?Y) -> (?Y P2 ?X)
+            p1 = self._get_relation(s)
+            p2 = self._get_relation(o)
+            rule1 = ExecutableRule(
+                name=f"owl_inverseOf_{p1.name}_{p2.name}",
+                conclusion=Atom(self.Y, p2, self.X),
+                premises=[Atom(self.X, p1, self.Y)],
+            )
+            # prp-inv2: (P1 owl:inverseOf P2) -> (?Y P2 ?X) -> (?X P1 ?Y)
+            rule2 = ExecutableRule(
+                name=f"owl_inverseOf_{p2.name}_{p1.name}",
+                conclusion=Atom(self.X, p1, self.Y),
+                premises=[Atom(self.Y, p2, self.X)],
+            )
+            self.rules.append(rule1)
+            self.rules.append(rule2)
+
+    def _handle_propertyChainAxiom(self, s: URIRef, p: URIRef, o: BNode) -> None:
+        if isinstance(s, URIRef) and isinstance(o, BNode):
+            # prp-prp-chain: (P owl:propertyChainAxiom (P1 ... Pn))
+            p_chain = self._get_relation(s)
+            chain_list = self._parse_rdf_list(o)
+
+            if len(chain_list) == 2:
+                # Specific handler for chain of 2
+                # (?X P1 ?Y), (?Y P2 ?Z) -> (?X P_chain ?Z)
+                p1 = self._get_relation(chain_list[0])
+                p2 = self._get_relation(chain_list[1])
                 rule = ExecutableRule(
-                    name=f"domain_{rel_s.name}_{class_o.name}",
-                    conclusion=Atom(Var("X"), RDF.type, class_o),
-                    premises=[Atom(Var("X"), rel_s, Var("Y"))],
+                    name=f"owl_chain_{p1.name}_{p2.name}_{p_chain.name}",
+                    conclusion=Atom(self.X, p_chain, self.Z),
+                    premises=[Atom(self.X, p1, self.Y), Atom(self.Y, p2, self.Z)],
                 )
                 self.rules.append(rule)
-
-            attr_s = self.get_attribute_property(s)
-            if attr_s:
+            elif len(chain_list) == 1:
+                # (P owl:propertyChainAxiom (P1)) -> (?X P1 ?Y) -> (?X P ?Y)
+                p1 = self._get_relation(chain_list[0])
                 rule = ExecutableRule(
-                    name=f"domain_{attr_s.name}_{class_o.name}",
-                    conclusion=Atom(Var("X"), RDF.type, class_o),
-                    premises=[Atom(Var("X"), attr_s, Var("Value"))],
+                    name=f"rdfs_subPropertyOf_{p1.name}_{p_chain.name}",
+                    conclusion=Atom(self.X, p_chain, self.Y),
+                    premises=[Atom(self.X, p1, self.Y)],
                 )
                 self.rules.append(rule)
+            # Note: Longer chains would require dynamic rule generation
 
-        # --- rdfs:range ---
-        # <P, rdfs:range, C>  =>  (X, P, Y) -> (Y, type, C) (ObjectProperty)
-        # <A, rdfs:range, D>  =>  (X, A, V) -> V is of type D (DatatypeProperty)
-        for s, o in self.graph.subject_objects(RDFS.range):
-            rel_s = self.get_object_property(s)
-            class_o = self.get_class(o)
-            if rel_s and class_o:
-                rule = ExecutableRule(
-                    name=f"range_{rel_s.name}_{class_o.name}",
-                    conclusion=Atom(Var("Y"), RDF.type, class_o),
-                    premises=[Atom(Var("X"), rel_s, Var("Y"))],
-                )
-                self.rules.append(rule)
+    def _handle_rdf_type(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if not isinstance(s, URIRef) or not isinstance(o, URIRef):
+            return
 
-            attr_s = self.get_attribute_property(s)
-            if attr_s:
-                # This is a literal type constraint
-                self.constraints.append(
-                    Constraint(
-                        name=f"range_{attr_s.name}_{remove_uri_prefix(str(o))}",
-                        constraint_type=RDFS.range,
-                        terms=[
-                            attr_s,
-                            o,
-                        ],  # Store the attribute and the XSD type (e.g., XSD.string)
-                    )
-                )
+        # --- Rules based on type ---
+        if o == OWL.SymmetricProperty:
+            # prp-sym: (P rdf:type owl:SymmetricProperty) -> (?X P ?Y) -> (?Y P ?X)
+            prop = self._get_relation(s)
+            rule = ExecutableRule(
+                name=f"owl_symmetric_{prop.name}",
+                conclusion=Atom(self.Y, prop, self.X),
+                premises=[Atom(self.X, prop, self.Y)],
+            )
+            self.rules.append(rule)
 
-        # --- owl:inverseOf ---
-        # <P1, owl:inverseOf, P2> => (X, P1, Y) -> (Y, P2, X)
-        #                        and (Y, P2, X) -> (X, P1, Y)
-        for s, o in self.graph.subject_objects(OWL.inverseOf):
-            rel_s = self.get_object_property(s)
-            rel_o = self.get_object_property(o)
-            if rel_s and rel_o:
-                # Rule 1
-                self.rules.append(
-                    ExecutableRule(
-                        name=f"inverseOf_{rel_s.name}_{rel_o.name}",
-                        conclusion=Atom(Var("Y"), rel_o, Var("X")),
-                        premises=[Atom(Var("X"), rel_s, Var("Y"))],
-                    )
-                )
-                # Rule 2
-                self.rules.append(
-                    ExecutableRule(
-                        name=f"inverseOf_{rel_o.name}_{rel_s.name}",
-                        conclusion=Atom(Var("X"), rel_s, Var("Y")),
-                        premises=[Atom(Var("Y"), rel_o, Var("X"))],
-                    )
-                )
+        elif o == OWL.TransitiveProperty:
+            # prp-trp: (P rdf:type owl:TransitiveProperty) -> (?X P ?Y), (?Y P ?Z) -> (?X P ?Z)
+            prop = self._get_relation(s)
+            rule = ExecutableRule(
+                name=f"owl_transitive_{prop.name}",
+                conclusion=Atom(self.X, prop, self.Z),
+                premises=[Atom(self.X, prop, self.Y), Atom(self.Y, prop, self.Z)],
+            )
+            self.rules.append(rule)
 
-        # --- owl:SymmetricProperty ---
-        # <P, rdf:type, owl:SymmetricProperty> => (X, P, Y) -> (Y, P, X)
-        for s in self.graph.subjects(RDF.type, OWL.SymmetricProperty):
-            rel_s = self.get_object_property(s)
-            if rel_s:
-                self.rules.append(
-                    ExecutableRule(
-                        name=f"symmetric_{rel_s.name}",
-                        conclusion=Atom(Var("Y"), rel_s, Var("X")),
-                        premises=[Atom(Var("X"), rel_s, Var("Y"))],
-                    )
-                )
+        # --- Constraints based on type ---
+        elif o == OWL.IrreflexiveProperty:
+            # prp-irr: (P rdf:type owl:IrreflexiveProperty)
+            # This is a constraint: NOT (?X P ?X)
+            prop = self._get_term(s)
+            constraint = Constraint(
+                name=f"owl_irreflexive_{prop.name}",
+                constraint_type=OWL.IrreflexiveProperty,
+                terms=[prop, self.X],  # Represents (?X P ?X) is forbidden
+            )
+            self.constraints.append(constraint)
 
-        # --- owl:TransitiveProperty ---
-        # <P, rdf:type, owl:TransitiveProperty> => (X, P, Y), (Y, P, Z) -> (X, P, Z)
-        for s in self.graph.subjects(RDF.type, OWL.TransitiveProperty):
-            rel_s = self.get_object_property(s)
-            if rel_s:
-                self.rules.append(
-                    ExecutableRule(
-                        name=f"transitive_{rel_s.name}",
-                        conclusion=Atom(Var("X"), rel_s, Var("Z")),
-                        premises=[
-                            Atom(Var("X"), rel_s, Var("Y")),
-                            Atom(Var("Y"), rel_s, Var("Z")),
-                        ],
-                    )
-                )
+    def _handle_disjointWith(self, s: URIRef, p: URIRef, o: URIRef) -> None:
+        if isinstance(s, URIRef) and isinstance(o, URIRef):
+            # cls-disj: (C1 owl:disjointWith C2)
+            # This is a constraint: NOT ((?X rdf:type C1) AND (?X rdf:type C2))
+            c1 = self._get_class(s)
+            c2 = self._get_class(o)
+            constraint = Constraint(
+                name=f"owl_disjoint_{c1.name}_{c2.name}",
+                constraint_type=OWL.disjointWith,
+                terms=[
+                    c1,
+                    c2,
+                    self.X,
+                ],  # Represents (?X type C1) and (?X type C2) is forbidden
+            )
+            self.constraints.append(constraint)
 
-        # --- owl:disjointWith ---
-        # <A, owl:disjointWith, B> => Constraint
-        for s, o in self.graph.subject_objects(OWL.disjointWith):
-            class_s = self.get_class(s)
-            class_o = self.get_class(o)
-            if class_s and class_o:
-                self.constraints.append(
-                    Constraint(
-                        name=f"disjointWith_{class_s.name}_{class_o.name}",
-                        constraint_type=OWL.disjointWith,
-                        terms=[class_s, class_o],
-                    )
-                )
-
-        # --- owl:FunctionalProperty ---
-        for s in self.graph.subjects(RDF.type, OWL.FunctionalProperty):
-            rel_s = self.get_object_property(s)
-            if rel_s:
-                self.constraints.append(
-                    Constraint(
-                        name=f"functional_{rel_s.name}",
-                        constraint_type=OWL.FunctionalProperty,
-                        terms=[rel_s],
-                    )
-                )
-
-            attr_s = self.get_attribute_property(s)
-            if attr_s:
-                self.constraints.append(
-                    Constraint(
-                        name=f"functional_{attr_s.name}",
-                        constraint_type=OWL.FunctionalProperty,
-                        terms=[attr_s],
-                    )
-                )
-
-        # --- owl:IrreflexiveProperty ---
-        for s in self.graph.subjects(RDF.type, OWL.IrreflexiveProperty):
-            prop = self.get_object_property(s)  # e.g., hasParent
-            if prop:
-                # Add constraint for the property itself
-                self.constraints.append(
-                    Constraint(
-                        name=f"irreflexive_{prop.name}",
-                        constraint_type=OWL.IrreflexiveProperty,
-                        terms=[prop],
-                    )
-                )
-                # Add constraint for all sub-properties
-                if prop.name in self.sub_property_map:
-                    for sub_prop in self.sub_property_map[prop.name]:
-                        self.constraints.append(
-                            Constraint(
-                                name=f"irreflexive_{sub_prop.name}_(inherited)",
-                                constraint_type=OWL.IrreflexiveProperty,
-                                terms=[sub_prop],
-                            )
-                        )
-
-        print(f"Total rules parsed: {len(self.rules)}")
-        print(f"Total constraints parsed: {len(self.constraints)}")
-        print("----------------------------------")
-
-    # ---------------------------------------------------------------------------- #
-    #                                    COMPLEX                                   #
-    # ---------------------------------------------------------------------------- #
-
-    def _parse_complex_subclass(self, s: Term, o: Term) -> None:
+    def print_summary(self) -> None:
         """
-        Parses complex class expressions (e.g., restrictions) in subclass axioms.
+        Prints a summary of the parsed schema, rules, and constraints.
         """
+        print("\n--- Ontology Parser Summary ---")
+        print(f"  Classes:    {len(self.classes)}")
+        for name in self.classes:
+            print(f"    - {name}")
 
-        # Example for owl:someValuesFrom
-        # [a owl:Restriction; owl:onProperty P; owl:someValuesFrom C] rdfs:subClassOf ClassA
-        # This means: (X, P, Y), (Y, type, C) -> (X, type, ClassA)
-        if isinstance(s, BNode):
-            try:
-                # Check for: (s, rdf:type, owl:Restriction)
-                if (s, RDF.type, OWL.Restriction) not in self.graph:
-                    return
+        print(f"\n  Relations:  {len(self.relations)}")
+        for name in self.relations:
+            print(f"    - {name}")
 
-                prop = next(self.graph.objects(s, OWL.onProperty))
-                some_class = next(self.graph.objects(s, OWL.someValuesFrom))
+        print(f"\n  Attributes: {len(self.attributes)}")
+        for name in self.attributes:
+            print(f"    - {name}")
 
-                rel_p = self.get_object_property(prop)  # Can only be ObjectProperty
-                class_c = self.get_class(some_class)
-                class_a = self.get_class(o)  # The conclusion
+        print("\n--- Parsed Rules ---")
+        if not self.rules:
+            print("  No rules were parsed.")
+        for rule in self.rules:
+            print(f"  {rule}")
 
-                if rel_p and class_c and class_a:
-                    rule = ExecutableRule(
-                        name=f"someValuesFrom_{rel_p.name}_{class_c.name}_{class_a.name}",
-                        conclusion=Atom(Var("X"), RDF.type, class_a),
-                        premises=[
-                            Atom(Var("X"), rel_p, Var("Y")),
-                            Atom(Var("Y"), RDF.type, class_c),
-                        ],
-                    )
-                    self.rules.append(rule)
+        print("\n--- Parsed Constraints ---")
+        if not self.constraints:
+            print("  No constraints were parsed.")
+        for constraint in self.constraints:
+            print(f"  {constraint}")
 
-            except StopIteration:
-                pass
-
-        # ... other complex axioms like allValuesFrom, hasValue, etc. can be added here
+        print("---------------------------------")

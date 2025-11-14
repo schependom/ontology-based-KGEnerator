@@ -163,6 +163,7 @@ class KGenerator:
         generating all possible proofs, and building the KnowledgeGraph.
         """
 
+        # self.parser.print_summary()
         all_rules = self.parser.rules
 
         # No rules means no data

@@ -60,6 +60,13 @@ class BackwardChainer:
         # Initialize a Dict[Tuple, List[ExecutableRule]] for fast rule lookup based on the head
         self.rules_by_head = self._index_rules(all_rules)
 
+        # Find all rule names that are part of a recursive cycle
+        self.recursive_rules: Set[str] = self._find_recursive_rules(all_rules)
+        if self.recursive_rules:
+            print(f"Chainer identified {len(self.recursive_rules)} recursive rules:")
+            for rule_name in self.recursive_rules:
+                print(f"  - {rule_name}")
+
         # Counters for generating unique entities
         self._var_rename_counter = 0
         self._individual_counter = 0
@@ -122,6 +129,63 @@ class BackwardChainer:
 
         # Return the completed index dictionary
         return index
+
+    def _find_recursive_rules(self, all_rules: List[ExecutableRule]) -> Set[str]:
+        """
+        Finds all rules that are part of any recursive cycle (including mutual recursion).
+        e.g., P -> Q, Q -> P
+        """
+        # 1. Build a dependency graph between "atom keys" (predicates/classes)
+        #    graph: { head_key: Set(premise_key, ...) }
+        graph: Dict[Tuple, Set[Tuple]] = defaultdict(set)
+        for rule in all_rules:
+            head_key = self._get_atom_key(rule.conclusion)
+            if head_key is None:
+                continue
+            for premise in rule.premises:
+                premise_key = self._get_atom_key(premise)
+                if premise_key is not None:
+                    graph[head_key].add(premise_key)
+
+        # 2. Use DFS to find all nodes (atom keys) that are part of a cycle
+        recursive_keys: Set[Tuple] = set()
+
+        # We need to track nodes currently in the recursion stack (visiting)
+        # and nodes we've already fully explored (visited)
+        visiting: Set[Tuple] = set()
+        visited: Set[Tuple] = set()
+
+        def dfs(key: Tuple):
+            """Recursive DFS to find cycles."""
+            visiting.add(key)
+
+            for neighbor_key in graph.get(key, set()):
+                if neighbor_key in visiting:
+                    # Cycle detected! This key is part of a cycle.
+                    recursive_keys.add(key)
+                elif neighbor_key not in visited:
+                    dfs(neighbor_key)
+                    # Propagate "recursive" status up the call stack
+                    if neighbor_key in recursive_keys:
+                        recursive_keys.add(key)
+
+            visiting.remove(key)
+            visited.add(key)
+
+        # Run DFS from every node to find all possible cycles
+        all_keys = list(graph.keys())
+        for key in all_keys:
+            if key not in visited:
+                dfs(key)
+
+        # 3. Find all rule names whose *conclusion* is one of the recursive keys
+        recursive_rule_names: Set[str] = set()
+        for rule in all_rules:
+            head_key = self._get_atom_key(rule.conclusion)
+            if head_key in recursive_keys:
+                recursive_rule_names.add(rule.name)
+
+        return recursive_rule_names
 
     def _get_fresh_individual(self) -> Individual:
         """
@@ -340,7 +404,7 @@ class BackwardChainer:
         # Where the count is how many times that rule has been used in the current proof path.
         # If the count exceeds max_recursion_depth, we skip that rule.
 
-        if rule.is_recursive():
+        if rule.name in self.recursive_rules:
             # If the starting rule is recursive, we count its first usage
             recursive_use_counts = frozenset([(rule.name, 1)])
 
@@ -489,10 +553,8 @@ class BackwardChainer:
         #                                   BASE CASE                                  #
         # ---------------------------------------------------------------------------- #
 
-        # If we can't use rules to prove the goal atom, it must be a base fact.
-        if not matching_rules:
-            yield Proof.create_base_proof(goal_atom)
-            return
+        # Always allow base facts
+        yield Proof.create_base_proof(goal_atom)
 
         # ---------------------------------------------------------------------------- #
         #                                RECURSIVE CASE                                #
@@ -504,7 +566,7 @@ class BackwardChainer:
             # If the rule is recursive
             #   -> check if we've hit max recursion depth
             #   -> update the recursion tracker
-            if original_rule.is_recursive():
+            if original_rule.name in self.recursive_rules:
                 #
                 # Get the number of times this rule has been used recursively so far
                 current_recursive_uses = dict(recursive_use_counts).get(
@@ -582,7 +644,7 @@ class BackwardChainer:
             for premise in ground_premises:
                 # Recurse
                 proof_list = list(
-                    self._find_proofs_recursive(premise, recursive_use_counts)
+                    self._find_proofs_recursive(premise, new_recursive_use_counts)
                 )
 
                 if not proof_list:
