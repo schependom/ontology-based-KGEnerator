@@ -6,9 +6,6 @@ DESCRIPTION:
         - Rules and Constraints
         - Proofs and Backward Chaining
 
-    This replaces the proprietary reldata format with standard Python classes (RRN KGE model)
-    and facilitates backward chaining operations.
-
 AUTHOR:
 
     Vincent Van Schependom
@@ -97,8 +94,6 @@ class Individual:
 
     index: int
     name: str
-
-    # We initialize classes as a list, but will store Membership objects here
     classes: List["Membership"] = field(default_factory=list)
 
     def get_class_memberships(self) -> Set[Class]:
@@ -121,20 +116,11 @@ class Individual:
 class Membership:
     """
     Represents class membership of an individual.
-    This fact can be a base fact (proofs=[]) or an inferred fact (proofs=[...]).
-
-    NOTE
-
-        - is_inferred is kept for backward compatibility
-        - it should always be true, since we are creating a synthetic datagenerator without seed base facts
     """
 
     individual: Individual
     cls: Class
-    is_member: bool  # True if member, False if explicitly not a member
-    # is_inferred: bool  # Still needed for old reldata compatibility
-
-    # Keep track of all proofs leading to this membership fact
+    is_member: bool
     proofs: List["Proof"] = field(default_factory=list)
 
     @property
@@ -142,7 +128,6 @@ class Membership:
         """A fact is inferred if it has at least one derived proof."""
         if not self.proofs:
             return False
-        # Check if any proof is a derived proof (not a base fact leaf)
         return any(p.rule is not None for p in self.proofs)
 
     @property
@@ -151,34 +136,27 @@ class Membership:
         return not self.is_inferred
 
     def __hash__(self):
-        # A fact is defined by its content
         return hash((self.individual.name, "rdf:type", self.cls.name))
 
     def to_atom(self) -> "Atom":
-        """Converts this fact to a ground Atom (Atom)."""
+        """Converts this fact to a ground Atom."""
         return Atom(self.individual, RDF.type, self.cls)
 
     def __repr__(self) -> str:
-        if self.is_member:
-            return f"<{self.individual}, memberOf, {self.cls}>"
-        else:
-            return f"<{self.individual}, ~memberOf, {self.cls}>"
+        prefix = "" if self.is_member else "~"
+        return f"<{self.individual}, {prefix}memberOf, {self.cls}>"
 
 
 @dataclass
 class Triple:
     """
     Represents a relational triple (subject, predicate, object).
-    This fact can be a base fact (proofs=[]) or an inferred fact (proofs=[...]).
     """
 
     subject: Individual
     predicate: Relation
     object: Individual
-    positive: bool  # True for positive predicate, False for negated predicate
-    # is_inferred: bool  # Still needed for old reldata compatibility
-
-    # Keep track of all proofs leading to this triple fact
+    positive: bool
     proofs: List["Proof"] = field(default_factory=list)
 
     @property
@@ -194,32 +172,26 @@ class Triple:
         return not self.is_inferred
 
     def __hash__(self):
-        # A fact is defined by its content
         return hash((self.subject.name, self.predicate.name, self.object.name))
 
     def to_atom(self) -> "Atom":
-        """Converts this fact to a ground Atom (Atom)."""
+        """Converts this fact to a ground Atom."""
         return Atom(self.subject, self.predicate, self.object)
 
     def __repr__(self) -> str:
-        if self.positive:
-            return f"<{self.subject}, {self.predicate}, {self.object}>"
-        else:
-            return f"<{self.subject}, ~{self.predicate}, {self.object}>"
+        prefix = "" if self.positive else "~"
+        return f"<{self.subject}, {prefix}{self.predicate}, {self.object}>"
 
 
 @dataclass
 class AttributeTriple:
     """
     Represents an attribute triple (subject, predicate, value).
-    This fact can be a base fact or an inferred fact.
     """
 
     subject: Individual
-    predicate: Attribute  # E.g. age, height
-    value: LiteralValue  # The literal value
-
-    # Keep track of all proofs leading to this attribute triple fact
+    predicate: Attribute
+    value: LiteralValue
     proofs: List["Proof"] = field(default_factory=list)
 
     @property
@@ -235,11 +207,10 @@ class AttributeTriple:
         return not self.is_inferred
 
     def __hash__(self):
-        # A fact is defined by its content
         return hash((self.subject.name, self.predicate.name, self.value))
 
     def to_atom(self) -> "Atom":
-        """Converts this fact to a ground Atom (Atom)."""
+        """Converts this fact to a ground Atom."""
         return Atom(self.subject, self.predicate, self.value)
 
     def __repr__(self) -> str:
@@ -270,22 +241,50 @@ class KnowledgeGraph:
         print(f"  Nb of Triples: {len(self.triples)}")
         print(f"  Nb of Memberships: {len(self.memberships)}")
         print(f"  Nb of Attribute Triples: {len(self.attribute_triples)}\n")
+
+        # Print base vs inferred statistics
+        base_triples = sum(1 for t in self.triples if t.is_base_fact)
+        inferred_triples = len(self.triples) - base_triples
+        base_memberships = sum(1 for m in self.memberships if m.is_base_fact)
+        inferred_memberships = len(self.memberships) - base_memberships
+
+        print(f"  Base Facts:")
+        print(f"    Triples: {base_triples}")
+        print(f"    Memberships: {base_memberships}")
+        print(f"  Inferred Facts:")
+        print(f"    Triples: {inferred_triples}")
+        print(f"    Memberships: {inferred_memberships}\n")
+
         print("Triples:")
         for triple in self.triples:
-            print(f"    {triple}")
+            proof_info = (
+                f" [base]"
+                if triple.is_base_fact
+                else f" [inferred, {len(triple.proofs)} proofs]"
+            )
+            print(f"    {triple}{proof_info}")
         print("Memberships:")
         for membership in self.memberships:
-            print(f"    {membership}")
+            proof_info = (
+                f" [base]"
+                if membership.is_base_fact
+                else f" [inferred, {len(membership.proofs)} proofs]"
+            )
+            print(f"    {membership}{proof_info}")
         print("Attribute Triples:")
         for attr_triple in self.attribute_triples:
-            print(f"    {attr_triple}")
+            proof_info = (
+                f" [base]"
+                if attr_triple.is_base_fact
+                else f" [inferred, {len(attr_triple.proofs)} proofs]"
+            )
+            print(f"    {attr_triple}{proof_info}")
 
 
 @dataclass
 class DataType(Enum):
     """
     Specifies what type of data to use in the KGE model.
-    This is for handling the data generated by the ASP solver in the original RRN paper.
     """
 
     INF = 1  # inferred facts
@@ -297,25 +296,8 @@ class DataType(Enum):
 #                               BACKWARD CHAINING                              #
 # ---------------------------------------------------------------------------- #
 
-"""
-EXAMPLE
 
-Rules:
-parent(X,Y), parent(Y,Z) -> grandparent(X,Z)    (Rule1)
-child(Y,X) -> parent(X,Y)                       (Rule2)
-
-We select the first rule. We see that the head is grandparent(X,Z) and the body is parent(X,Y), parent(Y,Z).
--> goal = Atom(Var('A'), Relation('grandparent'), Var('B'))
--> premises = [Atom(Var('A'), Relation('parent'), Var('C')),
-               Atom(Var('C'), Relation('parent'), Var('B'))]
--> rule = ExecutableRule('Rule1', goal, premises)
-
-Now, we want to generate a proof for grandparent(X,Z) and we want to generate
-individuals along the way.
-"""
-
-
-@dataclass(frozen=True)  # Variables are immutable and hashable
+@dataclass(frozen=True)
 class Var:
     """Represents a variable in a rule, e.g., 'X' or 'Y'."""
 
@@ -325,7 +307,7 @@ class Var:
         return f"{self.name}"
 
 
-@dataclass(frozen=True)  # Atoms are immutable and hashable
+@dataclass(frozen=True)
 class Atom:
     """
     Represents a triple pattern, e.g. (Var('X'), rdf:type, Class('Person')).
@@ -338,7 +320,7 @@ class Atom:
 
     def is_ground(self) -> bool:
         """
-        Checks if the goal pattern is ground (no variables).
+        Checks if the atom is ground (no variables).
         """
         return not (
             isinstance(self.subject, Var)
@@ -348,13 +330,16 @@ class Atom:
 
     def substitute(self, substitution: Dict[Var, Term]) -> "Atom":
         """
-        Applies a variable substitution to this pattern.
+        Applies a variable substitution to this atom.
         """
         return Atom(
             subject=substitution.get(self.subject, self.subject),
             predicate=substitution.get(self.predicate, self.predicate),
             object=substitution.get(self.object, self.object),
         )
+
+    def __repr__(self) -> str:
+        return f"({self.subject}, {self.predicate}, {self.object})"
 
 
 @dataclass
@@ -372,6 +357,8 @@ class ExecutableRule:
     premises: List[Atom]
 
     def __repr__(self):
+        if not self.premises:
+            return f"-> {self.conclusion}  ({self.name})"
         prem_str = ", ".join(map(str, self.premises))
         return f"{prem_str} -> {self.conclusion}  ({self.name})"
 
@@ -388,7 +375,6 @@ class ExecutableRule:
         head_pred = head.predicate
 
         # Get the "type" term (class for rdf:type, or None)
-        # This handles cases like A(x) -> B(x)
         head_type_term = None
         if head_pred == RDF.type and isinstance(head.object, (Class, Var)):
             head_type_term = head.object
@@ -398,12 +384,10 @@ class ExecutableRule:
             if premise.predicate == head_pred:
                 # 2. If predicate is rdf:type, check class match
                 if head_type_term is not None:
-                    # e.g., A(X) ... -> A(Y)
                     if premise.object == head_type_term:
                         return True
                 # 3. If predicate is not rdf:type, just predicate match is enough
                 else:
-                    # e.g., P(X,Y) ... -> P(X,Z)
                     return True
         return False
 
@@ -416,55 +400,32 @@ class Constraint:
     """
 
     name: str
-    constraint_type: URIRef  # e.g., OWL.disjointWith
-    terms: List[Term]  # e.g., [Class('ClassA'), Class('ClassB')]
+    constraint_type: URIRef
+    terms: List[Term]
 
     def __repr__(self):
         return f"Constraint(name={self.name}, type={self.constraint_type}, terms={self.terms})"
 
 
-@dataclass(frozen=True)  # Proofs are immutable and hashable
+@dataclass(frozen=True)
 class Proof:
     """
     Represents a proof tree for a single GROUND goal (Atom).
 
     A proof is either for
-        - a base fact
-            -> if no rules can be applied to prove a goal
-            -> leaf in the proof tree
-            -> rule=None
-        - a derived fact
-            -> if a rule was applied to prove the goal
-            -> node in the proof tree
-            -> rule=ExecutableRule, sub_proofs=[Proof, ...]
+        - a base fact (leaf in the proof tree, rule=None)
+        - a derived fact (node in the proof tree, rule=ExecutableRule, sub_proofs=[Proof, ...])
     """
 
-    # The ground atom this proof satisfies.
     goal: Atom
-
-    # The rule (ExecutableRule) whose conclusion (ExecutableRule.conclusion)
-    # was unified with the goal (grounded Atom).
-    # If 'None', this proof represents a base fact (a leaf in the tree).
     rule: Optional[ExecutableRule] = None
-
-    # The list of proofs for the premises of the rule.
-    # Must be empty if rule is None.
     sub_proofs: Tuple["Proof", ...] = field(default_factory=tuple)
-    # We use a Tuple instead of List to make Proof hashable
-
-    # recursive_use_counts
-    #   -> tracks {rule_name: count} for recursive rules.
-    #   -> is an immutable, hashable set
     recursive_use_counts: frozenset[Tuple[str, int]] = field(default_factory=frozenset)
-    # field() returns an empty frozenset
 
     def __post_init__(self):
-        # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
             raise ValueError("Base fact proof (rule=None) cannot have sub-proofs.")
 
-        # A derived fact proof must have the same number of sub-proofs as premises
-        # in the rule it tries to prove.
         if self.rule is not None and len(self.sub_proofs) != len(self.rule.premises):
             raise ValueError(
                 f"Proof for rule '{self.rule.name}' must have "
@@ -472,71 +433,68 @@ class Proof:
                 f"{len(self.sub_proofs)} were given."
             )
 
-        # The goal of a proof must be ground.
         if not self.goal.is_ground():
             raise ValueError(f"Proof goal '{self.goal}' must be a ground atom.")
 
     def is_base_fact(self) -> bool:
-        """
-        Checks if this proof represents a base fact (leaf).
-        """
+        """Checks if this proof represents a base fact (leaf)."""
         return self.rule is None
 
     def get_base_facts(self) -> Set[Atom]:
-        """
-        Traverses the proof tree and returns the set of all base facts (leaves) this proof depends on.
-        """
-
-        # This is a base fact (a leaf)
+        """Returns the set of all base facts (leaves) this proof depends on."""
         if self.rule is None:
             return {self.goal}
 
-        # Derived fact: gather base facts from sub-proofs
         base_facts: Set[Atom] = set()
         for sp in self.sub_proofs:
             base_facts.update(sp.get_base_facts())
         return base_facts
 
+    def get_all_atoms(self) -> Set[Atom]:
+        """Returns all atoms (base and derived) in this proof tree."""
+        atoms = {self.goal}
+        for sp in self.sub_proofs:
+            atoms.update(sp.get_all_atoms())
+        return atoms
+
     def get_recursion_depth(self, rule: ExecutableRule) -> int:
-        """
-        Gets the number of times the given recursive rule was used in this proof path.
-        """
+        """Gets the number of times the given recursive rule was used in this proof path."""
         for name, count in self.recursive_use_counts:
             if name == rule.name:
                 return count
         return 0
 
     def get_max_recursion_depth(self) -> int:
-        """
-        Gets the maximum depth of any recursive rule in this proof.
-        """
-        # Check if there are any recursive rules used
+        """Gets the maximum depth of any recursive rule in this proof."""
         if not self.recursive_use_counts:
             return 0
-
-        # If there are, return the max count
         return max(count for _, count in self.recursive_use_counts)
+
+    def depth(self) -> int:
+        """Returns the depth of this proof tree."""
+        if self.rule is None:
+            return 0
+        if not self.sub_proofs:
+            return 1
+        return 1 + max(sp.depth() for sp in self.sub_proofs)
+
+    def __repr__(self) -> str:
+        if self.is_base_fact():
+            return f"BaseProof({self.goal})"
+        return f"DerivedProof({self.goal} via {self.rule.name})"
 
     @staticmethod
     def create_base_proof(atom: Atom) -> "Proof":
-        """
-        Creates a proof for a base fact (a leaf).
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a base fact (a leaf)."""
         if not atom.is_ground():
             raise ValueError("Base fact proof must be for a ground atom.")
-
-        # Return a proof with no rule and no sub-proofs for the base fact (ground Atom)
         return Proof(goal=atom, rule=None, sub_proofs=tuple())
 
     @staticmethod
     def create_derived_proof(
         goal: Atom, rule: ExecutableRule, sub_proofs: List["Proof"]
     ) -> "Proof":
-        """
-        Creates a proof for a derived fact (a node), tracking recursion.
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a derived fact (a node), tracking recursion."""
         if not goal.is_ground():
             raise ValueError("Derived proof goal must be a ground atom.")
 
@@ -544,8 +502,6 @@ class Proof:
         new_counts: Dict[str, int] = {}
         for sp in sub_proofs:
             for name, count in sp.recursive_use_counts:
-                # We take the MAX depth from any sub-proof branch for each rule
-                # to make sure that the depth doesn't get underestimated.
                 new_counts[name] = max(new_counts.get(name, 0), count)
 
         # Update this rule's count if it's recursive
@@ -553,7 +509,6 @@ class Proof:
             name = rule.name
             new_counts[name] = new_counts.get(name, 0) + 1
 
-        # Return the proof
         return Proof(
             goal=goal,
             rule=rule,

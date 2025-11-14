@@ -3,15 +3,6 @@ DESCRIPTION:
 
     Main script to generate facts using backward chaining on a given ontology.
 
-    Workflow:
-
-        - Parse the ontology using OntologyParser.
-        - Initialize BackwardChainer with parsed rules.
-        - For each rule, generate all possible proof trees.
-        - Traverse each proof tree to extract ground atoms.
-        - Convert ground atoms into KnowledgeGraph facts (Triples, Memberships, etc.).
-        - Store facts in KnowledgeGraph, ensuring no duplicates.
-
 AUTHOR
 
     Vincent Van Schependom
@@ -23,7 +14,6 @@ import traceback
 from typing import Dict, Set
 from rdflib.namespace import RDF
 
-# Custom imports
 from data_structures import (
     KnowledgeGraph,
     Individual,
@@ -47,20 +37,25 @@ class KGenerator:
     Orchestrates the full data generation pipeline.
     """
 
-    def __init__(self, ontology_file: str, max_recursion: int = 2):
+    def __init__(
+        self, ontology_file: str, max_recursion: int = 2, max_proofs_per_rule: int = 100
+    ):
         """
         Initializes the parser and chainer.
 
         Args:
             ontology_file (str): Path to the .ttl ontology file.
             max_recursion (int): The maximum depth for recursive rules.
+            max_proofs_per_rule (int): Maximum number of proofs per starting rule.
         """
 
         print(f"Loading and parsing ontology from: {ontology_file}")
 
         self.parser = OntologyParser(ontology_file)
         self.chainer = BackwardChainer(
-            all_rules=self.parser.rules, max_recursion_depth=max_recursion
+            all_rules=self.parser.rules,
+            max_recursion_depth=max_recursion,
+            max_proofs_per_rule=max_proofs_per_rule,
         )
 
         # Store schemas from the parser
@@ -68,25 +63,19 @@ class KGenerator:
         self.schema_relations = self.parser.relations
         self.schema_attributes = self.parser.attributes
 
-        # Store the data that we will populate a KnowledgeGraph class with
-        # We use dictionaries for deduplication
-        self.individuals: Dict[str, Individual] = {}  # name -> Individual
-        self.triples: Dict[tuple, Triple] = {}  # (s, p, o) -> Triple
-        self.memberships: Dict[tuple, Membership] = {}  # (ind, cls) -> Membership
-        self.attr_triples: Dict[
-            tuple, AttributeTriple
-        ] = {}  # (s, p, v) -> AttributeTriple
+        # Store the data
+        self.individuals: Dict[str, Individual] = {}
+        self.triples: Dict[tuple, Triple] = {}
+        self.memberships: Dict[tuple, Membership] = {}
+        self.attr_triples: Dict[tuple, AttributeTriple] = {}
 
-        # Set to track proofs we've already processed to avoid duplicate work
-        # This is vital for proof trees that form a DAG (Directed Acyclic Graph)
+        # Track processed proofs to avoid duplicate work
         self.processed_proofs: Set[Proof] = set()
-        # For example, if proof A has sub-proofs B and C,
-        # and both B and C have sub-proof D, we only want to process D once
+
+        self.visualized_one_proof = False
 
     def _register_individual(self, term: Term) -> None:
-        """
-        Adds an Individual to our store if it's not present.
-        """
+        """Adds an Individual to our store if it's not present."""
         if isinstance(term, Individual):
             if term.name not in self.individuals:
                 self.individuals[term.name] = term
@@ -95,67 +84,46 @@ class KGenerator:
 
     def _add_atom_and_proof(self, atom: Atom, proof: Proof) -> None:
         """
-        Converts a ground Atom into a KG fact (Triple, Membership, etc.)
-        and adds it to our stores. If the fact already exists, it appends
-        the proof to the fact's proof list.
-
-        Args:
-            atom (Atom):    The ground atom to add.
-            proof (Proof):  The proof object that derived this atom.
+        Converts a ground Atom into a KG fact and adds it to our stores.
+        If the fact already exists, it appends the proof to the fact's proof list.
         """
 
-        # A goal of a proof must always be ground!
         if not atom.is_ground():
-            # This should not happen if chainer is correct
             print(f"Warning: Skipping non-ground atom: {atom}")
             return
 
-        # Extract subject, predicate, object from goal Atom
-        # Note that these are Terms that are guaranteed to be ground
         s, p, o = atom.subject, atom.predicate, atom.object
 
-        # ----------------------------- CLASS MEMBERSHIPS ---------------------------- #
-
+        # CLASS MEMBERSHIPS
         if p == RDF.type and isinstance(o, Class):
             self._register_individual(s)
             key = (s.name, o.name)
             if key not in self.memberships:
-                # Create a new Membership fact
                 self.memberships[key] = Membership(
                     individual=s, cls=o, is_member=True, proofs=[]
                 )
-            # Add this proof to the fact's proof list
             self.memberships[key].proofs.append(proof)
 
-        # ---------------------------- RELATIONAL TRIPLES ---------------------------- #
-
+        # RELATIONAL TRIPLES
         elif isinstance(o, Individual) and isinstance(p, Relation):
             self._register_individual(s)
             self._register_individual(o)
             key = (s.name, p.name, o.name)
             if key not in self.triples:
-                # Create a new Triple fact
                 self.triples[key] = Triple(
                     subject=s, predicate=p, object=o, positive=True, proofs=[]
                 )
-            # Add this proof to the fact's proof list
             self.triples[key].proofs.append(proof)
 
-        # ----------------------------- ATTRIBUTE TRIPLES ---------------------------- #
-
+        # ATTRIBUTE TRIPLES
         elif isinstance(p, Attribute):
             self._register_individual(s)
-            # Note: object (o) is a LiteralValue here
             key = (s.name, p.name, o)
             if key not in self.attr_triples:
-                # Create a new AttributeTriple fact
                 self.attr_triples[key] = AttributeTriple(
                     subject=s, predicate=p, value=o, proofs=[]
                 )
-            # Add this proof to the fact's proof list
             self.attr_triples[key].proofs.append(proof)
-
-        # Other atom types (e.g., variable predicates) are not handled
 
     def generate_data(self) -> KnowledgeGraph:
         """
@@ -163,42 +131,32 @@ class KGenerator:
         generating all possible proofs, and building the KnowledgeGraph.
         """
 
-        # self.parser.print_summary()
         all_rules = self.parser.rules
 
-        # No rules means no data
         if not all_rules:
             print("Warning: No rules found in the ontology. No data will be generated.")
             return self.build_knowledge_graph()
 
         print(f"Starting data generation from {len(all_rules)} rules...")
 
-        # Iterate through all rules as starting points for proof generation
+        total_top_level_proofs = 0
+
         for i, rule in enumerate(all_rules):
             print(f"\n[{i + 1}/{len(all_rules)}] Generating from rule: {rule.name}")
 
-            # Generate all top-level proof trees starting from this rule
             proof_generator = self.chainer.generate_proof_trees(rule.name)
 
             top_level_proofs = 0
 
-            # For all top-level proofs generated from this rule,
-            # traverse the proof tree and extract all ground atoms
             for top_level_proof in proof_generator:
-                # Count this top-level proof
                 top_level_proofs += 1
 
-                # We traverse the entire proof tree (a Directed Acyclic Graph) from the top
-                # and add every single atom (goal, intermediate, base) to our KG.
-
+                # Traverse the entire proof tree
                 stack = [top_level_proof]
 
-                # Depth-first traversal of the proof tree
                 while stack:
-                    # Pop a proof from the stack
                     current_proof = stack.pop()
 
-                    # If we've seen this exact proof object, skip
                     if current_proof in self.processed_proofs:
                         continue
 
@@ -207,7 +165,7 @@ class KGenerator:
                     # Add the goal of this proof to our KG
                     self._add_atom_and_proof(current_proof.goal, current_proof)
 
-                    # Add all sub-proofs to the stack to be processed
+                    # Add all sub-proofs to the stack
                     for sub_proof in current_proof.sub_proofs:
                         stack.append(sub_proof)
 
@@ -215,22 +173,20 @@ class KGenerator:
                 print("  -> No proofs found (rule may not be a valid starting point).")
             else:
                 print(f"  -> Found and processed {top_level_proofs} proof tree(s).")
+                total_top_level_proofs += top_level_proofs
 
-        print("\n--- Data generation complete. ---")
+        print(
+            f"\n--- Data generation complete. Total proof trees: {total_top_level_proofs} ---"
+        )
 
-        # Return a KnowledgeGraph object with all collected data
         return self.build_knowledge_graph()
 
     def build_knowledge_graph(self) -> KnowledgeGraph:
-        """
-        Assembles the final KnowledgeGraph object from all collected data.
-        """
+        """Assembles the final KnowledgeGraph object from all collected data."""
         return KnowledgeGraph(
-            # From schema
             attributes=list(self.schema_attributes.values()),
             classes=list(self.schema_classes.values()),
             relations=list(self.schema_relations.values()),
-            # From generated data
             individuals=list(self.individuals.values()),
             triples=list(self.triples.values()),
             memberships=list(self.memberships.values()),
@@ -239,14 +195,11 @@ class KGenerator:
 
 
 def main():
-    """
-    Main entry point for the script.
-    """
-
-    # ------------------------------ PARSE ARGUMENTS ----------------------------- #
+    """Main entry point for the script."""
 
     default_ontology_path = "data/family.ttl"
-    default_max_recursion = 4
+    default_max_recursion = 3
+    default_max_proofs = 200
 
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator"
@@ -263,32 +216,48 @@ def main():
         default=default_max_recursion,
         help=f"Maximum depth for recursive rules (default: {default_max_recursion})",
     )
+    parser.add_argument(
+        "--max-proofs",
+        type=int,
+        default=default_max_proofs,
+        help=f"Maximum number of proofs per rule (default: {default_max_proofs})",
+    )
     args = parser.parse_args()
 
-    # ---------------------------- RUN GENERATION PIPELINE ----------------------- #
-
     try:
-        # Initialize Generator
-        generator = KGenerator(args.ontology_path, max_recursion=args.max_recursion)
+        generator = KGenerator(
+            args.ontology_path,
+            max_recursion=args.max_recursion,
+            max_proofs_per_rule=args.max_proofs,
+        )
 
-        # Run Generation
         kg = generator.generate_data()
 
-        # Print Summary
-        print("\n--- Knowledge Graph Generation Summary ---")
-        print(f"  Schema Classes:    {len(kg.classes)}")
-        print(f"  Schema Relations:  {len(kg.relations)}")
-        print(f"  Schema Attributes: {len(kg.attributes)}")
-        print("------------------------------------------")
-        print(f"  Generated Individuals: {len(kg.individuals)}")
-        print(f"  Generated Triples:     {len(kg.triples)}")
-        print(f"  Generated Memberships: {len(kg.memberships)}")
-        print(f"  Generated AttrTriples: {len(kg.attribute_triples)}")
-        print("------------------------------------------")
+        print("\n" + "=" * 60)
+        print("KNOWLEDGE GRAPH GENERATION SUMMARY")
+        print("=" * 60)
+        print(f"\nSchema Elements:")
+        print(f"  Classes:    {len(kg.classes)}")
+        print(f"  Relations:  {len(kg.relations)}")
+        print(f"  Attributes: {len(kg.attributes)}")
+        print(f"\nGenerated Data:")
+        print(f"  Individuals: {len(kg.individuals)}")
+        print(f"  Triples:     {len(kg.triples)}")
+        print(f"  Memberships: {len(kg.memberships)}")
+        print(f"  AttrTriples: {len(kg.attribute_triples)}")
+
+        # Calculate statistics
+        base_triples = sum(1 for t in kg.triples if t.is_base_fact)
+        inferred_triples = len(kg.triples) - base_triples
+        base_memberships = sum(1 for m in kg.memberships if m.is_base_fact)
+        inferred_memberships = len(kg.memberships) - base_memberships
+
+        print(f"\nFact Types:")
+        print(f"  Base Facts:     {base_triples + base_memberships}")
+        print(f"  Inferred Facts: {inferred_triples + inferred_memberships}")
+        print("=" * 60 + "\n")
 
         kg.print()
-
-    # ------------------------------ ERROR HANDLING ------------------------------ #
 
     except FileNotFoundError:
         print(

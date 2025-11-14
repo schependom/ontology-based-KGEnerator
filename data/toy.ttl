@@ -7,7 +7,7 @@
 :Person rdf:type owl:Class .
 :Man rdf:type owl:Class ;
      rdfs:subClassOf :Person .
-    
+
 :Woman rdf:type owl:Class ;
        rdfs:subClassOf :Person ;
        owl:disjointWith :Man .
@@ -22,3 +22,12 @@
             rdf:type owl:IrreflexiveProperty ;
             rdfs:domain :Person ;
             rdfs:range :Person .
+    
+:hasGrandparent rdf:type owl:ObjectProperty ;
+               rdf:type owl:IrreflexiveProperty ;
+               owl:propertyChainAxiom ( :hasParent :hasParent ) .
+
+:hasGrandfather rdf:type owl:ObjectProperty ;
+               rdfs:subPropertyOf :hasGrandparent ;
+               rdfs:range :Man ;
+                rdf:type owl:IrreflexiveProperty .
