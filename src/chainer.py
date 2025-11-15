@@ -1,7 +1,7 @@
 """
 DESCRIPTION
 
-    Pure Python Backward-Chaining Knowledge Graph Generator.
+    Pure Python Backward-Chaining Knowledge Graph Generator with detailed logging.
 
 WORKFLOW
 
@@ -10,6 +10,7 @@ WORKFLOW
         - Recursively find proofs for each premise of the rule.
         - Generate new individuals as needed for unbound variables.
         - Track recursive rule usage to prevent infinite loops.
+        - Track atoms in proof path to prevent circular reasoning.
 
 AUTHOR
 
@@ -39,28 +40,41 @@ class BackwardChainer:
 
     This engine starts with a "goal rule" and tries to find all possible
     proof trees for its conclusion, generating new individuals along the way.
+
+    Key features:
+    - Backward chaining from goal to premises
+    - Automatic individual generation for unbound variables
+    - Recursion depth limiting for recursive rules
+    - Circular reasoning prevention via atom path tracking
+    - Optional verbose logging for debugging
     """
 
     def __init__(
         self,
         all_rules: List[ExecutableRule],
         max_recursion_depth: int = 2,
+        verbose: bool = False,
     ):
         """
         Initializes the chainer.
 
         Args:
             all_rules (List[ExecutableRule]):   All rules from the ontology parser.
-            max_recursion_depth (int):          Max number of times a recursive rule can be used in a single proof path.
+            max_recursion_depth (int):          Max number of times a recursive rule
+                                                can be used in a single proof path.
+            verbose (bool):                     Enable detailed debug output.
         """
-        # Dict {rule_name: ExecutableRule}
+        # Store rules as dict {rule_name: ExecutableRule} for fast lookup
         self.all_rules = {rule.name: rule for rule in all_rules}
         self.max_recursion_depth = max_recursion_depth
+        self.verbose = verbose
 
-        # Initialize a Dict[Tuple, List[ExecutableRule]] for fast rule lookup based on the head
+        # Index rules by their conclusion for O(1) lookup
+        # Dict[Tuple, List[ExecutableRule]]: atom_key -> [rules with that conclusion]
         self.rules_by_head = self._index_rules(all_rules)
 
         # Find all rule names that are part of a recursive cycle
+        # (including mutual recursion, e.g., P -> Q, Q -> P)
         self.recursive_rules: Set[str] = self._find_recursive_rules(all_rules)
         if self.recursive_rules:
             print(f"Chainer identified {len(self.recursive_rules)} recursive rules:")
@@ -68,18 +82,24 @@ class BackwardChainer:
                 print(f"  - {rule_name}")
 
         # Counters for generating unique entities
-        self._var_rename_counter = 0
-        self._individual_counter = 0
+        self._var_rename_counter = 0  # For renaming rule variables
+        self._individual_counter = 0  # For generating new individuals
 
     def _get_atom_key(self, atom: Atom) -> Optional[Tuple]:
         """
-        Creates a hashable key for an atom to index rules.
+        Creates a hashable key for an atom to index rules by their conclusions.
 
-        Classes:    (rdf:type, 'Person')
-        Relations:  ('hasParent', None)
-        Attributes: ('age', None)
+        Examples:
+            Classes:    Atom(X, rdf:type, Person)     -> (rdf:type, 'Person')
+            Relations:  Atom(X, hasParent, Y)         -> ('hasParent', None)
+            Attributes: Atom(X, age, 25)              -> ('age', None)
+
+        Args:
+            atom (Atom): The atom to create a key for.
+
+        Returns:
+            Optional[Tuple]: A hashable key, or None if the predicate is a variable.
         """
-
         pred = atom.predicate
         obj = atom.object
 
@@ -87,16 +107,15 @@ class BackwardChainer:
         if isinstance(pred, Var):
             return None
 
-        # Key on (rdf:type, ClassName)
+        # For class membership (rdf:type), key on (rdf:type, ClassName)
         if pred == RDF.type and not isinstance(obj, Var):
             if isinstance(obj, Class):
-                # Class membership
                 return (RDF.type, obj.name)
             else:
                 print(f"Warning: Unexpected object for rdf:type: {obj}")
                 return (RDF.type, str(obj))
 
-        # Key on (PredicateName, None)
+        # For relations and attributes, key on (PredicateName, None)
         else:
             if isinstance(pred, (Relation, Attribute)):
                 return (pred.name, None)
@@ -107,19 +126,19 @@ class BackwardChainer:
         self, rules: List[ExecutableRule]
     ) -> Dict[Tuple, List[ExecutableRule]]:
         """
-        Indexes rules by their conclusion (head atom) for faster lookup.
+        Indexes rules by their conclusion (head atom) for O(1) lookup.
+
+        This allows us to quickly find all rules that could prove a given atom.
 
         Args:
-            rules (List[ExecutableRule]): List of all rules.
+            rules (List[ExecutableRule]): List of all rules from the ontology.
 
         Returns:
-            Dict[Tuple, List[ExecutableRule]]: Mapping from atom keys to rules.
+            Dict[Tuple, List[ExecutableRule]]: Mapping from atom keys to rules
+                                                 that have that atom as conclusion.
         """
-        index: Dict[Tuple, List[ExecutableRule]] = defaultdict(
-            list
-        )  # automatically creates lists on new keys
+        index: Dict[Tuple, List[ExecutableRule]] = defaultdict(list)
 
-        # Index each rule by its conclusion
         for rule in rules:
             key = self._get_atom_key(rule.conclusion)
             if key is not None:
@@ -127,16 +146,22 @@ class BackwardChainer:
             else:
                 print(f"Warning: Cannot index rule with variable predicate: {rule}")
 
-        # Return the completed index dictionary
         return index
 
     def _find_recursive_rules(self, all_rules: List[ExecutableRule]) -> Set[str]:
         """
-        Finds all rules that are part of any recursive cycle (including mutual recursion).
-        e.g., P -> Q, Q -> P
+        Finds all rules that are part of any recursive cycle.
+
+        This includes direct recursion (A -> A) and mutual recursion (A -> B, B -> A).
+        Uses DFS to detect cycles in the dependency graph.
+
+        Args:
+            all_rules (List[ExecutableRule]): All rules from the ontology.
+
+        Returns:
+            Set[str]: Set of rule names that are part of recursive cycles.
         """
-        # 1. Build a dependency graph between "atom keys" (predicates/classes)
-        #    graph: { head_key: Set(premise_key, ...) }
+        # Build a dependency graph: atom_key -> {atom_keys it depends on}
         graph: Dict[Tuple, Set[Tuple]] = defaultdict(set)
         for rule in all_rules:
             head_key = self._get_atom_key(rule.conclusion)
@@ -147,21 +172,18 @@ class BackwardChainer:
                 if premise_key is not None:
                     graph[head_key].add(premise_key)
 
-        # 2. Use DFS to find all nodes (atom keys) that are part of a cycle
+        # Use DFS to find all nodes that are part of a cycle
         recursive_keys: Set[Tuple] = set()
-
-        # We need to track nodes currently in the recursion stack (visiting)
-        # and nodes we've already fully explored (visited)
-        visiting: Set[Tuple] = set()
-        visited: Set[Tuple] = set()
+        visiting: Set[Tuple] = set()  # Currently in recursion stack
+        visited: Set[Tuple] = set()  # Fully explored
 
         def dfs(key: Tuple):
-            """Recursive DFS to find cycles."""
+            """DFS to detect cycles and mark all nodes in cycles."""
             visiting.add(key)
 
             for neighbor_key in graph.get(key, set()):
                 if neighbor_key in visiting:
-                    # Cycle detected! This key is part of a cycle.
+                    # Back edge found - cycle detected!
                     recursive_keys.add(key)
                 elif neighbor_key not in visited:
                     dfs(neighbor_key)
@@ -172,13 +194,12 @@ class BackwardChainer:
             visiting.remove(key)
             visited.add(key)
 
-        # Run DFS from every node to find all possible cycles
-        all_keys = list(graph.keys())
-        for key in all_keys:
+        # Run DFS from every unvisited node
+        for key in list(graph.keys()):
             if key not in visited:
                 dfs(key)
 
-        # 3. Find all rule names whose *conclusion* is one of the recursive keys
+        # Map recursive atom keys back to rule names
         recursive_rule_names: Set[str] = set()
         for rule in all_rules:
             head_key = self._get_atom_key(rule.conclusion)
@@ -189,20 +210,24 @@ class BackwardChainer:
 
     def _get_fresh_individual(self) -> Individual:
         """
-        Generates a new, unique Individual.
+        Generates a new, unique Individual with an auto-incremented name.
 
         Returns:
-            Individual: A new individual with a unique name.
+            Individual: A new individual with a unique name (e.g., "Ind_0", "Ind_1").
         """
-
         idx = self._individual_counter
         self._individual_counter += 1
-
         return Individual(index=idx, name=f"Ind_{idx}")
 
     def _get_vars_in_atom(self, atom: Atom) -> Set[Var]:
         """
-        Returns all Var objects present in an atom.
+        Extracts all Var objects present in an atom.
+
+        Args:
+            atom (Atom): The atom to extract variables from.
+
+        Returns:
+            Set[Var]: Set of all variables in the atom.
         """
         vars: Set[Var] = set()
         if isinstance(atom.subject, Var):
@@ -215,12 +240,13 @@ class BackwardChainer:
 
     def _rename_rule_vars(self, rule: ExecutableRule) -> ExecutableRule:
         """
-        Crete a new rule with all variables renamed to be unique.
+        Creates a new rule with all variables renamed to be unique.
 
-        e.g., (X, P, Y) -> (X, Q, Z)  becomes
-              (X_1, P, Y_1) -> (X_1, Q, Z_1)
+        This prevents variable name collisions when using the same rule multiple times.
 
-        Above, the triples are Atoms and the tuple items are Terms.
+        Example:
+            Input:  (X, parent, Y) -> (X, grandparent, Z)
+            Output: (X_1, parent, Y_1) -> (X_1, grandparent, Z_1)
 
         Args:
             rule (ExecutableRule): The rule to rename variables for.
@@ -228,33 +254,28 @@ class BackwardChainer:
         Returns:
             ExecutableRule: A new rule instance with renamed variables.
         """
-
-        # Update the counter
         self._var_rename_counter += 1
-
-        # Create a unique suffix
         suffix = f"_{self._var_rename_counter}"
-
-        # A map from old Var to new Var
         var_map: Dict[Var, Var] = {}
 
         def get_renamed_var(v: Var) -> Var:
-            # If the variable is not yet renamed, do so now
+            """Get or create a renamed version of a variable."""
             if v not in var_map:
                 var_map[v] = Var(v.name + suffix)
-
-            # If it is already renamed, return that renamed Var
             return var_map[v]
 
-        # Rename one Term (part of an Atom, ground or not (Var))
         def rename_term(t: Term) -> Term:
+            """Rename a term if it's a variable, otherwise return as-is."""
             return get_renamed_var(t) if isinstance(t, Var) else t
 
+        # Rename conclusion
         renamed_conclusion = Atom(
             subject=rename_term(rule.conclusion.subject),
             predicate=rename_term(rule.conclusion.predicate),
             object=rename_term(rule.conclusion.object),
         )
+
+        # Rename all premises
         renamed_premises = [
             Atom(
                 subject=rename_term(p.subject),
@@ -264,7 +285,6 @@ class BackwardChainer:
             for p in rule.premises
         ]
 
-        # Return a new rule instance
         return ExecutableRule(
             name=rule.name, conclusion=renamed_conclusion, premises=renamed_premises
         )
@@ -273,47 +293,47 @@ class BackwardChainer:
         """
         Attempts to unify a GROUND goal atom with a rule's conclusion pattern.
 
+        Unification finds a substitution that makes the pattern match the goal.
+
+        Example:
+            goal    = Atom(Ind_A, hasParent, Ind_C)  [ground]
+            pattern = Atom(X_1, hasParent, Y_1)      [has variables]
+            result  = {X_1: Ind_A, Y_1: Ind_C}       [substitution]
+
         Args:
-            goal:     A ground atom we want to prove  (e.g., parent(Ind_A, Ind_C))
-            pattern:  A rule head with variables      (e.g., parent(X_1, Y_1))
+            goal (Atom):    A ground atom we want to prove.
+            pattern (Atom): A rule conclusion with variables.
 
         Returns:
-            A substitution mapping from Var to Term if unification succeeds,
-            or None if unification fails.
+            Optional[Dict[Var, Term]]: A substitution mapping from variables to
+                                       ground terms, or None if unification fails.
         """
-
-        # Keep track of substitutions per Var, e.g.
-        # { Var('X_1'): Individual('Ind_A'), ... }
         subst: Dict[Var, Term] = {}
 
         def unify_terms(t1: Term, t2: Term) -> bool:
             """
-            Unify two terms, updating subst as needed.
+            Unify two terms, updating the substitution dictionary.
 
             Args:
-                t1: First term (ground)
-                t2: Second term (could be Var or ground)
+                t1 (Term): Ground term from goal.
+                t2 (Term): Possibly variable term from pattern.
 
-            Returns
-                True on success, False on failure.
+            Returns:
+                bool: True if unification succeeds, False otherwise.
             """
-
-            # If the second term t2 is a variable, try to bind it
             if isinstance(t2, Var):
+                # t2 is a variable - try to bind it to t1
                 if t2 in subst and subst[t2] != t1:
-                    # Variable already bound to different value
-                    return False  # could not unify
-
-                # Not already bound or same binding
+                    # Variable already bound to different value - unification fails
+                    return False
+                # Bind or confirm existing binding
                 subst[t2] = t1
-                # Successful binding
                 return True
-
-            # If the second term t2 is ground, then t1 must match it
             else:
+                # t2 is ground - must match t1 exactly
                 return t1 == t2
 
-        # We assume that goal.subject, predicate, object are all ground
+        # Unify subject, predicate, and object
         if not unify_terms(goal.subject, pattern.subject):
             return None
         if not unify_terms(goal.predicate, pattern.predicate):
@@ -327,342 +347,403 @@ class BackwardChainer:
         """
         Main entry point to generate proof trees starting from a specific rule.
 
+        This method generates all possible proof trees for the given rule's conclusion,
+        creating new individuals as needed for variables.
+
+        RUNNING EXAMPLE:
+        ----------------
+        Consider the rule for grandparent:
+            hasParent(X, Y) ∧ hasParent(Y, Z) → hasGrandparent(X, Z)
+
+        In OWL 2 RL:
+            :hasGrandparent owl:propertyChainAxiom ( :hasParent :hasParent ) .
+
+        Parsed as ExecutableRule:
+            conclusion = Atom(Var('X'), hasGrandparent, Var('Z'))
+            premises   = [Atom(Var('X'), hasParent, Var('Y')),
+                         Atom(Var('Y'), hasParent, Var('Z'))]
+
         Args:
-            start_rule_name (str): The name of the rule to use as the
-                                   starting point (e.g., "transitive_hasAncestor").
+            start_rule_name (str): The name of the rule to use as starting point
+                                   (e.g., "owl_chain_hasParent_hasParent_hasGrandparent").
 
         Yields:
-            Proof: A complete, ground proof tree.
+            Proof: Complete, ground proof trees.
         """
         if start_rule_name not in self.all_rules:
             print(f"Error: Rule '{start_rule_name}' not found.")
             return
 
-        # ------------------------------ RUNNING EXAMPLE ----------------------------- #
-        #
-        # Let's assume we want to prove the following rule:
-        #       hasParent(X, Y) ∧ hasParent(Y, Z) → hasGrandparent(X, Z)
-        #
-        # This is expressed in owl 2 rl as:
-        #       :hasGrandparent owl:propertyChainAxiom ( :hasParent :hasParent ) .
-        #
-        # Which is parsed into an ExecutableRule with:
-        #       conclusion  =   Atom(Var('X'), hasGrandparent, Var('Z'))
-        #       premises    = [ Atom(Var('X'), hasParent, Var('Y')),
-        #                       Atom(Var('Y'), hasParent, Var('Z')) ]
-        # ---------------------------------------------------------------------------- #
+        if self.verbose:
+            print(f"\n{'=' * 80}")
+            print(f"GENERATING PROOF TREES FOR: {start_rule_name}")
+            print(f"{'=' * 80}")
 
-        # The 'raw', i.e. unrenamed, starting rule
+        # Get the starting rule (unrenamed)
         start_rule = self.all_rules[start_rule_name]
-        # e.g. ExecutableRule(
+        # Example: ExecutableRule(
         #   conclusion=Atom(Var('X'), hasGrandparent, Var('Z')),
-        #   premises=[Atom(Var('X'), hasParent, Var('Y')), Atom(Var('Y'), hasParent, Var('Z'))]
+        #   premises=[Atom(Var('X'), hasParent, Var('Y')),
+        #             Atom(Var('Y'), hasParent, Var('Z'))]
         # )
 
-        # Rename rule vars
+        # Rename variables to avoid collisions
         rule = self._rename_rule_vars(start_rule)
-        # e.g. ExecutableRule(
+        # Example after renaming: ExecutableRule(
         #   conclusion=Atom(Var('X_1'), hasGrandparent, Var('Z_1')),
-        #   premises=[Atom(Var('X_1'), hasParent, Var('Y_1')), Atom(Var('Y_1'), hasParent, Var('Z_1'))]
+        #   premises=[Atom(Var('X_1'), hasParent, Var('Y_1')),
+        #             Atom(Var('Y_1'), hasParent, Var('Z_1'))]
         # )
 
-        # Create initial substitution
-        #   -> generate individuals for all variables in the rule's conclusion
-        subst: Dict[Var, Term] = {}
+        # Extract variables from the conclusion
         conclusion_vars = self._get_vars_in_atom(rule.conclusion)
-        # e.g. X_1, Z_1
+        # Example: {Var('X_1'), Var('Z_1')}
 
         if not conclusion_vars:
-            # If the head has no variables, like Atom(Ind_A, hasParent, Ind_B),
-            # it is already a fact and the generator can't start from it.
+            # If the conclusion has no variables, it's already a ground fact
             print(
                 f"Error: Rule '{start_rule_name}' conclusion has no variables. It is a fact."
             )
             return
 
-        # Generate individuals for all conclusion variables
+        # Generate fresh individuals for all conclusion variables
+        subst: Dict[Var, Term] = {}
         for var in conclusion_vars:
             subst[var] = self._get_fresh_individual()
-            # e.g. subst = {
-            #           Var('X_1'): Individual('Ind_0'),
-            #           Var('Z_1'): Individual('Ind_1')
-            #      }
+        # Example: subst = {
+        #   Var('X_1'): Individual('Ind_0'),
+        #   Var('Z_1'): Individual('Ind_1')
+        # }
+
+        if self.verbose:
+            print(f"\nInitial substitution for conclusion variables:")
+            for var, ind in subst.items():
+                print(f"  {var} -> {ind}")
 
         # Create the ground goal we intend to prove
         ground_goal = rule.conclusion.substitute(subst)
-        # e.g. Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
+        # Example: Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
 
-        # ------------------- Find all sub-proofs for the premises ------------------- #
+        if self.verbose:
+            print(f"\nGround goal to prove: {self._format_atom(ground_goal)}")
 
-        # This is the same logic as the recursive step in _find_proofs
-
-        # A frozenset is a mutable unordered collection, good for tracking
-        # recursive rule usage in proof paths like this.
+        # Track recursive rule usage
         recursive_use_counts = frozenset()
-        # The set will look like this:
-        #   { ('rule_name_1', count_1), ('rule_name_2', count_2), ... }
-        # Where the count is how many times that rule has been used in the current proof path.
-        # If the count exceeds max_recursion_depth, we skip that rule.
-
         if rule.name in self.recursive_rules:
-            # If the starting rule is recursive, we count its first usage
+            # If the starting rule is recursive, count its first usage
             recursive_use_counts = frozenset([(rule.name, 1)])
 
-        # Find unbound variables in premises and substitute them based on subst dictionary from above
-        #   -> this new list can still contain variables that need grounding!
+        # Substitute known variables into premises
         premises_with_bound_vars = [p.substitute(subst) for p in rule.premises]
-        # e.g. [ Atom(Individual('Ind_0'), hasParent, Var('Y_1')),
-        #        Atom(Var('Y_1'), hasParent, Individual('Ind_1')) ]
+        # Example: [Atom(Individual('Ind_0'), hasParent, Var('Y_1')),
+        #           Atom(Var('Y_1'), hasParent, Individual('Ind_1'))]
 
-        # Find any new variables (after the substitutions above) and add
-        # them to the unbound variables set
+        # Find any remaining unbound variables in premises
         unbound_vars: Set[Var] = set()
         for p in premises_with_bound_vars:
             unbound_vars.update(self._get_vars_in_atom(p))
-        # e.g. { Var('Y_1') }
+        # Example: {Var('Y_1')}
 
-        # Generate individuals for any unbound variables in the premises,
-        # because before we try to prove these premises, they must be ground
+        # Generate individuals for unbound variables
         for var in unbound_vars:
             if var not in subst:
-                # Should always be true
-                # e.g. 'Y_1' not in subst = { 'X_1': Ind_0, 'Z_1': Ind_1 }
                 subst[var] = self._get_fresh_individual()
-
-        # e.g. subst = {
-        #           Var('X_1'): Individual('Ind_0'),
-        #           Var('Z_1'): Individual('Ind_1'),
-        #           Var('Y_1'): Individual('Ind_2')     # new
-        #      }
+                if self.verbose:
+                    print(f"  Generated {subst[var]} for unbound variable {var}")
+        # Example: subst = {
+        #   Var('X_1'): Individual('Ind_0'),
+        #   Var('Z_1'): Individual('Ind_1'),
+        #   Var('Y_1'): Individual('Ind_2')  # newly generated
+        # }
 
         # Final grounding of premises
         ground_premises = [p.substitute(subst) for p in premises_with_bound_vars]
-        # e.g. [ Atom(Individual('Ind_0'), hasParent, Individual('Ind_2')),
-        #        Atom(Individual('Ind_2'), hasParent, Individual('Ind_1')) ]
+        # Example: [Atom(Individual('Ind_0'), hasParent, Individual('Ind_2')),
+        #           Atom(Individual('Ind_2'), hasParent, Individual('Ind_1'))]
 
-        # Keep track of all Iterator objects that are yielding sub-proofs for each premise
-        premise_sub_proof_iters = []
-
-        # Handle the case of zero-premise rules
+        # Handle zero-premise rules (axioms)
         if not ground_premises:
             print("WARNING: Rule with no premises encountered.")
-
-            # This rule has no premises, so it's a generator of base facts.
             yield Proof.create_base_proof(ground_goal)
             return
 
+        if self.verbose:
+            print(f"\nGround premises to prove:")
+            for i, prem in enumerate(ground_premises):
+                print(f"  {i + 1}. {self._format_atom(prem)}")
+
+        # Track atoms in the current proof path to prevent circular reasoning
+        atoms_in_path: frozenset[Atom] = frozenset([ground_goal])
+
+        # Find proofs for all premises
+        premise_sub_proof_iters = []
         failed_to_prove_a_premise = False
 
-        # Find proofs for all (now ground) premises
         for premise in ground_premises:
-            # Get all Iterator[Proof]'s for this premise
-            # and pass the current recursion tracker
             proof_list = list(
-                self._find_proofs_recursive(premise, recursive_use_counts)
+                self._find_proofs_recursive(
+                    premise, recursive_use_counts, atoms_in_path
+                )
             )
 
             if not proof_list:
-                # No proofs found for this premise, so the whole rule fails
+                # No proofs found for this premise
                 failed_to_prove_a_premise = True
+                if self.verbose:
+                    print(f"  ✗ Failed to prove: {self._format_atom(premise)}")
                 break
 
-            # Collect the list of proofs
+            if self.verbose:
+                print(
+                    f"  ✓ Found {len(proof_list)} proof(s) for: {self._format_atom(premise)}"
+                )
             premise_sub_proof_iters.append(proof_list)
 
-        # Check if any premise failed to find a proof
         if failed_to_prove_a_premise:
-            return  # This whole proof for the goal fails
+            if self.verbose:
+                print("\n✗ Proof generation failed (couldn't prove all premises)")
+            return
 
-        # E.g., right now we have:
-        #   premise_sub_proof_iters = [
-        #       [Proof1_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_0, Ind_2), ...],
-        #       [Proof1_for_parent(Ind_2, Ind_1), Proof2_for_parent(Ind_2, Ind_1), ...],
-        #   ]
-
-        # Yield all combinations of sub-proofs by taking the Cartesian product of the iterators
-
-        # e.g., for two premises A and B:
-        #   for proof_A in proofs_for_A:
-        #       for proof_B in proofs_for_B:
-        #           yield Proof(goal, rule, [proof_A, proof_B])
-
-        # for the grandparent example, we get that all_sub_proof_combinations will yield:
-        #   (Proof1_for_parent(Ind_0, Ind_2), Proof1_for_parent(Ind_2, Ind_1))
-        #   (Proof1_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_2, Ind_1))
-        #   (Proof2_for_parent(Ind_0, Ind_2), Proof1_for_parent(Ind_2, Ind_1))
-        #   (Proof2_for_parent(Ind_0, Ind_2), Proof2_for_parent(Ind_2, Ind_1))
+        # Yield all combinations of sub-proofs (Cartesian product)
+        # Example: If premise 1 has 2 proofs and premise 2 has 3 proofs,
+        #          this yields 2 × 3 = 6 complete proof trees
+        proof_count = 0
         for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
+            proof_count += 1
             yield Proof.create_derived_proof(
-                goal=ground_goal,  # grounded goal atom
-                rule=start_rule,  # unrenamed rule
+                goal=ground_goal,
+                rule=start_rule,  # Use unrenamed rule
                 sub_proofs=list(sub_proof_combination),
             )
 
+        if self.verbose:
+            print(f"\n✓ Generated {proof_count} complete proof tree(s)")
+
     def _find_proofs_recursive(
-        self, goal_atom: Atom, recursive_use_counts: frozenset[Tuple[str, int]]
+        self,
+        goal_atom: Atom,
+        recursive_use_counts: frozenset[Tuple[str, int]],
+        atoms_in_path: frozenset[Atom],
     ) -> Iterator[Proof]:
         """
         Recursively finds all possible proof trees for a given ground atom.
 
+        RUNNING EXAMPLE (continued):
+        ----------------------------
+        From the generate_proof_trees example, we now need to prove the premises:
+            1. Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+            2. Atom(Individual('Ind_2'), hasParent, Individual('Ind_1'))
+
+        Let's trace the first premise:
+            goal_atom = Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
+
+        This gets converted to a key for rule lookup:
+            key = ('hasParent', None)
+
+        We find matching rules, e.g.:
+            ExecutableRule(conclusion = Atom(Var('X'), hasParent, Var('Y')),
+                          premises   = [Atom(Var('Y'), hasChild, Var('X'))])
+
+        After renaming:
+            ExecutableRule(conclusion = Atom(Var('X_3'), hasParent, Var('Y_3')),
+                          premises   = [Atom(Var('Y_3'), hasChild, Var('X_3'))])
+
+        Unifying goal_atom with the renamed conclusion:
+            subst = {Var('X_3'): Individual('Ind_0'),
+                    Var('Y_3'): Individual('Ind_2')}
+
+        Substituting into premises:
+            [Atom(Individual('Ind_2'), hasChild, Individual('Ind_0'))]
+
+        Then we recursively prove this new premise...
+
         Args:
-            goal_atom (Atom):               A *ground* atom to prove (e.g., parent(Ind_A, Ind_C)).
-            recursive_use_counts (frozenset):  Tracks recursive rule usage.
+            goal_atom (Atom):               Ground atom to prove.
+            recursive_use_counts (frozenset): Tracks how many times each recursive
+                                              rule has been used in this path.
+            atoms_in_path (frozenset):      Atoms already in the current proof path
+                                            (prevents circular reasoning).
 
         Yields:
-            Proof: A valid proof tree for the goal_atom.
+            Proof: Valid proof trees for the goal_atom.
         """
+        if self.verbose:
+            indent = "  " * len(atoms_in_path)
+            print(f"{indent}→ Proving: {self._format_atom(goal_atom)}")
 
-        # ------------------------------ RUNNING EXAMPLE ----------------------------- #
-        #
-        # Let's resume the running example of proving grandparent based on 2 x parent.
-        #
-        # Assume that in the generate_proof_trees function above, our goal was
-        #       rule.conclusion = Atom(Var('X'), hasGrandparent, Var('Z'))
-        # which got grounded to
-        #       goal_atom = Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
-        # leading - after creating individuals for the premises atoms - to the subst dictionary:
-        #       subst = {
-        #                   Var('X'): Individual('Ind_0'),
-        #                   Var('Z'): Individual('Ind_1'),
-        #                   Var('Y'): Individual('Ind_2')    # generated for the premises
-        #               }
-        # So, we now want to prove the premises:
-        #       Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
-        #       Atom(Individual('Ind_2'), hasParent, Individual('Ind_1'))
-        # That's where this recursive function comes in.
-        #
-        # Let's assume that the function is called for the first premise:
-        #       goal_atom = Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
-        #
-        # ---------------------------------------------------------------------------- #
+            if atoms_in_path and len(atoms_in_path) > 1:
+                print(f"{indent}  Current proof path:")
+                for i, atom in enumerate(atoms_in_path, 1):
+                    print(f"{indent}    {i}. {self._format_atom(atom)}")
 
-        # Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
-        # gets converted to a hashable key for rule lookup:
-        #   e.g. key = ('hasParent', None)
-        key = self._get_atom_key(goal_atom)
+        # Check for circular reasoning
+        if goal_atom in atoms_in_path:
+            if self.verbose:
+                print(
+                    f"{indent}  ✗ CIRCULAR: Atom already in proof path, skipping entirely"
+                )
+            return  # Yield nothing - this would be circular
 
-        # Find all rules whose conclusion matches this atom,
-        # i.e. rules we could apply to prove our goal_atom
-        matching_rules = self.rules_by_head.get(key, [])
-        #   e.g. [ ExecutableRule(  conclusion  =   Atom(Var('X'), hasParent, Var('Y')),
-        #                           premises    = [ Atom(Var('Y'), hasChild, Var('X'))  ]),
-        #          ... ]
-        # These rules are not renamed yet!
-
-        # ---------------------------------------------------------------------------- #
-        #                                   BASE CASE                                  #
-        # ---------------------------------------------------------------------------- #
-
-        # Always allow base facts
+        # ==================== BASE CASE ==================== #
+        # Allow this atom to be proven as a base fact
+        if self.verbose:
+            print(f"{indent}  ✓ Yielding BASE FACT proof")
         yield Proof.create_base_proof(goal_atom)
 
-        # ---------------------------------------------------------------------------- #
-        #                                RECURSIVE CASE                                #
-        # ---------------------------------------------------------------------------- #
+        # ==================== RECURSIVE CASE ==================== #
+        # Try to derive using rules
 
-        # Try all matching rules to prove the goal atom
+        # Add current atom to path BEFORE trying to derive it
+        new_atoms_in_path = atoms_in_path | frozenset([goal_atom])
+
+        # Find rules that could prove this atom
+        key = self._get_atom_key(goal_atom)
+        matching_rules = self.rules_by_head.get(key, [])
+
+        if self.verbose and matching_rules:
+            print(f"{indent}  Found {len(matching_rules)} matching rule(s)")
+
+        # Try each matching rule
         for original_rule in matching_rules:
-            #
-            # If the rule is recursive
-            #   -> check if we've hit max recursion depth
-            #   -> update the recursion tracker
+            # Check recursion limits
             if original_rule.name in self.recursive_rules:
-                #
-                # Get the number of times this rule has been used recursively so far
                 current_recursive_uses = dict(recursive_use_counts).get(
                     original_rule.name, 0
                 )
 
-                # Skip this rule if we've hit max recursion depth
                 if current_recursive_uses >= self.max_recursion_depth:
+                    if self.verbose:
+                        print(
+                            f"{indent}  ✗ Skipping {original_rule.name} (recursion limit)"
+                        )
                     continue
 
-                # Make a new recursion tracker with updated count
+                # Update recursion counter
                 new_counts = dict(recursive_use_counts)
                 new_counts[original_rule.name] = current_recursive_uses + 1
                 new_recursive_use_counts = frozenset(new_counts.items())
-
             else:
-                # Non-recursive rule, no changes to recursion tracker
+                # Non-recursive rule - no change to counter
                 new_recursive_use_counts = recursive_use_counts
 
-            # Rename the rule variables
+            # Rename rule variables to avoid collisions
             rule = self._rename_rule_vars(original_rule)
-            # e.g. ExecutableRule(  conclusion  =   Atom(Var('X_3'), hasParent, Var('Y_3')),
-            #                       premises    = [ Atom(Var('Y_3'), hasChild, Var('X_3'))  ])
 
-            # Unify our ground goal with the rule conclusion (that has variables)
-            #       Recall that _unify(t1, t2) returns a substitution dict from Var to Term
-            #       and t1 needs to be GROUND.
+            # Get all variables in this renamed rule for debug output
+            rule_vars = set()
+            rule_vars.update(self._get_vars_in_atom(rule.conclusion))
+            for premise in rule.premises:
+                rule_vars.update(self._get_vars_in_atom(premise))
+
+            if self.verbose:
+                print(f"{indent}  Trying rule: {rule.name}")
+                print(f"{indent}    Rule pattern: {self._format_atom(rule.conclusion)}")
+
+            # Unify goal with rule conclusion
             subst = self._unify(goal_atom, rule.conclusion)
-            # e.g. unifying goal_atom       = Atom(Individual('Ind_0'), hasParent, Individual('Ind_2'))
-            #      with     rule.conclusion = Atom(Var('X_3'), hasParent, Var('Y_3'))
-            #      yields   subst = {
-            #                   Var('X_3'): Individual('Ind_0'),
-            #                   Var('Y_3'): Individual('Ind_2')
-            #               }
             if subst is None:
-                # Should not happen
-                print(
-                    f"Warning: Unification failed between goal {goal_atom} and rule conclusion {rule.conclusion}"
-                )
+                if self.verbose:
+                    print(f"{indent}    ✗ Unification failed")
                 continue
 
-            # Substitute the found substitutions into the rule premises
-            premises_with_bound_vars = [p.substitute(subst) for p in rule.premises]
-            # e.g. [ Atom(Individual('Ind_2'), hasChild, Individual('Ind_0')) ]
+            if self.verbose:
+                print(f"{indent}    ✓ Unified with substitutions:")
+                for var in sorted(subst.keys(), key=lambda v: v.name):
+                    if var in rule_vars:  # Only show variables from this rule
+                        term_str = (
+                            subst[var].name
+                            if hasattr(subst[var], "name")
+                            else str(subst[var])
+                        )
+                        print(f"{indent}      {var.name} → {term_str}")
 
-            # Find any new variables in the premises (after substitution)
+            # Create a new substitution dict for this rule's scope
+            rule_subst = dict(subst)
+
+            # Substitute into premises
+            premises_with_bound_vars = [p.substitute(rule_subst) for p in rule.premises]
+
+            # Find unbound variables
             unbound_vars: Set[Var] = set()
             for p in premises_with_bound_vars:
                 unbound_vars.update(self._get_vars_in_atom(p))
 
-            # Generate individuals for any unbound variables in the premises
+            # Generate individuals for unbound variables
+            newly_generated = []
             for var in unbound_vars:
-                if var not in subst:
-                    # The if above should always be true
-                    subst[var] = self._get_fresh_individual()
+                if var not in rule_subst:
+                    rule_subst[var] = self._get_fresh_individual()
+                    newly_generated.append((var, rule_subst[var]))
+
+            if self.verbose and newly_generated:
+                print(f"{indent}    Generated new individuals:")
+                for var, ind in newly_generated:
+                    print(f"{indent}      {var.name} → {ind.name}")
 
             # Final grounding of premises
-            ground_premises = [p.substitute(subst) for p in premises_with_bound_vars]
+            ground_premises = [
+                p.substitute(rule_subst) for p in premises_with_bound_vars
+            ]
 
+            # Handle zero-premise rules (axioms)
             if not ground_premises:
-                print("WARNING: Rule with no premises encountered.")
-                # This is also a form of "base fact" for the chain.
+                if self.verbose:
+                    print(f"{indent}    ✓ No premises (axiom)")
                 yield Proof.create_derived_proof(
                     goal=goal_atom, rule=original_rule, sub_proofs=[]
                 )
                 continue
 
-            # Get all Iterators that yield the proofs for the premises
-            # of the current rule
+            # Try to prove all premises (with updated atoms_in_path)
             premise_sub_proof_iters = []
-
             failed_to_prove_a_premise = False
 
-            # Try to prove all premises
             for premise in ground_premises:
-                # Recurse
                 proof_list = list(
-                    self._find_proofs_recursive(premise, new_recursive_use_counts)
+                    self._find_proofs_recursive(
+                        premise, new_recursive_use_counts, new_atoms_in_path
+                    )
                 )
 
                 if not proof_list:
-                    # No proofs found for this premise, so the whole rule fails
+                    # No proofs found for this premise
                     failed_to_prove_a_premise = True
+                    if self.verbose:
+                        print(
+                            f"{indent}    ✗ Failed to prove premise: {self._format_atom(premise)}"
+                        )
                     break
 
-                # Collect the list of proofs
                 premise_sub_proof_iters.append(proof_list)
 
-            # Check if any premise failed to find a proof
             if failed_to_prove_a_premise:
-                continue  # Try the next rule
+                continue  # Try next rule
 
-            # Yield all combinations of sub-proofs by taking the Cartesian product of the iterators
+            # Yield all combinations of sub-proofs (Cartesian product)
             for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
+                if self.verbose:
+                    print(f"{indent}    ✓ Derived via {rule.name}")
                 yield Proof.create_derived_proof(
                     goal=goal_atom,
-                    rule=original_rule,
+                    rule=original_rule,  # Use unrenamed rule
                     sub_proofs=list(sub_proof_combination),
                 )
+
+    def _format_atom(self, atom: Atom) -> str:
+        """
+        Helper to format atom for debug output.
+
+        Args:
+            atom (Atom): The atom to format.
+
+        Returns:
+            str: A human-readable representation like "(Ind_0, hasParent, Ind_1)".
+        """
+        s = atom.subject.name if hasattr(atom.subject, "name") else str(atom.subject)
+        p = (
+            atom.predicate.name
+            if hasattr(atom.predicate, "name")
+            else str(atom.predicate)
+        )
+        o = atom.object.name if hasattr(atom.object, "name") else str(atom.object)
+        return f"({s}, {p}, {o})"

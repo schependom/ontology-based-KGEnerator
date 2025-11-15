@@ -43,7 +43,7 @@ from data_structures import (
     Relation,
 )
 from parser import OntologyParser
-from verbose_chainer import BackwardChainer
+from chainer import BackwardChainer
 from rdflib.namespace import RDF
 
 

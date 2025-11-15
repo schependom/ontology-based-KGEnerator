@@ -1,17 +1,38 @@
 """
 DESCRIPTION:
 
-    Enhanced Proof Tree Visualizer with Variable Substitutions.
+    Proof Tree Visualizer with Variable Substitutions.
 
-    Shows:
-    - Complete proof tree structure
-    - Variable substitutions at each step
+    This tool generates visual and textual representations of proof trees
+    produced by the backward chainer, showing the complete reasoning process
+    including variable bindings and rule applications.
+
+FEATURES:
+
+    - Complete proof tree structure visualization
+    - Variable substitutions tracked at each step
     - Individual generation tracking
     - Rule applications with detailed variable bindings
+    - Multiple output formats:
+        * Textual representation (console and file)
+        * Graphviz PDF diagrams (with graphviz installed)
+    - Proof statistics (depth, node count, individuals, etc.)
+
+OUTPUT FILES:
+
+    For each proof tree, generates:
+    - {proof_id}_detailed.txt: Text-based proof tree with full details
+    - {proof_id}_detailed.pdf: Visual graph (requires graphviz)
+    - {proof_id}_detailed.dot: Graphviz source (if PDF generation fails)
 
 USAGE:
 
     python visualizer_var.py --ontology-path data/toy.ttl --output-dir output/
+
+    Optional arguments:
+    --max-recursion N:  Maximum recursion depth for proofs (default: 2)
+    --max-proofs N:     Maximum proofs to visualize per rule (default: 5)
+    --rules R1 R2 ...:  Only visualize specific rules (default: all)
 
 AUTHOR:
 
@@ -44,7 +65,7 @@ from data_structures import (
     Relation,
 )
 from parser import OntologyParser
-from verbose_chainer import BackwardChainer
+from chainer import BackwardChainer
 from rdflib.namespace import RDF
 
 
@@ -52,6 +73,10 @@ class ProofTreeVisualizerV2:
     """
     Enhanced visualizer that tracks and displays variable substitutions
     throughout the proof tree.
+
+    This visualizer reconstructs the variable bindings at each step of the
+    proof by matching rule patterns against ground instances, providing
+    insight into how the backward chainer generates individuals and builds proofs.
     """
 
     def __init__(self, output_dir: str = "output"):
@@ -59,16 +84,17 @@ class ProofTreeVisualizerV2:
         Initialize the visualizer.
 
         Args:
-            output_dir: Directory to save output files
+            output_dir (str): Directory to save output files. Created if it doesn't exist.
         """
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Track nodes for graphviz
-        self.node_counter = 0
-        self.node_ids: Dict[Proof, str] = {}
+        # Tracking for graphviz node creation
+        self.node_counter = 0  # Auto-increment for unique node IDs
+        self.node_ids: Dict[Proof, str] = {}  # Map proof objects to node IDs
 
-        # Track variable substitutions throughout the proof
+        # Variable substitution tracking
+        # Maps each proof to the variable bindings that were used to derive it
         self.substitution_history: Dict[Proof, Dict[Var, str]] = {}
 
     def visualize_all_proofs(
@@ -80,10 +106,15 @@ class ProofTreeVisualizerV2:
         """
         Generate visualizations for all rules (or specified rules).
 
+        For each rule, generates up to max_proofs_per_rule proof trees,
+        creating both text and graphical representations.
+
         Args:
-            chainer: The BackwardChainer instance
-            rule_names: List of rule names to visualize (None = all rules)
-            max_proofs_per_rule: Maximum number of proof trees to visualize per rule
+            chainer (BackwardChainer): The BackwardChainer instance to use.
+            rule_names (Optional[List[str]]): List of rule names to visualize.
+                                              If None, visualizes all rules.
+            max_proofs_per_rule (int): Maximum number of proof trees to
+                                       visualize per rule.
         """
         if rule_names is None:
             rule_names = list(chainer.all_rules.keys())
@@ -101,7 +132,7 @@ class ProofTreeVisualizerV2:
             print(f"Rule: {rule_name}")
             print(f"{'-' * 80}")
 
-            # Generate proofs
+            # Generate proofs for this rule
             proof_generator = chainer.generate_proof_trees(rule_name)
             proofs = []
 
@@ -135,7 +166,7 @@ class ProofTreeVisualizerV2:
                 # Infer substitutions by comparing rule patterns with ground atoms
                 self._infer_substitutions(proof)
 
-                # Text visualization
+                # Text visualization (to console)
                 self.print_proof_tree_text(proof)
 
                 # Save text to file
@@ -146,11 +177,11 @@ class ProofTreeVisualizerV2:
                     f.write(self.get_proof_tree_text(proof))
                 print(f"✓ Saved text visualization to: {text_file}")
 
-                # Graphviz visualization
+                # Graphviz visualization (if available)
                 if HAS_GRAPHVIZ:
                     self.create_graphviz_visualization(proof, proof_id)
 
-                # Statistics
+                # Print statistics
                 stats = self.get_proof_statistics(proof)
                 print(f"\nProof Statistics:")
                 print(f"  Total nodes: {stats['total_nodes']}")
@@ -164,18 +195,25 @@ class ProofTreeVisualizerV2:
         self, proof: Proof, parent_subs: Optional[Dict[Var, str]] = None
     ) -> Dict[Var, str]:
         """
-        Recursively infer variable substitutions by comparing rule patterns with ground atoms.
+        Recursively infer variable substitutions by comparing rule patterns
+        with ground atoms.
+
+        This method reconstructs the variable bindings that the chainer used
+        by matching rule patterns (with variables) against ground instances
+        (with individuals).
 
         Args:
-            proof: Current proof node
-            parent_subs: Substitutions from parent (inherited)
+            proof (Proof): Current proof node to analyze.
+            parent_subs (Optional[Dict[Var, str]]): Substitutions inherited
+                                                     from parent proof.
 
         Returns:
-            Dictionary mapping variables to their ground values
+            Dict[Var, str]: Dictionary mapping variables to their ground values.
         """
         if parent_subs is None:
             parent_subs = {}
 
+        # Start with parent substitutions
         current_subs = parent_subs.copy()
 
         if proof.rule is not None:
@@ -183,11 +221,11 @@ class ProofTreeVisualizerV2:
             conclusion_pattern = proof.rule.conclusion
             ground_goal = proof.goal
 
-            # Infer substitutions from the unification
+            # Infer substitutions from unification
             new_subs = self._match_pattern_to_ground(conclusion_pattern, ground_goal)
             current_subs.update(new_subs)
 
-            # Also infer from premises
+            # Also infer from premises (if they exist)
             if len(proof.sub_proofs) == len(proof.rule.premises):
                 for premise_pattern, sub_proof in zip(
                     proof.rule.premises, proof.sub_proofs
@@ -198,7 +236,7 @@ class ProofTreeVisualizerV2:
                     )
                     current_subs.update(premise_subs)
 
-        # Store substitutions for this proof
+        # Store substitutions for this proof node
         self.substitution_history[proof] = current_subs
 
         # Recurse to sub-proofs
@@ -210,14 +248,21 @@ class ProofTreeVisualizerV2:
     def _match_pattern_to_ground(self, pattern: Atom, ground: Atom) -> Dict[Var, str]:
         """
         Match a pattern atom (with variables) against a ground atom.
-        Returns mapping from variables to ground terms.
+
+        Returns mapping from variables to ground terms by aligning the
+        pattern with the ground instance.
+
+        Example:
+            pattern = Atom(Var('X'), hasParent, Var('Y'))
+            ground  = Atom(Ind_0, hasParent, Ind_1)
+            result  = {Var('X'): 'Ind_0', Var('Y'): 'Ind_1'}
 
         Args:
-            pattern: Atom with variables (from rule)
-            ground: Ground atom (actual instance)
+            pattern (Atom): Atom with variables (from rule).
+            ground (Atom): Ground atom (actual instance).
 
         Returns:
-            Dictionary mapping Var to ground term names
+            Dict[Var, str]: Dictionary mapping Var to ground term names.
         """
         subs = {}
 
@@ -239,21 +284,30 @@ class ProofTreeVisualizerV2:
         """
         Print proof tree with variable substitutions to console.
 
+        Displays a hierarchical view of the proof tree showing:
+        - Goal atoms (what's being proved)
+        - Rule applications
+        - Variable substitutions
+        - Recursion tracking
+        - Sub-proofs
+
         Args:
-            proof: The proof tree to print
-            indent: Current indentation level
+            proof (Proof): The proof tree to print.
+            indent (int): Current indentation level (for hierarchical display).
         """
         prefix = "  " * indent
 
         # Get substitutions for this proof
         subs = self.substitution_history.get(proof, {})
 
-        # Print the goal
+        # Format the goal
         goal_str = self._format_atom(proof.goal)
 
         if proof.rule is None:
+            # Base fact - no rule derivation
             print(f"{prefix}[BASE FACT] {goal_str}")
         else:
+            # Derived fact - show full derivation details
             print(f"{prefix}[DERIVE] {goal_str}")
             print(f"{prefix}  via rule: {proof.rule.name}")
 
@@ -267,14 +321,14 @@ class ProofTreeVisualizerV2:
                 for var, value in sorted(subs.items(), key=lambda x: x[0].name):
                     print(f"{prefix}    {var.name} → {value}")
 
-            # Show recursion info
+            # Show recursion tracking info (if applicable)
             if proof.recursive_use_counts:
                 counts_str = ", ".join(
                     [f"{name}:{count}" for name, count in proof.recursive_use_counts]
                 )
                 print(f"{prefix}  recursion: {counts_str}")
 
-            # Show premises
+            # Show premises and their proofs
             if proof.sub_proofs:
                 print(f"{prefix}  from premises:")
                 for i, (premise_pattern, sub_proof) in enumerate(
@@ -284,18 +338,22 @@ class ProofTreeVisualizerV2:
                     premise_ground_str = self._format_atom(sub_proof.goal)
                     print(f"{prefix}    [{i + 1}] pattern: {premise_pattern_str}")
                     print(f"{prefix}        ground:  {premise_ground_str}")
+                    # Recursively print sub-proof
                     self.print_proof_tree_text(sub_proof, indent + 3)
 
     def get_proof_tree_text(self, proof: Proof, indent: int = 0) -> str:
         """
         Get proof tree with substitutions as formatted text string.
 
+        This is similar to print_proof_tree_text but returns a string
+        instead of printing, useful for saving to files.
+
         Args:
-            proof: The proof tree
-            indent: Current indentation level
+            proof (Proof): The proof tree.
+            indent (int): Current indentation level.
 
         Returns:
-            Formatted string representation
+            str: Formatted string representation of the proof tree.
         """
         lines = []
         prefix = "  " * indent
@@ -329,6 +387,7 @@ class ProofTreeVisualizerV2:
                 )
                 lines.append(f"{prefix}  recursion: {counts_str}")
 
+            # Show premises
             if proof.sub_proofs:
                 lines.append(f"{prefix}  from premises:")
                 for i, (premise_pattern, sub_proof) in enumerate(
@@ -340,6 +399,7 @@ class ProofTreeVisualizerV2:
                         f"{prefix}    [{i + 1}] pattern: {premise_pattern_str}"
                     )
                     lines.append(f"{prefix}        ground:  {premise_ground_str}")
+                    # Recursively get sub-proof text
                     lines.append(self.get_proof_tree_text(sub_proof, indent + 3))
 
         return "\n".join(lines)
@@ -348,32 +408,39 @@ class ProofTreeVisualizerV2:
         """
         Create a Graphviz visualization with variable substitutions.
 
+        Generates a directed graph showing the proof tree structure with:
+        - Color-coded nodes (green for base facts, blue for derived)
+        - Variable substitutions displayed in each node
+        - Premise patterns shown on edges
+        - Recursion tracking information
+
         Args:
-            proof: The proof tree
-            proof_id: Identifier for this proof (used in filename)
+            proof (Proof): The proof tree to visualize.
+            proof_id (str): Identifier for this proof (used in filename).
         """
-        # Reset node tracking
+        # Reset node tracking for new graph
         self.node_counter = 0
         self.node_ids = {}
 
-        # Create graph
+        # Create graph with sensible defaults
         dot = graphviz.Digraph(comment=f"Proof Tree: {proof_id}")
-        dot.attr(rankdir="TB")
+        dot.attr(rankdir="TB")  # Top to bottom layout
         dot.attr("node", shape="box", style="rounded,filled")
         dot.attr("graph", fontname="Courier", fontsize="10")
         dot.attr("node", fontname="Courier", fontsize="9")
         dot.attr("edge", fontname="Courier", fontsize="8")
 
-        # Build the graph
+        # Build the graph recursively
         self._add_proof_to_graph_v2(proof, dot, None)
 
-        # Save
+        # Save to file
         output_path = os.path.join(self.output_dir, proof_id + "_detailed")
         try:
             dot.render(output_path, format="pdf", cleanup=True)
             print(f"✓ Saved detailed graph to: {output_path}.pdf")
         except Exception as e:
             print(f"✗ Failed to create graph: {e}")
+            # Save .dot file as fallback
             dot.save(output_path + ".dot")
             print(f"  Saved .dot file to: {output_path}.dot")
 
@@ -383,39 +450,44 @@ class ProofTreeVisualizerV2:
         """
         Recursively add proof nodes with substitution info to graphviz graph.
 
+        Creates a node for this proof and recursively adds nodes for all
+        sub-proofs, connecting them with labeled edges.
+
         Args:
-            proof: Current proof node
-            dot: Graphviz graph object
-            parent_id: ID of parent node (None for root)
+            proof (Proof): Current proof node to add.
+            dot (graphviz.Digraph): Graphviz graph object to add nodes to.
+            parent_id (Optional[str]): ID of parent node (None for root).
 
         Returns:
-            Node ID for this proof
+            str: Node ID for this proof (for parent to reference).
         """
-        # Get or create node ID
+        # Reuse node if already created (DAG structure)
         if proof in self.node_ids:
             return self.node_ids[proof]
 
+        # Create unique node ID
         node_id = f"node_{self.node_counter}"
         self.node_counter += 1
         self.node_ids[proof] = node_id
 
-        # Get substitutions
+        # Get substitutions for this proof
         subs = self.substitution_history.get(proof, {})
 
         # Format node label
         goal_str = self._format_atom(proof.goal)
 
         if proof.rule is None:
-            # Base fact - green box
+            # Base fact - simple green box
             label = f"BASE FACT\\n{goal_str}"
             dot.node(node_id, label, fillcolor="lightgreen")
         else:
-            # Derived fact - blue box with substitutions
-            label = f"DERIVE\\n{goal_str}\\l\\l"  # \\l = left-aligned
+            # Derived fact - blue box with detailed info
+            # Use \\l for left-aligned text in graphviz
+            label = f"DERIVE\\n{goal_str}\\l\\l"
             label += f"Rule: {proof.rule.name}\\l"
             label += f"Pattern: {self._format_atom(proof.rule.conclusion)}\\l"
 
-            # Add substitutions
+            # Add substitutions to label
             if subs:
                 label += "\\lSubstitutions:\\l"
                 for var, value in sorted(subs.items(), key=lambda x: x[0].name):
@@ -430,27 +502,43 @@ class ProofTreeVisualizerV2:
 
             dot.node(node_id, label, fillcolor="lightblue")
 
-            # Add edges to sub-proofs with premise patterns
+            # Add edges to sub-proofs with premise patterns as labels
             for i, (premise_pattern, sub_proof) in enumerate(
                 zip(proof.rule.premises, proof.sub_proofs)
             ):
                 sub_id = self._add_proof_to_graph_v2(sub_proof, dot, node_id)
 
-                # Edge label shows premise pattern
+                # Edge label shows which premise this sub-proof satisfies
                 edge_label = f"premise {i + 1}:\\n{self._format_atom(premise_pattern)}"
                 dot.edge(node_id, sub_id, label=edge_label)
 
         return node_id
 
     def _format_atom(self, atom: Atom) -> str:
-        """Format an atom for display."""
+        """
+        Format an atom for display in a human-readable way.
+
+        Args:
+            atom (Atom): The atom to format.
+
+        Returns:
+            str: Formatted string like "(Ind_0, hasParent, Ind_1)".
+        """
         s = self._format_term(atom.subject)
         p = self._format_term(atom.predicate)
         o = self._format_term(atom.object)
         return f"({s}, {p}, {o})"
 
     def _format_term(self, term) -> str:
-        """Format a term for display."""
+        """
+        Format a term (Individual, Class, Relation, Var, etc.) for display.
+
+        Args:
+            term: The term to format.
+
+        Returns:
+            str: Human-readable string representation.
+        """
         if isinstance(term, (Individual, Class, Relation)):
             return term.name
         elif isinstance(term, Var):
@@ -464,11 +552,26 @@ class ProofTreeVisualizerV2:
         """
         Calculate statistics about a proof tree.
 
+        Traverses the entire proof tree and collects:
+        - Node counts (total, base, derived)
+        - Depth information
+        - Individual tracking
+        - Rule usage
+        - Variable information
+
         Args:
-            proof: The proof tree
+            proof (Proof): The proof tree to analyze.
 
         Returns:
-            Dictionary of statistics
+            Dict: Dictionary of statistics with keys:
+                  - total_nodes: int
+                  - base_facts: int
+                  - derived_facts: int
+                  - max_depth: int
+                  - unique_individuals: int
+                  - rules_used: List[str]
+                  - total_substitutions: int
+                  - unique_variables: int
         """
         stats = {
             "total_nodes": 0,
@@ -482,6 +585,7 @@ class ProofTreeVisualizerV2:
         }
 
         def traverse(p: Proof, depth: int):
+            """Recursively traverse proof tree and collect stats."""
             stats["total_nodes"] += 1
             stats["max_depth"] = max(stats["max_depth"], depth)
 
@@ -502,11 +606,14 @@ class ProofTreeVisualizerV2:
             for var in subs.keys():
                 stats["unique_variables"].add(var.name)
 
-            # Recurse
+            # Recurse to sub-proofs
             for sub in p.sub_proofs:
                 traverse(sub, depth + 1)
 
+        # Start traversal from root
         traverse(proof, 0)
+
+        # Convert sets to counts and sorted lists
         stats["unique_individuals"] = len(stats["unique_individuals"])
         stats["unique_variables"] = len(stats["unique_variables"])
         stats["rules_used"] = sorted(list(stats["rules_used"]))
@@ -515,9 +622,14 @@ class ProofTreeVisualizerV2:
 
 
 def main():
-    """Main entry point."""
+    """
+    Main entry point for the visualizer.
 
-    # Parse arguments
+    Parses command-line arguments, loads ontology, runs backward chainer,
+    and generates visualizations for proof trees.
+    """
+    # ==================== PARSE ARGUMENTS ==================== #
+
     parser = argparse.ArgumentParser(
         description="Visualize proof trees with variable substitutions"
     )
@@ -552,13 +664,15 @@ def main():
 
     args = parser.parse_args()
 
-    # Check graphviz
+    # Check if graphviz is available
     if not HAS_GRAPHVIZ:
         print("\n" + "!" * 80)
         print("WARNING: graphviz not installed. Only text output will be available.")
         print("Install with: pip install graphviz")
         print("You also need graphviz system package: https://graphviz.org/download/")
         print("!" * 80 + "\n")
+
+    # ==================== RUN VISUALIZATION PIPELINE ==================== #
 
     try:
         # Parse ontology
@@ -583,6 +697,8 @@ def main():
         print(f"VISUALIZATION COMPLETE")
         print(f"Output saved to: {args.output_dir}")
         print(f"{'=' * 80}\n")
+
+    # ==================== ERROR HANDLING ==================== #
 
     except FileNotFoundError:
         print(
