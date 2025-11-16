@@ -7,32 +7,12 @@ DESCRIPTION:
     produced by the backward chainer, showing the complete reasoning process
     including variable bindings and rule applications.
 
-FEATURES:
-
-    - Complete proof tree structure visualization
-    - Variable substitutions tracked at each step
-    - Individual generation tracking
-    - Rule applications with detailed variable bindings
-    - Multiple output formats:
-        * Textual representation (console and file)
-        * Graphviz PDF diagrams (with graphviz installed)
-    - Proof statistics (depth, node count, individuals, etc.)
-
-OUTPUT FILES:
+OUTPUT:
 
     For each proof tree, generates:
     - {proof_id}_detailed.txt: Text-based proof tree with full details
     - {proof_id}_detailed.pdf: Visual graph (requires graphviz)
     - {proof_id}_detailed.dot: Graphviz source (if PDF generation fails)
-
-USAGE:
-
-    python visualizer_var.py --ontology-path data/toy.ttl --output-dir output/
-
-    Optional arguments:
-    --max-recursion N:  Maximum recursion depth for proofs (default: 2)
-    --max-proofs N:     Maximum proofs to visualize per rule (default: 5)
-    --rules R1 R2 ...:  Only visualize specific rules (default: all)
 
 AUTHOR:
 
@@ -483,7 +463,8 @@ class ProofTreeVisualizerV2:
         else:
             # Derived fact - blue box with detailed info
             # Use \\l for left-aligned text in graphviz
-            label = f"DERIVE\\n{goal_str}\\l\\l"
+            # Use \\n for new lines
+            label = f"DERIVE\\n{goal_str}\\n\\l"
             label += f"Rule: {proof.rule.name}\\l"
             label += f"Pattern: {self._format_atom(proof.rule.conclusion)}\\l"
 
@@ -646,12 +627,12 @@ def main():
         help="Directory to save visualizations",
     )
     parser.add_argument(
-        "--max-recursion", type=int, default=2, help="Maximum recursion depth"
+        "--max-recursion", type=int, default=5, help="Maximum recursion depth"
     )
     parser.add_argument(
         "--max-proofs",
         type=int,
-        default=5,
+        default=10,
         help="Maximum number of proofs to visualize per rule",
     )
     parser.add_argument(

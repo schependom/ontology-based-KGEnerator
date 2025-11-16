@@ -7,37 +7,6 @@ DESCRIPTION:
     OWL 2 RL axioms into executable rules and constraints for
     the backward chainer.
 
-    OWL 2 RL is a rule-based profile of OWL 2 designed for reasoning
-    with large datasets. This parser extracts the rule structure from
-    the ontology and converts it into a format suitable for backward chaining.
-
-OUTPUTS:
-
-    The parser populates:
-    - self.classes: Dict[str, Class]         - All declared classes
-    - self.relations: Dict[str, Relation]    - All object properties
-    - self.attributes: Dict[str, Attribute]  - All datatype properties
-    - self.rules: List[ExecutableRule]       - Derived inference rules
-    - self.constraints: List[Constraint]     - Integrity constraints
-
-SUPPORTED OWL 2 RL AXIOMS:
-
-    RDFS:
-    - rdfs:subClassOf           → Class hierarchy rules
-    - rdfs:subPropertyOf        → Property hierarchy rules
-    - rdfs:domain               → Domain restriction rules
-    - rdfs:range                → Range restriction rules
-
-    OWL Properties:
-    - owl:inverseOf             → Inverse property rules
-    - owl:propertyChainAxiom    → Property chain rules
-    - owl:SymmetricProperty     → Symmetric property rules
-    - owl:TransitiveProperty    → Transitive property rules
-
-    OWL Constraints:
-    - owl:disjointWith          → Class disjointness constraints
-    - owl:IrreflexiveProperty   → Irreflexive property constraints
-
 AUTHOR
 
     Vincent Van Schependom

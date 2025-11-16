@@ -278,7 +278,7 @@ def main():
     # ==================== PARSE ARGUMENTS ==================== #
 
     default_ontology_path = "data/family.ttl"
-    default_max_recursion = 4
+    default_max_recursion = 10
 
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator"
