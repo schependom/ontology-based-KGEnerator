@@ -13,21 +13,12 @@ conda activate KGEnerator
 
 ## Usage
 
-Run the generator script:
+Work in progress as of 16/11/2025.
 
 ```bash
-python src/generator.py <args>
+python src/visualizer.py
 ```
 
-Where `<args>` can include:
-
-| Argument                | Description                                              |
-| ----------------------- | -------------------------------------------------------- |
-| `--ontology-path`       | Path to the ontology file in turtle format.              |
-| `--max-recursion-depth` | Maximum depth for recursive rule applications in proofs. |
-
-To see more information and the default values, run:
-
 ```bash
-python src/generator.py --help
+python src/create_data.py
 ```

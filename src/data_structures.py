@@ -14,6 +14,8 @@ AUTHOR:
     Vincent Van Schependom
 """
 
+import csv
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Union, Optional, Any
 from enum import Enum
@@ -279,6 +281,297 @@ class KnowledgeGraph:
         print("Attribute Triples:")
         for attr_triple in self.attribute_triples:
             print(f"    {attr_triple}")
+
+    def to_csv(self, file_path: str) -> None:
+        """
+        Saves the knowledge graph to a CSV file.
+
+        Each row represents one fact (triple, membership, or attribute).
+        This format is suitable for loading into RRN models.
+
+        CSV FORMAT:
+        ----------
+        subject,predicate,object,label,fact_type
+
+        EXAMPLES:
+        --------
+        Ind_0,hasParent,Ind_1,1,triple          # Positive relation
+        Ind_0,hasParent,Ind_3,0,triple          # Negative relation
+        Ind_0,rdf:type,Person,1,membership      # Class membership
+        Ind_0,age,25,1,attribute                # Attribute value
+
+        Args:
+            file_path (str): Path to save CSV file.
+        """
+        rows = []
+
+        # Convert memberships to CSV rows
+        for membership in self.memberships:
+            rows.append(
+                {
+                    "subject": membership.individual.name,
+                    "predicate": "rdf:type",
+                    "object": membership.cls.name,
+                    "label": "1" if membership.is_member else "0",
+                    "fact_type": "membership",
+                }
+            )
+
+        # Convert triples to CSV rows
+        for triple in self.triples:
+            rows.append(
+                {
+                    "subject": triple.subject.name,
+                    "predicate": triple.predicate.name,
+                    "object": triple.object.name,
+                    "label": "1" if triple.positive else "0",
+                    "fact_type": "triple",
+                }
+            )
+
+        # Convert attribute triples to CSV rows
+        for attr_triple in self.attribute_triples:
+            rows.append(
+                {
+                    "subject": attr_triple.subject.name,
+                    "predicate": attr_triple.predicate.name,
+                    "object": str(attr_triple.value),  # Convert literal to string
+                    "label": "1",  # Attributes are always positive
+                    "fact_type": "attribute",
+                }
+            )
+
+        # Write to CSV
+        with open(file_path, "w", newline="", encoding="utf-8") as f:
+            if rows:
+                fieldnames = ["subject", "predicate", "object", "label", "fact_type"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    @classmethod
+    def from_csv(cls, file_path: str) -> "KnowledgeGraph":
+        """
+        Loads a knowledge graph from a CSV file.
+
+        This method reconstructs a KG from the CSV format created by to_csv().
+        It rebuilds:
+            - All individuals mentioned in the CSV
+            - Schema elements (classes, relations, attributes)
+            - All facts (triples, memberships, attributes)
+
+        NOTE: The schema is inferred from the data in the CSV.
+            For full schema with all possible classes/relations,
+            use the original ontology parser.
+
+        Args:
+            file_path (str): Path to CSV file.
+
+        Returns:
+            KnowledgeGraph: Reconstructed knowledge graph.
+        """
+        # Storage for reconstructed elements
+        individuals: Dict[str, Individual] = {}
+        classes: Dict[str, Class] = {}
+        relations: Dict[str, Relation] = {}
+        attributes: Dict[str, Attribute] = {}
+
+        triples: List[Triple] = []
+        memberships: List[Membership] = []
+        attribute_triples: List[AttributeTriple] = []
+
+        # Index counters for creating new objects
+        ind_counter = 0
+        cls_counter = 0
+        rel_counter = 0
+        attr_counter = 0
+
+        def get_or_create_individual(name: str) -> Individual:
+            """Get or create an Individual by name."""
+            nonlocal ind_counter
+            if name not in individuals:
+                individuals[name] = Individual(index=ind_counter, name=name)
+                ind_counter += 1
+            return individuals[name]
+
+        def get_or_create_class(name: str) -> Class:
+            """Get or create a Class by name."""
+            nonlocal cls_counter
+            if name not in classes:
+                classes[name] = Class(index=cls_counter, name=name)
+                cls_counter += 1
+            return classes[name]
+
+        def get_or_create_relation(name: str) -> Relation:
+            """Get or create a Relation by name."""
+            nonlocal rel_counter
+            if name not in relations:
+                relations[name] = Relation(index=rel_counter, name=name)
+                rel_counter += 1
+            return relations[name]
+
+        def get_or_create_attribute(name: str) -> Attribute:
+            """Get or create an Attribute by name."""
+            nonlocal attr_counter
+            if name not in attributes:
+                attributes[name] = Attribute(index=attr_counter, name=name)
+                attr_counter += 1
+            return attributes[name]
+
+        # Read CSV file
+        with open(file_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                subject_name = row["subject"]
+                predicate_name = row["predicate"]
+                object_name = row["object"]
+                label = row["label"] == "1"  # Convert to boolean
+                fact_type = row["fact_type"]
+
+                # Reconstruct based on fact type
+                if fact_type == "membership":
+                    # Class membership: (Individual, rdf:type, Class)
+                    individual = get_or_create_individual(subject_name)
+                    cls = get_or_create_class(object_name)
+
+                    membership = Membership(
+                        individual=individual,
+                        cls=cls,
+                        is_member=label,
+                        proofs=[],
+                    )
+                    memberships.append(membership)
+
+                elif fact_type == "triple":
+                    # Relational triple: (Individual, Relation, Individual)
+                    subject = get_or_create_individual(subject_name)
+                    predicate = get_or_create_relation(predicate_name)
+                    obj = get_or_create_individual(object_name)
+
+                    triple = Triple(
+                        subject=subject,
+                        predicate=predicate,
+                        object=obj,
+                        positive=label,
+                        proofs=[],
+                    )
+                    triples.append(triple)
+
+                elif fact_type == "attribute":
+                    # Attribute triple: (Individual, Attribute, LiteralValue)
+                    subject = get_or_create_individual(subject_name)
+                    predicate = get_or_create_attribute(predicate_name)
+
+                    # Try to infer literal type
+                    value = cls._parse_literal_value(object_name)
+
+                    attr_triple = AttributeTriple(
+                        subject=subject,
+                        predicate=predicate,
+                        value=value,
+                        proofs=[],
+                    )
+                    attribute_triples.append(attr_triple)
+
+        # Create and return knowledge graph
+        return cls(
+            attributes=list(attributes.values()),
+            classes=list(classes.values()),
+            relations=list(relations.values()),
+            individuals=list(individuals.values()),
+            triples=triples,
+            memberships=memberships,
+            attribute_triples=attribute_triples,
+        )
+
+    @staticmethod
+    def _parse_literal_value(value_str: str):
+        """
+        Attempts to parse a string literal value to its appropriate type.
+
+        Tries in order: int, float, bool, string
+
+        Args:
+            value_str (str): String representation of the value.
+
+        Returns:
+            Parsed value (int, float, bool, or str).
+        """
+        # Try int
+        try:
+            return int(value_str)
+        except ValueError:
+            pass
+
+        # Try float
+        try:
+            return float(value_str)
+        except ValueError:
+            pass
+
+        # Try bool
+        if value_str.lower() in ("true", "false"):
+            return value_str.lower() == "true"
+
+        # Default to string
+        return value_str
+
+    def to_csv_batch(
+        samples: List["KnowledgeGraph"],
+        output_dir: str,
+        prefix: str = "sample",
+    ) -> None:
+        """
+        Batch save multiple KG samples to CSV files.
+
+        Convenience method for saving entire datasets.
+
+        Args:
+            samples (List[KnowledgeGraph]): List of KG samples.
+            output_dir (str): Directory to save files.
+            prefix (str): Prefix for file names.
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        for idx, kg in enumerate(samples):
+            file_path = output_path / f"{prefix}_{idx:05d}.csv"
+            kg.to_csv(str(file_path))
+
+    @classmethod
+    def from_csv_batch(
+        cls,
+        input_dir: str,
+        prefix: str = "sample",
+        n_samples: int = None,
+    ) -> List["KnowledgeGraph"]:
+        """
+        Batch load multiple KG samples from CSV files.
+
+        Convenience method for loading entire datasets.
+
+        Args:
+            input_dir (str): Directory containing CSV files.
+            prefix (str): Prefix of file names to load.
+            n_samples (int): Max number to load (None = all).
+
+        Returns:
+            List[KnowledgeGraph]: Loaded KG samples.
+        """
+        input_path = Path(input_dir)
+        pattern = f"{prefix}_*.csv"
+        csv_files = sorted(input_path.glob(pattern))
+
+        if n_samples is not None:
+            csv_files = csv_files[:n_samples]
+
+        samples = []
+        for file_path in csv_files:
+            kg = cls.from_csv(str(file_path))
+            samples.append(kg)
+
+        return samples
 
 
 @dataclass
