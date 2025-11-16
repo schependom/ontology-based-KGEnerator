@@ -3,17 +3,6 @@ DESCRIPTION:
 
     Proof Tree Visualizer with Variable Substitutions and Constraint Checking.
 
-    This tool generates visual and textual representations of proof trees
-    produced by the backward chainer, showing the complete reasoning process
-    including variable bindings, rule applications, and constraint validation.
-
-OUTPUT:
-
-    For each proof tree, generates:
-    - {proof_id}_detailed.txt: Text-based proof tree with full details
-    - {proof_id}_detailed.pdf: Visual graph (requires graphviz)
-    - {proof_id}_detailed.dot: Graphviz source (if PDF generation fails)
-
 AUTHOR:
 
     Vincent Van Schependom
@@ -24,15 +13,7 @@ import os
 import sys
 from typing import Dict, List, Set, Optional, Tuple
 from collections import defaultdict
-
-# For graph visualization
-try:
-    import graphviz
-
-    HAS_GRAPHVIZ = True
-except ImportError:
-    HAS_GRAPHVIZ = False
-    print("Warning: graphviz not installed. Install with: pip install graphviz")
+import graphviz
 
 # Custom imports
 from data_structures import (
@@ -44,12 +25,14 @@ from data_structures import (
     Class,
     Relation,
 )
-from parser import OntologyParser
-from chainer import BackwardChainer
+
+# REFACTORED: Import KGenerator from generator.py
+from generator import KGenerator
+
 from rdflib.namespace import RDF
 
 
-class ProofTreeVisualizerV2:
+class ProofTreeVisualizer:
     """
     Enhanced visualizer that tracks and displays variable substitutions
     throughout the proof tree, and validates proofs against constraints.
@@ -58,8 +41,7 @@ class ProofTreeVisualizerV2:
     proof by matching rule patterns against ground instances, providing
     insight into how the backward chainer generates individuals and builds proofs.
 
-    ENHANCED: Now includes constraint checking visualization to show which
-    proofs are valid and which violate constraints.
+    REFACTORED: Now uses KGenerator for proof generation.
     """
 
     def __init__(self, output_dir: str = "output"):
@@ -87,10 +69,10 @@ class ProofTreeVisualizerV2:
 
     def visualize_all_proofs(
         self,
-        chainer: BackwardChainer,
+        generator: KGenerator,
         rule_names: Optional[List[str]] = None,
         max_proofs_per_rule: int = 5,
-        show_invalid_proofs: bool = True,
+        show_invalid_proofs: bool = False,
     ) -> None:
         """
         Generate visualizations for all rules (or specified rules).
@@ -98,27 +80,26 @@ class ProofTreeVisualizerV2:
         For each rule, generates up to max_proofs_per_rule proof trees,
         creating both text and graphical representations.
 
-        ENHANCED: Now validates proofs against constraints and optionally
-        shows which proofs are invalid and why.
+        REFACTORED: Now uses KGenerator's generate_proofs_for_rule method.
 
         Args:
-            chainer (BackwardChainer): The BackwardChainer instance to use.
+            generator (KGenerator): The KGenerator instance to use.
             rule_names (Optional[List[str]]): List of rule names to visualize.
                                               If None, visualizes all rules.
             max_proofs_per_rule (int): Maximum number of proof trees to
                                        visualize per rule.
             show_invalid_proofs (bool): Whether to visualize proofs that
-                                        violate constraints (default: True).
+                                        violate constraints (default: False).
         """
         if rule_names is None:
-            rule_names = list(chainer.all_rules.keys())
+            rule_names = list(generator.chainer.all_rules.keys())
 
         print(f"\n{'=' * 80}")
         print(f"VISUALIZING PROOF TREES WITH VARIABLE SUBSTITUTIONS AND CONSTRAINTS")
         print(f"{'=' * 80}")
 
         for rule_name in rule_names:
-            if rule_name not in chainer.all_rules:
+            if rule_name not in generator.chainer.all_rules:
                 print(f"\nWarning: Rule '{rule_name}' not found. Skipping.")
                 continue
 
@@ -126,110 +107,98 @@ class ProofTreeVisualizerV2:
             print(f"Rule: {rule_name}")
             print(f"{'-' * 80}")
 
-            # Generate proofs for this rule
-            # NOTE: The chainer already filters by constraints, so these are valid proofs
-            proof_generator = chainer.generate_proof_trees(rule_name)
-            valid_proofs = []
-            invalid_proofs = []
-
+            # REFACTORED: Use KGenerator's generate_proofs_for_rule method
             try:
-                # Collect valid proofs from chainer (these pass constraints)
-                for i, proof in enumerate(proof_generator):
-                    if i >= max_proofs_per_rule:
-                        print(
-                            f"\nReached max proofs limit ({max_proofs_per_rule}). Stopping generation."
-                        )
-                        break
-                    valid_proofs.append(proof)
+                proofs = generator.generate_proofs_for_rule(
+                    rule_name=rule_name,
+                    max_proofs=max_proofs_per_rule,
+                )
 
-                # If requested, also generate invalid proofs by temporarily disabling constraints
-                if show_invalid_proofs:
-                    # We need to manually check constraints to show violations
-                    # This is done during visualization
-                    pass
+                if not proofs:
+                    print(f"No valid proofs generated for rule: {rule_name}")
+                    continue
 
-            except Exception as e:
-                print(f"\nError generating proofs for {rule_name}: {e}")
-                import traceback
+                print(
+                    f"\nGenerated {len(proofs)} valid proof tree(s) for rule: {rule_name}"
+                )
 
-                traceback.print_exc()
-                continue
+                # Visualize each proof
+                for i, proof in enumerate(proofs):
+                    # Validate this proof to get detailed info
+                    all_atoms = generator.chainer._collect_all_atoms(proof)
+                    is_valid = generator.chainer._check_constraints(proof, all_atoms)
 
-            total_proofs = len(valid_proofs)
+                    # Skip invalid proofs unless requested
+                    if not is_valid and not show_invalid_proofs:
+                        continue
 
-            if total_proofs == 0:
-                print(f"No valid proofs generated for rule: {rule_name}")
-                continue
+                    # Store validation result
+                    self.constraint_validation[proof] = is_valid
 
-            print(
-                f"\nGenerated {total_proofs} valid proof tree(s) for rule: {rule_name}"
-            )
+                    # Determine proof status for filename
+                    status = "valid" if is_valid else "invalid"
+                    proof_id = f"{rule_name}_proof_{i + 1}_{status}"
 
-            # Visualize each proof
-            all_proofs = valid_proofs
+                    print(
+                        f"\n--- Proof Tree {i + 1}/{len(proofs)} ({status.upper()}) ---"
+                    )
 
-            for i, proof in enumerate(all_proofs):
-                # Validate this proof manually to get detailed info
-                all_atoms = chainer._collect_all_atoms(proof)
-                is_valid = chainer._check_constraints(proof, all_atoms)
+                    # Infer substitutions by comparing rule patterns with ground atoms
+                    self._infer_substitutions(proof)
 
-                # Store validation result
-                self.constraint_validation[proof] = is_valid
+                    # Text visualization (to console)
+                    self.print_proof_tree_text(proof)
 
-                # Determine proof status for filename
-                status = "valid" if is_valid else "invalid"
-                proof_id = f"{rule_name}_proof_{i + 1}_{status}"
+                    # Save text to file
+                    text_file = os.path.join(
+                        self.output_dir, f"{proof_id}_detailed.txt"
+                    )
+                    with open(text_file, "w") as f:
+                        f.write(f"Proof Tree for Rule: {rule_name}\n")
+                        f.write(f"Status: {status.upper()}\n")
+                        f.write(f"{'=' * 80}\n\n")
 
-                print(f"\n--- Proof Tree {i + 1}/{total_proofs} ({status.upper()}) ---")
+                        # Add constraint validation summary
+                        if not is_valid:
+                            f.write("CONSTRAINT VIOLATIONS:\n")
+                            violations = self.constraint_violations.get(
+                                proof, ["Unknown violation"]
+                            )
+                            for v in violations:
+                                f.write(f"  - {v}\n")
+                            f.write("\n")
 
-                # Infer substitutions by comparing rule patterns with ground atoms
-                self._infer_substitutions(proof)
+                        f.write(self.get_proof_tree_text(proof))
+                    print(f"✓ Saved text visualization to: {text_file}")
 
-                # Text visualization (to console)
-                self.print_proof_tree_text(proof)
+                    # Graphviz visualization (if available)
+                    self.create_graphviz_visualization(proof, proof_id)
 
-                # Save text to file
-                text_file = os.path.join(self.output_dir, f"{proof_id}_detailed.txt")
-                with open(text_file, "w") as f:
-                    f.write(f"Proof Tree for Rule: {rule_name}\n")
-                    f.write(f"Status: {status.upper()}\n")
-                    f.write(f"{'=' * 80}\n\n")
+                    # Print statistics
+                    stats = self.get_proof_statistics(proof)
+                    print(f"\nProof Statistics:")
+                    print(f"  Status: {status.upper()}")
+                    print(f"  Total nodes: {stats['total_nodes']}")
+                    print(f"  Base facts: {stats['base_facts']}")
+                    print(f"  Derived facts: {stats['derived_facts']}")
+                    print(f"  Max depth: {stats['max_depth']}")
+                    print(f"  Unique individuals: {stats['unique_individuals']}")
+                    print(f"  Rules used: {', '.join(stats['rules_used'])}")
 
-                    # Add constraint validation summary
                     if not is_valid:
-                        f.write("CONSTRAINT VIOLATIONS:\n")
+                        print(f"\n  ⚠️  CONSTRAINT VIOLATIONS:")
                         violations = self.constraint_violations.get(
                             proof, ["Unknown violation"]
                         )
                         for v in violations:
-                            f.write(f"  - {v}\n")
-                        f.write("\n")
+                            print(f"    - {v}")
 
-                    f.write(self.get_proof_tree_text(proof))
-                print(f"✓ Saved text visualization to: {text_file}")
+            except Exception as e:
+                print(f"\nError visualizing proofs for {rule_name}: {e}")
+                import traceback
 
-                # Graphviz visualization (if available)
-                if HAS_GRAPHVIZ:
-                    self.create_graphviz_visualization(proof, proof_id)
-
-                # Print statistics
-                stats = self.get_proof_statistics(proof)
-                print(f"\nProof Statistics:")
-                print(f"  Status: {status.upper()}")
-                print(f"  Total nodes: {stats['total_nodes']}")
-                print(f"  Base facts: {stats['base_facts']}")
-                print(f"  Derived facts: {stats['derived_facts']}")
-                print(f"  Max depth: {stats['max_depth']}")
-                print(f"  Unique individuals: {stats['unique_individuals']}")
-                print(f"  Rules used: {', '.join(stats['rules_used'])}")
-
-                if not is_valid:
-                    print(f"\n  ⚠️  CONSTRAINT VIOLATIONS:")
-                    violations = self.constraint_violations.get(
-                        proof, ["Unknown violation"]
-                    )
-                    for v in violations:
-                        print(f"    - {v}")
+                traceback.print_exc()
+                continue
 
     def _infer_substitutions(
         self, proof: Proof, parent_subs: Optional[Dict[Var, str]] = None
@@ -488,7 +457,7 @@ class ProofTreeVisualizerV2:
         dot.attr(label=f"Proof Tree: {proof_id}\\nStatus: {status}", labelloc="t")
 
         # Build the graph recursively
-        self._add_proof_to_graph_v2(proof, dot, None)
+        self._add_proof_to_graph(proof, dot, None)
 
         # Save to file
         output_path = os.path.join(self.output_dir, proof_id + "_detailed")
@@ -501,7 +470,7 @@ class ProofTreeVisualizerV2:
             dot.save(output_path + ".dot")
             print(f"  Saved .dot file to: {output_path}.dot")
 
-    def _add_proof_to_graph_v2(
+    def _add_proof_to_graph(
         self, proof: Proof, dot: graphviz.Digraph, parent_id: Optional[str]
     ) -> str:
         """
@@ -574,7 +543,7 @@ class ProofTreeVisualizerV2:
             for i, (premise_pattern, sub_proof) in enumerate(
                 zip(proof.rule.premises, proof.sub_proofs)
             ):
-                sub_id = self._add_proof_to_graph_v2(sub_proof, dot, node_id)
+                sub_id = self._add_proof_to_graph(sub_proof, dot, node_id)
 
                 # Edge label shows which premise this sub-proof satisfies
                 edge_label = f"premise {i + 1}:\\n{self._format_atom(premise_pattern)}"
@@ -632,16 +601,7 @@ class ProofTreeVisualizerV2:
             proof (Proof): The proof tree to analyze.
 
         Returns:
-            Dict: Dictionary of statistics with keys:
-                  - total_nodes: int
-                  - base_facts: int
-                  - derived_facts: int
-                  - max_depth: int
-                  - unique_individuals: int
-                  - rules_used: List[str]
-                  - total_substitutions: int
-                  - unique_variables: int
-                  - is_valid: bool
+            Dict: Dictionary of statistics.
         """
         stats = {
             "total_nodes": 0,
@@ -707,7 +667,7 @@ def main():
     parser.add_argument(
         "--ontology-path",
         type=str,
-        default="data/family.ttl",
+        default="data/toy.ttl",
         help="Path to the ontology file",
     )
     parser.add_argument(
@@ -737,39 +697,33 @@ def main():
         action="store_true",
         help="Show proofs that violate constraints (default: only valid proofs)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
+    )
 
     args = parser.parse_args()
-
-    # Check if graphviz is available
-    if not HAS_GRAPHVIZ:
-        print("\n" + "!" * 80)
-        print("WARNING: graphviz not installed. Only text output will be available.")
-        print("Install with: pip install graphviz")
-        print("You also need graphviz system package: https://graphviz.org/download/")
-        print("!" * 80 + "\n")
 
     # ==================== RUN VISUALIZATION PIPELINE ==================== #
 
     try:
-        # Parse ontology
-        print(f"Loading ontology from: {args.ontology_path}")
-        onto_parser = OntologyParser(args.ontology_path)
-
-        # Initialize chainer with constraints
-        print(f"Initializing backward chainer (max recursion: {args.max_recursion})")
-        print(f"Loaded {len(onto_parser.constraints)} constraints")
-        chainer = BackwardChainer(
-            all_rules=onto_parser.rules,
-            constraints=onto_parser.constraints,  # ENHANCED: Pass constraints
-            max_recursion_depth=args.max_recursion,
+        # REFACTORED: Use KGenerator instead of creating parser/chainer directly
+        print(f"Initializing KGenerator from: {args.ontology_path}")
+        generator = KGenerator(
+            ontology_file=args.ontology_path,
+            max_recursion=args.max_recursion,
+            verbose=args.verbose,
         )
 
+        print(f"Loaded {len(generator.parser.constraints)} constraints")
+
         # Create visualizer
-        visualizer = ProofTreeVisualizerV2(output_dir=args.output_dir)
+        visualizer = ProofTreeVisualizer(output_dir=args.output_dir)
 
         # Visualize proofs
         visualizer.visualize_all_proofs(
-            chainer=chainer,
+            generator=generator,
             rule_names=args.rules,
             max_proofs_per_rule=args.max_proofs,
             show_invalid_proofs=args.show_invalid,
@@ -784,7 +738,8 @@ def main():
 
     except FileNotFoundError:
         print(
-            f"Error: Ontology file not found at '{args.ontology_path}'", file=sys.stderr
+            f"Error: Ontology file not found at '{args.ontology_path}'",
+            file=sys.stderr,
         )
         sys.exit(1)
     except Exception as e:
