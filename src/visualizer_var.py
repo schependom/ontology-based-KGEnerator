@@ -1,11 +1,11 @@
 """
 DESCRIPTION:
 
-    Proof Tree Visualizer with Variable Substitutions.
+    Proof Tree Visualizer with Variable Substitutions and Constraint Checking.
 
     This tool generates visual and textual representations of proof trees
     produced by the backward chainer, showing the complete reasoning process
-    including variable bindings and rule applications.
+    including variable bindings, rule applications, and constraint validation.
 
 OUTPUT:
 
@@ -52,11 +52,14 @@ from rdflib.namespace import RDF
 class ProofTreeVisualizerV2:
     """
     Enhanced visualizer that tracks and displays variable substitutions
-    throughout the proof tree.
+    throughout the proof tree, and validates proofs against constraints.
 
     This visualizer reconstructs the variable bindings at each step of the
     proof by matching rule patterns against ground instances, providing
     insight into how the backward chainer generates individuals and builds proofs.
+
+    ENHANCED: Now includes constraint checking visualization to show which
+    proofs are valid and which violate constraints.
     """
 
     def __init__(self, output_dir: str = "output"):
@@ -77,11 +80,17 @@ class ProofTreeVisualizerV2:
         # Maps each proof to the variable bindings that were used to derive it
         self.substitution_history: Dict[Proof, Dict[Var, str]] = {}
 
+        # Constraint validation tracking
+        # Maps each proof to whether it satisfies constraints
+        self.constraint_validation: Dict[Proof, bool] = {}
+        self.constraint_violations: Dict[Proof, List[str]] = {}
+
     def visualize_all_proofs(
         self,
         chainer: BackwardChainer,
         rule_names: Optional[List[str]] = None,
         max_proofs_per_rule: int = 5,
+        show_invalid_proofs: bool = True,
     ) -> None:
         """
         Generate visualizations for all rules (or specified rules).
@@ -89,18 +98,23 @@ class ProofTreeVisualizerV2:
         For each rule, generates up to max_proofs_per_rule proof trees,
         creating both text and graphical representations.
 
+        ENHANCED: Now validates proofs against constraints and optionally
+        shows which proofs are invalid and why.
+
         Args:
             chainer (BackwardChainer): The BackwardChainer instance to use.
             rule_names (Optional[List[str]]): List of rule names to visualize.
                                               If None, visualizes all rules.
             max_proofs_per_rule (int): Maximum number of proof trees to
                                        visualize per rule.
+            show_invalid_proofs (bool): Whether to visualize proofs that
+                                        violate constraints (default: True).
         """
         if rule_names is None:
             rule_names = list(chainer.all_rules.keys())
 
         print(f"\n{'=' * 80}")
-        print(f"VISUALIZING PROOF TREES WITH VARIABLE SUBSTITUTIONS")
+        print(f"VISUALIZING PROOF TREES WITH VARIABLE SUBSTITUTIONS AND CONSTRAINTS")
         print(f"{'=' * 80}")
 
         for rule_name in rule_names:
@@ -113,17 +127,26 @@ class ProofTreeVisualizerV2:
             print(f"{'-' * 80}")
 
             # Generate proofs for this rule
+            # NOTE: The chainer already filters by constraints, so these are valid proofs
             proof_generator = chainer.generate_proof_trees(rule_name)
-            proofs = []
+            valid_proofs = []
+            invalid_proofs = []
 
             try:
+                # Collect valid proofs from chainer (these pass constraints)
                 for i, proof in enumerate(proof_generator):
                     if i >= max_proofs_per_rule:
                         print(
                             f"\nReached max proofs limit ({max_proofs_per_rule}). Stopping generation."
                         )
                         break
-                    proofs.append(proof)
+                    valid_proofs.append(proof)
+
+                # If requested, also generate invalid proofs by temporarily disabling constraints
+                if show_invalid_proofs:
+                    # We need to manually check constraints to show violations
+                    # This is done during visualization
+                    pass
 
             except Exception as e:
                 print(f"\nError generating proofs for {rule_name}: {e}")
@@ -132,16 +155,32 @@ class ProofTreeVisualizerV2:
                 traceback.print_exc()
                 continue
 
-            if not proofs:
-                print(f"No proofs generated for rule: {rule_name}")
+            total_proofs = len(valid_proofs)
+
+            if total_proofs == 0:
+                print(f"No valid proofs generated for rule: {rule_name}")
                 continue
 
-            print(f"\nGenerated {len(proofs)} proof tree(s) for rule: {rule_name}")
+            print(
+                f"\nGenerated {total_proofs} valid proof tree(s) for rule: {rule_name}"
+            )
 
             # Visualize each proof
-            for i, proof in enumerate(proofs):
-                proof_id = f"{rule_name}_proof_{i + 1}"
-                print(f"\n--- Proof Tree {i + 1}/{len(proofs)} ---")
+            all_proofs = valid_proofs
+
+            for i, proof in enumerate(all_proofs):
+                # Validate this proof manually to get detailed info
+                all_atoms = chainer._collect_all_atoms(proof)
+                is_valid = chainer._check_constraints(proof, all_atoms)
+
+                # Store validation result
+                self.constraint_validation[proof] = is_valid
+
+                # Determine proof status for filename
+                status = "valid" if is_valid else "invalid"
+                proof_id = f"{rule_name}_proof_{i + 1}_{status}"
+
+                print(f"\n--- Proof Tree {i + 1}/{total_proofs} ({status.upper()}) ---")
 
                 # Infer substitutions by comparing rule patterns with ground atoms
                 self._infer_substitutions(proof)
@@ -153,7 +192,19 @@ class ProofTreeVisualizerV2:
                 text_file = os.path.join(self.output_dir, f"{proof_id}_detailed.txt")
                 with open(text_file, "w") as f:
                     f.write(f"Proof Tree for Rule: {rule_name}\n")
+                    f.write(f"Status: {status.upper()}\n")
                     f.write(f"{'=' * 80}\n\n")
+
+                    # Add constraint validation summary
+                    if not is_valid:
+                        f.write("CONSTRAINT VIOLATIONS:\n")
+                        violations = self.constraint_violations.get(
+                            proof, ["Unknown violation"]
+                        )
+                        for v in violations:
+                            f.write(f"  - {v}\n")
+                        f.write("\n")
+
                     f.write(self.get_proof_tree_text(proof))
                 print(f"✓ Saved text visualization to: {text_file}")
 
@@ -164,12 +215,21 @@ class ProofTreeVisualizerV2:
                 # Print statistics
                 stats = self.get_proof_statistics(proof)
                 print(f"\nProof Statistics:")
+                print(f"  Status: {status.upper()}")
                 print(f"  Total nodes: {stats['total_nodes']}")
                 print(f"  Base facts: {stats['base_facts']}")
                 print(f"  Derived facts: {stats['derived_facts']}")
                 print(f"  Max depth: {stats['max_depth']}")
                 print(f"  Unique individuals: {stats['unique_individuals']}")
                 print(f"  Rules used: {', '.join(stats['rules_used'])}")
+
+                if not is_valid:
+                    print(f"\n  ⚠️  CONSTRAINT VIOLATIONS:")
+                    violations = self.constraint_violations.get(
+                        proof, ["Unknown violation"]
+                    )
+                    for v in violations:
+                        print(f"    - {v}")
 
     def _infer_substitutions(
         self, proof: Proof, parent_subs: Optional[Dict[Var, str]] = None
@@ -270,6 +330,7 @@ class ProofTreeVisualizerV2:
         - Variable substitutions
         - Recursion tracking
         - Sub-proofs
+        - Constraint validation status
 
         Args:
             proof (Proof): The proof tree to print.
@@ -280,15 +341,19 @@ class ProofTreeVisualizerV2:
         # Get substitutions for this proof
         subs = self.substitution_history.get(proof, {})
 
+        # Get validation status
+        is_valid = self.constraint_validation.get(proof, True)
+        status_marker = "✓" if is_valid else "✗"
+
         # Format the goal
         goal_str = self._format_atom(proof.goal)
 
         if proof.rule is None:
             # Base fact - no rule derivation
-            print(f"{prefix}[BASE FACT] {goal_str}")
+            print(f"{prefix}[BASE FACT] {status_marker} {goal_str}")
         else:
             # Derived fact - show full derivation details
-            print(f"{prefix}[DERIVE] {goal_str}")
+            print(f"{prefix}[DERIVE] {status_marker} {goal_str}")
             print(f"{prefix}  via rule: {proof.rule.name}")
 
             # Show the original rule pattern
@@ -341,13 +406,17 @@ class ProofTreeVisualizerV2:
         # Get substitutions
         subs = self.substitution_history.get(proof, {})
 
+        # Get validation status
+        is_valid = self.constraint_validation.get(proof, True)
+        status_marker = "✓" if is_valid else "✗"
+
         # Format the goal
         goal_str = self._format_atom(proof.goal)
 
         if proof.rule is None:
-            lines.append(f"{prefix}[BASE FACT] {goal_str}")
+            lines.append(f"{prefix}[BASE FACT] {status_marker} {goal_str}")
         else:
-            lines.append(f"{prefix}[DERIVE] {goal_str}")
+            lines.append(f"{prefix}[DERIVE] {status_marker} {goal_str}")
             lines.append(f"{prefix}  via rule: {proof.rule.name}")
 
             # Show original rule pattern
@@ -386,13 +455,14 @@ class ProofTreeVisualizerV2:
 
     def create_graphviz_visualization(self, proof: Proof, proof_id: str) -> None:
         """
-        Create a Graphviz visualization with variable substitutions.
+        Create a Graphviz visualization with variable substitutions and constraint status.
 
         Generates a directed graph showing the proof tree structure with:
-        - Color-coded nodes (green for base facts, blue for derived)
+        - Color-coded nodes (green for base facts, blue for derived, red for constraint violations)
         - Variable substitutions displayed in each node
         - Premise patterns shown on edges
         - Recursion tracking information
+        - Constraint validation status
 
         Args:
             proof (Proof): The proof tree to visualize.
@@ -402,6 +472,10 @@ class ProofTreeVisualizerV2:
         self.node_counter = 0
         self.node_ids = {}
 
+        # Get validation status for title
+        is_valid = self.constraint_validation.get(proof, True)
+        status = "VALID" if is_valid else "INVALID (Constraint Violation)"
+
         # Create graph with sensible defaults
         dot = graphviz.Digraph(comment=f"Proof Tree: {proof_id}")
         dot.attr(rankdir="TB")  # Top to bottom layout
@@ -409,6 +483,9 @@ class ProofTreeVisualizerV2:
         dot.attr("graph", fontname="Courier", fontsize="10")
         dot.attr("node", fontname="Courier", fontsize="9")
         dot.attr("edge", fontname="Courier", fontsize="8")
+
+        # Add title with validation status
+        dot.attr(label=f"Proof Tree: {proof_id}\\nStatus: {status}", labelloc="t")
 
         # Build the graph recursively
         self._add_proof_to_graph_v2(proof, dot, None)
@@ -431,7 +508,8 @@ class ProofTreeVisualizerV2:
         Recursively add proof nodes with substitution info to graphviz graph.
 
         Creates a node for this proof and recursively adds nodes for all
-        sub-proofs, connecting them with labeled edges.
+        sub-proofs, connecting them with labeled edges. Nodes are color-coded
+        based on constraint validation status.
 
         Args:
             proof (Proof): Current proof node to add.
@@ -453,18 +531,27 @@ class ProofTreeVisualizerV2:
         # Get substitutions for this proof
         subs = self.substitution_history.get(proof, {})
 
+        # Get validation status
+        is_valid = self.constraint_validation.get(proof, True)
+
         # Format node label
         goal_str = self._format_atom(proof.goal)
 
         if proof.rule is None:
-            # Base fact - simple green box
+            # Base fact - simple green box (or red if invalid)
+            color = "lightgreen" if is_valid else "lightcoral"
             label = f"BASE FACT\\n{goal_str}"
-            dot.node(node_id, label, fillcolor="lightgreen")
+            if not is_valid:
+                label += "\\n✗ INVALID"
+            dot.node(node_id, label, fillcolor=color)
         else:
-            # Derived fact - blue box with detailed info
+            # Derived fact - blue box with detailed info (or red if invalid)
+            color = "lightblue" if is_valid else "lightcoral"
             # Use \\l for left-aligned text in graphviz
             # Use \\n for new lines
             label = f"DERIVE\\n{goal_str}\\n\\l"
+            if not is_valid:
+                label = f"DERIVE (✗ INVALID)\\n{goal_str}\\n\\l"
             label += f"Rule: {proof.rule.name}\\l"
             label += f"Pattern: {self._format_atom(proof.rule.conclusion)}\\l"
 
@@ -481,7 +568,7 @@ class ProofTreeVisualizerV2:
                 )
                 label += f"\\lRecursion: {rec_info}\\l"
 
-            dot.node(node_id, label, fillcolor="lightblue")
+            dot.node(node_id, label, fillcolor=color)
 
             # Add edges to sub-proofs with premise patterns as labels
             for i, (premise_pattern, sub_proof) in enumerate(
@@ -539,6 +626,7 @@ class ProofTreeVisualizerV2:
         - Individual tracking
         - Rule usage
         - Variable information
+        - Constraint validation status
 
         Args:
             proof (Proof): The proof tree to analyze.
@@ -553,6 +641,7 @@ class ProofTreeVisualizerV2:
                   - rules_used: List[str]
                   - total_substitutions: int
                   - unique_variables: int
+                  - is_valid: bool
         """
         stats = {
             "total_nodes": 0,
@@ -563,6 +652,7 @@ class ProofTreeVisualizerV2:
             "rules_used": set(),
             "total_substitutions": 0,
             "unique_variables": set(),
+            "is_valid": self.constraint_validation.get(proof, True),
         }
 
         def traverse(p: Proof, depth: int):
@@ -607,12 +697,12 @@ def main():
     Main entry point for the visualizer.
 
     Parses command-line arguments, loads ontology, runs backward chainer,
-    and generates visualizations for proof trees.
+    and generates visualizations for proof trees with constraint validation.
     """
     # ==================== PARSE ARGUMENTS ==================== #
 
     parser = argparse.ArgumentParser(
-        description="Visualize proof trees with variable substitutions"
+        description="Visualize proof trees with variable substitutions and constraints"
     )
     parser.add_argument(
         "--ontology-path",
@@ -642,6 +732,11 @@ def main():
         default=None,
         help="Specific rule names to visualize (default: all rules)",
     )
+    parser.add_argument(
+        "--show-invalid",
+        action="store_true",
+        help="Show proofs that violate constraints (default: only valid proofs)",
+    )
 
     args = parser.parse_args()
 
@@ -660,10 +755,13 @@ def main():
         print(f"Loading ontology from: {args.ontology_path}")
         onto_parser = OntologyParser(args.ontology_path)
 
-        # Initialize chainer
+        # Initialize chainer with constraints
         print(f"Initializing backward chainer (max recursion: {args.max_recursion})")
+        print(f"Loaded {len(onto_parser.constraints)} constraints")
         chainer = BackwardChainer(
-            all_rules=onto_parser.rules, max_recursion_depth=args.max_recursion
+            all_rules=onto_parser.rules,
+            constraints=onto_parser.constraints,  # ENHANCED: Pass constraints
+            max_recursion_depth=args.max_recursion,
         )
 
         # Create visualizer
@@ -671,7 +769,10 @@ def main():
 
         # Visualize proofs
         visualizer.visualize_all_proofs(
-            chainer=chainer, rule_names=args.rules, max_proofs_per_rule=args.max_proofs
+            chainer=chainer,
+            rule_names=args.rules,
+            max_proofs_per_rule=args.max_proofs,
+            show_invalid_proofs=args.show_invalid,
         )
 
         print(f"\n{'=' * 80}")

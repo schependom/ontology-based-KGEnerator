@@ -11,12 +11,14 @@ WORKFLOW:
     1. Parse the ontology using OntologyParser to extract:
        - Schema (classes, relations, attributes)
        - Rules (OWL 2 RL axioms converted to ExecutableRules)
+       - Constraints (disjointWith, IrreflexiveProperty, FunctionalProperty)
 
-    2. Initialize BackwardChainer with parsed rules
+    2. Initialize BackwardChainer with parsed rules AND constraints
 
     3. For each rule in the ontology:
        - Generate all possible proof trees starting from that rule
        - Traverse each proof tree (depth-first) to extract all ground atoms
+       - VALIDATE each proof against constraints before accepting
 
     4. Convert ground atoms into KnowledgeGraph facts:
        - Class memberships: (Individual, rdf:type, Class)
@@ -64,7 +66,8 @@ class KGenerator:
     complete knowledge graph with all derivable facts.
 
     The generator uses backward chaining to explore all possible proof
-    paths in the ontology, generating individuals and facts along the way.
+    paths in the ontology, generating individuals and facts along the way,
+    while ensuring all constraints are satisfied.
     """
 
     def __init__(self, ontology_file: str, max_recursion: int = 2):
@@ -79,12 +82,17 @@ class KGenerator:
         """
         print(f"Loading and parsing ontology from: {ontology_file}")
 
-        # Parse the ontology to extract schema and rules
+        # Parse the ontology to extract schema, rules, and constraints
         self.parser = OntologyParser(ontology_file)
 
-        # Initialize the backward chainer with all rules
+        # Initialize the backward chainer with all rules AND constraints
+        print(
+            f"Initializing backward chainer with {len(self.parser.constraints)} constraints..."
+        )
         self.chainer = BackwardChainer(
-            all_rules=self.parser.rules, max_recursion_depth=max_recursion
+            all_rules=self.parser.rules,
+            constraints=self.parser.constraints,  # ENHANCED: Pass constraints
+            max_recursion_depth=max_recursion,
         )
 
         # Store schemas from the parser
@@ -105,6 +113,13 @@ class KGenerator:
         # This is critical because proof trees form a DAG structure
         # Example: If proofs A→B and A→C both depend on D, we only process D once
         self.processed_proofs: Set[Proof] = set()
+
+        # Statistics tracking
+        self.stats = {
+            "proofs_generated": 0,
+            "proofs_rejected_by_constraints": 0,
+            "proofs_accepted": 0,
+        }
 
     def _register_individual(self, term: Term) -> None:
         """
@@ -191,8 +206,9 @@ class KGenerator:
         This method:
         1. Iterates through all rules in the ontology
         2. Generates all possible proofs starting from each rule
-        3. Traverses each proof tree to extract atoms
-        4. Converts atoms to KG facts and stores them
+        3. Validates each proof against constraints
+        4. Traverses valid proof trees to extract atoms
+        5. Converts atoms to KG facts and stores them
 
         Returns:
             KnowledgeGraph: The complete generated knowledge graph.
@@ -211,12 +227,14 @@ class KGenerator:
             print(f"\n[{i + 1}/{len(all_rules)}] Generating from rule: {rule.name}")
 
             # Generate all top-level proof trees starting from this rule
+            # NOTE: The chainer now internally checks constraints before yielding proofs
             proof_generator = self.chainer.generate_proof_trees(rule.name)
             top_level_proofs = 0
 
-            # Process each top-level proof
+            # Process each top-level proof (these are already validated)
             for top_level_proof in proof_generator:
                 top_level_proofs += 1
+                self.stats["proofs_accepted"] += 1
 
                 # Traverse the entire proof tree (DAG) from the top
                 # We use depth-first traversal with a stack
@@ -240,11 +258,17 @@ class KGenerator:
                         stack.append(sub_proof)
 
             if top_level_proofs == 0:
-                print("  -> No proofs found (rule may not be a valid starting point).")
+                print(
+                    "  -> No valid proofs found (rule may not be a valid starting point)."
+                )
             else:
-                print(f"  -> Found and processed {top_level_proofs} proof tree(s).")
+                print(
+                    f"  -> Found and processed {top_level_proofs} valid proof tree(s)."
+                )
 
         print("\n--- Data generation complete. ---")
+        print(f"Statistics:")
+        print(f"  Total proofs accepted: {self.stats['proofs_accepted']}")
 
         # Return the assembled knowledge graph
         return self.build_knowledge_graph()
@@ -281,7 +305,7 @@ def main():
     default_max_recursion = 10
 
     parser = argparse.ArgumentParser(
-        description="Ontology-based Knowledge Graph Data Generator"
+        description="Ontology-based Knowledge Graph Data Generator with Constraint Checking"
     )
     parser.add_argument(
         "--ontology-path",

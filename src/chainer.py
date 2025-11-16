@@ -11,6 +11,7 @@ WORKFLOW
         - Generate new individuals as needed for unbound variables.
         - Track recursive rule usage to prevent infinite loops.
         - Track atoms in proof path to prevent circular reasoning.
+        - CHECK CONSTRAINTS after generating each proof to ensure validity.
 
 AUTHOR
 
@@ -28,8 +29,10 @@ from data_structures import (
     Class,
     Relation,
     Attribute,
+    Constraint,
+    LiteralValue,
 )
-from rdflib.namespace import RDF
+from rdflib.namespace import RDF, OWL
 from typing import List, Dict, Set, Optional, Iterator, Tuple, Any
 import itertools
 
@@ -46,12 +49,15 @@ class BackwardChainer:
     - Automatic individual generation for unbound variables
     - Recursion depth limiting for recursive rules
     - Circular reasoning prevention via atom path tracking
+    - Constraint checking to ensure valid proofs
+    - Support for ReflexiveProperty, FunctionalProperty, and attributes
     - Optional verbose logging for debugging
     """
 
     def __init__(
         self,
         all_rules: List[ExecutableRule],
+        constraints: List[Constraint] = None,
         max_recursion_depth: int = 2,
         verbose: bool = False,
     ):
@@ -60,12 +66,14 @@ class BackwardChainer:
 
         Args:
             all_rules (List[ExecutableRule]):   All rules from the ontology parser.
+            constraints (List[Constraint]):     All constraints from the ontology parser.
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
             verbose (bool):                     Enable detailed debug output.
         """
         # Store rules as dict {rule_name: ExecutableRule} for fast lookup
         self.all_rules = {rule.name: rule for rule in all_rules}
+        self.constraints = constraints if constraints else []
         self.max_recursion_depth = max_recursion_depth
         self.verbose = verbose
 
@@ -81,9 +89,63 @@ class BackwardChainer:
             for rule_name in self.recursive_rules:
                 print(f"  - {rule_name}")
 
+        # Index constraints for efficient checking
+        self._index_constraints()
+
         # Counters for generating unique entities
         self._var_rename_counter = 0  # For renaming rule variables
         self._individual_counter = 0  # For generating new individuals
+
+        # Track functional property values to ensure uniqueness
+        # Dict[Tuple[Individual, Relation], Term]: (subject, functional_prop) -> unique_object
+        self._functional_property_values: Dict[Tuple[Individual, Relation], Term] = {}
+
+    def _index_constraints(self) -> None:
+        """
+        Index constraints by type for efficient lookup during constraint checking.
+
+        Creates mappings:
+        - disjoint_classes: Dict[Class, Set[Class]] - maps each class to classes it's disjoint with
+        - irreflexive_properties: Set[Relation] - set of properties that cannot be reflexive
+        - functional_properties: Set[Relation] - set of properties that must have unique values
+        """
+        self.disjoint_classes: Dict[Class, Set[Class]] = defaultdict(set)
+        self.irreflexive_properties: Set[Relation] = set()
+        self.functional_properties: Set[Relation] = set()
+
+        for constraint in self.constraints:
+            if constraint.constraint_type == OWL.disjointWith:
+                # constraint.terms = [Class1, Class2, Var('X')]
+                # Represents: X cannot be both Class1 and Class2
+                if len(constraint.terms) >= 2:
+                    c1, c2 = constraint.terms[0], constraint.terms[1]
+                    if isinstance(c1, Class) and isinstance(c2, Class):
+                        self.disjoint_classes[c1].add(c2)
+                        self.disjoint_classes[c2].add(c1)  # Symmetric
+
+            elif constraint.constraint_type == OWL.IrreflexiveProperty:
+                # constraint.terms = [Property, Var('X')]
+                # Represents: (X, Property, X) is forbidden
+                if len(constraint.terms) >= 1:
+                    prop = constraint.terms[0]
+                    if isinstance(prop, Relation):
+                        self.irreflexive_properties.add(prop)
+
+            elif constraint.constraint_type == OWL.FunctionalProperty:
+                # constraint.terms = [Property, Var('X')]
+                # Represents: X can have at most one value for Property
+                if len(constraint.terms) >= 1:
+                    prop = constraint.terms[0]
+                    if isinstance(prop, Relation):
+                        self.functional_properties.add(prop)
+
+        if self.verbose:
+            print(f"\nConstraint indexing complete:")
+            print(
+                f"  Disjoint class pairs: {sum(len(v) for v in self.disjoint_classes.values()) // 2}"
+            )
+            print(f"  Irreflexive properties: {len(self.irreflexive_properties)}")
+            print(f"  Functional properties: {len(self.functional_properties)}")
 
     def _get_atom_key(self, atom: Atom) -> Optional[Tuple]:
         """
@@ -343,12 +405,132 @@ class BackwardChainer:
 
         return subst
 
+    def _check_constraints(self, proof: Proof, collected_atoms: Set[Atom]) -> bool:
+        """
+        Checks if a proof violates any constraints.
+
+        This method verifies:
+        1. DisjointWith: No individual belongs to two disjoint classes
+        2. IrreflexiveProperty: No reflexive triples for irreflexive properties
+        3. FunctionalProperty: Each subject has at most one value for functional properties
+
+        RUNNING EXAMPLE:
+        ----------------
+        Consider a proof tree that derives:
+            - Atom(Ind_0, rdf:type, Person)
+            - Atom(Ind_0, rdf:type, Building)
+
+        If Person and Building are declared disjoint:
+            :Person owl:disjointWith :Building .
+
+        Then this proof violates the disjointWith constraint and should be rejected.
+
+        Args:
+            proof (Proof): The complete proof tree to check.
+            collected_atoms (Set[Atom]): All atoms derived in this proof tree.
+
+        Returns:
+            bool: True if proof is valid (no violations), False if constraints violated.
+        """
+        # Collect class memberships by individual
+        # Dict[Individual, Set[Class]]: individual -> {classes it belongs to}
+        individual_classes: Dict[Individual, Set[Class]] = defaultdict(set)
+
+        # Collect relation triples by (subject, predicate)
+        # Dict[Tuple[Individual, Relation], Set[Term]]: (subj, pred) -> {objects}
+        property_values: Dict[Tuple[Individual, Relation], Set[Term]] = defaultdict(set)
+
+        for atom in collected_atoms:
+            # ==================== COLLECT CLASS MEMBERSHIPS ==================== #
+            if atom.predicate == RDF.type and isinstance(atom.object, Class):
+                if isinstance(atom.subject, Individual):
+                    individual_classes[atom.subject].add(atom.object)
+
+            # ==================== COLLECT RELATION TRIPLES ==================== #
+            elif isinstance(atom.predicate, Relation) and isinstance(
+                atom.subject, Individual
+            ):
+                property_values[(atom.subject, atom.predicate)].add(atom.object)
+
+        # ==================== CHECK DISJOINT CLASSES ==================== #
+        for individual, classes in individual_classes.items():
+            for cls in classes:
+                disjoint_with = self.disjoint_classes.get(cls, set())
+                # Check if individual belongs to any disjoint class
+                violation = classes & disjoint_with
+                if violation:
+                    if self.verbose:
+                        print(
+                            f"  ✗ CONSTRAINT VIOLATION: {individual.name} cannot be both "
+                            f"{cls.name} and {next(iter(violation)).name} (disjoint classes)"
+                        )
+                    return False
+
+        # ==================== CHECK IRREFLEXIVE PROPERTIES ==================== #
+        for atom in collected_atoms:
+            if isinstance(atom.predicate, Relation):
+                if atom.predicate in self.irreflexive_properties:
+                    # Check if subject equals object (reflexive triple)
+                    if atom.subject == atom.object:
+                        if self.verbose:
+                            print(
+                                f"  ✗ CONSTRAINT VIOLATION: {self._format_atom(atom)} "
+                                f"violates irreflexive property {atom.predicate.name}"
+                            )
+                        return False
+
+        # ==================== CHECK FUNCTIONAL PROPERTIES ==================== #
+        for (subject, predicate), objects in property_values.items():
+            if predicate in self.functional_properties:
+                # Functional property must have exactly one value per subject
+                if len(objects) > 1:
+                    if self.verbose:
+                        obj_names = [
+                            o.name if hasattr(o, "name") else str(o) for o in objects
+                        ]
+                        print(
+                            f"  ✗ CONSTRAINT VIOLATION: {subject.name} has multiple values "
+                            f"for functional property {predicate.name}: {obj_names}"
+                        )
+                    return False
+
+        # All constraints satisfied
+        return True
+
+    def _collect_all_atoms(self, proof: Proof) -> Set[Atom]:
+        """
+        Collects all atoms (goals) from a proof tree via traversal.
+
+        This is used for constraint checking - we need to examine all derived
+        facts in the proof tree to detect violations.
+
+        Args:
+            proof (Proof): The proof tree to traverse.
+
+        Returns:
+            Set[Atom]: Set of all ground atoms in the proof tree.
+        """
+        atoms: Set[Atom] = set()
+        visited: Set[Proof] = set()
+
+        def traverse(p: Proof):
+            if p in visited:
+                return
+            visited.add(p)
+            atoms.add(p.goal)
+            for sub_proof in p.sub_proofs:
+                traverse(sub_proof)
+
+        traverse(proof)
+        return atoms
+
     def generate_proof_trees(self, start_rule_name: str) -> Iterator[Proof]:
         """
         Main entry point to generate proof trees starting from a specific rule.
 
         This method generates all possible proof trees for the given rule's conclusion,
-        creating new individuals as needed for variables.
+        creating new individuals as needed for variables, and CHECKING CONSTRAINTS
+        to ensure only valid proofs are yielded.
 
         RUNNING EXAMPLE:
         ----------------
@@ -368,7 +550,7 @@ class BackwardChainer:
                                    (e.g., "owl_chain_hasParent_hasParent_hasGrandparent").
 
         Yields:
-            Proof: Complete, ground proof trees.
+            Proof: Complete, ground proof trees that satisfy all constraints.
         """
         if start_rule_name not in self.all_rules:
             print(f"Error: Rule '{start_rule_name}' not found.")
@@ -464,7 +646,11 @@ class BackwardChainer:
         # Handle zero-premise rules (axioms)
         if not ground_premises:
             print("WARNING: Rule with no premises encountered.")
-            yield Proof.create_base_proof(ground_goal)
+            proof = Proof.create_base_proof(ground_goal)
+            # Check constraints before yielding
+            atoms = self._collect_all_atoms(proof)
+            if self._check_constraints(proof, atoms):
+                yield proof
             return
 
         if self.verbose:
@@ -508,16 +694,31 @@ class BackwardChainer:
         # Example: If premise 1 has 2 proofs and premise 2 has 3 proofs,
         #          this yields 2 × 3 = 6 complete proof trees
         proof_count = 0
+        valid_proof_count = 0
+
         for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
             proof_count += 1
-            yield Proof.create_derived_proof(
+            complete_proof = Proof.create_derived_proof(
                 goal=ground_goal,
                 rule=start_rule,  # Use unrenamed rule
                 sub_proofs=list(sub_proof_combination),
             )
 
+            # ==================== CONSTRAINT CHECKING ==================== #
+            # Collect all atoms from this complete proof tree
+            all_atoms = self._collect_all_atoms(complete_proof)
+
+            # Check if proof satisfies all constraints
+            if self._check_constraints(complete_proof, all_atoms):
+                valid_proof_count += 1
+                yield complete_proof
+            elif self.verbose:
+                print(f"  ✗ Proof {proof_count} rejected due to constraint violation")
+
         if self.verbose:
-            print(f"\n✓ Generated {proof_count} complete proof tree(s)")
+            print(
+                f"\n✓ Generated {valid_proof_count}/{proof_count} valid proof tree(s)"
+            )
 
     def _find_proofs_recursive(
         self,
@@ -668,12 +869,55 @@ class BackwardChainer:
             for p in premises_with_bound_vars:
                 unbound_vars.update(self._get_vars_in_atom(p))
 
-            # Generate individuals for unbound variables
+            # ==================== FUNCTIONAL PROPERTY HANDLING ==================== #
+            # For functional properties, reuse existing values if they exist
             newly_generated = []
             for var in unbound_vars:
                 if var not in rule_subst:
-                    rule_subst[var] = self._get_fresh_individual()
-                    newly_generated.append((var, rule_subst[var]))
+                    # Check if this variable will be used as object of a functional property
+                    needs_functional_value = False
+                    functional_key = None
+
+                    for p in premises_with_bound_vars:
+                        if (
+                            isinstance(p.predicate, Relation)
+                            and p.predicate in self.functional_properties
+                            and p.object == var
+                            and isinstance(p.subject, Individual)
+                        ):
+                            needs_functional_value = True
+                            functional_key = (p.subject, p.predicate)
+                            break
+
+                    if (
+                        needs_functional_value
+                        and functional_key in self._functional_property_values
+                    ):
+                        # Reuse existing value for this functional property
+                        rule_subst[var] = self._functional_property_values[
+                            functional_key
+                        ]
+                        if self.verbose:
+                            existing_val = self._functional_property_values[
+                                functional_key
+                            ]
+                            val_name = (
+                                existing_val.name
+                                if hasattr(existing_val, "name")
+                                else str(existing_val)
+                            )
+                            print(
+                                f"{indent}    Reused functional property value: {var.name} → {val_name}"
+                            )
+                    else:
+                        # Generate new individual
+                        new_ind = self._get_fresh_individual()
+                        rule_subst[var] = new_ind
+                        newly_generated.append((var, new_ind))
+
+                        # Track functional property value if applicable
+                        if needs_functional_value and functional_key:
+                            self._functional_property_values[functional_key] = new_ind
 
             if self.verbose and newly_generated:
                 print(f"{indent}    Generated new individuals:")

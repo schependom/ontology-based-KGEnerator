@@ -386,13 +386,26 @@ class OntologyParser:
         Intuition: If property P has range C, then the object of any
                    P triple must be a member of class C.
 
+        NOTE: For DatatypeProperty (Attribute), range typically specifies
+              a datatype (e.g., xsd:integer), not a class. We still create
+              the rule for consistency, though it may not be used in practice.
+
         Args:
             s (URIRef): The property.
             p (URIRef): rdfs:range predicate.
-            o (URIRef): The range class.
+            o (URIRef): The range class or datatype.
         """
         if isinstance(s, URIRef) and isinstance(o, URIRef):
             prop = self._get_term(s)
+
+            # Check if range is a datatype (for attributes)
+            if (o, RDF.type, RDFS.Datatype) in self.graph or str(o).startswith(
+                str(XSD)
+            ):
+                # This is a datatype range - we don't create a rule for this
+                # as it's a type constraint on literal values, not class membership
+                return
+
             cls = self._get_class(o)
             rule = ExecutableRule(
                 name=f"rdfs_range_{prop.name}_{cls.name}",
@@ -489,7 +502,9 @@ class OntologyParser:
         Supported types:
         - owl:SymmetricProperty:    P(X,Y) → P(Y,X)
         - owl:TransitiveProperty:   P(X,Y) ∧ P(Y,Z) → P(X,Z)
+        - owl:ReflexiveProperty:    P(X,X) for all X in domain
         - owl:IrreflexiveProperty:  NOT P(X,X) [constraint]
+        - owl:FunctionalProperty:   P(X,Y1) ∧ P(X,Y2) → Y1 = Y2 [constraint]
 
         Args:
             s (URIRef): The property or class.
@@ -526,6 +541,25 @@ class OntologyParser:
             )
             self.rules.append(rule)
 
+        # ==================== REFLEXIVE PROPERTY ==================== #
+        elif o == OWL.ReflexiveProperty:
+            # Rule: (P rdf:type owl:ReflexiveProperty) → (?X rdf:type Domain(P)) → (?X P ?X)
+            # Intuition: If P is reflexive, then every individual in P's domain
+            #            is related to itself via P.
+            #            Example: "knows" might be reflexive (everyone knows themselves).
+            #
+            # NOTE: This creates a zero-premise rule that generates reflexive triples
+            #       for any individual. In practice, you'd want to limit this to
+            #       individuals in the property's domain, but for synthetic generation
+            #       we allow the chainer to generate X as needed.
+            prop = self._get_relation(s)
+            rule = ExecutableRule(
+                name=f"owl_reflexive_{prop.name}",
+                conclusion=Atom(self.X, prop, self.X),
+                premises=[],  # Zero premises - axiom that X relates to itself
+            )
+            self.rules.append(rule)
+
         # ==================== IRREFLEXIVE PROPERTY (CONSTRAINT) ==================== #
         elif o == OWL.IrreflexiveProperty:
             # Constraint: (P rdf:type owl:IrreflexiveProperty)
@@ -536,6 +570,22 @@ class OntologyParser:
                 name=f"owl_irreflexive_{prop.name}",
                 constraint_type=OWL.IrreflexiveProperty,
                 terms=[prop, self.X],  # Represents that (?X P ?X) is forbidden
+            )
+            self.constraints.append(constraint)
+
+        # ==================== FUNCTIONAL PROPERTY (CONSTRAINT) ==================== #
+        elif o == OWL.FunctionalProperty:
+            # Constraint: (P rdf:type owl:FunctionalProperty)
+            # This means P can have at most one value for each subject.
+            # Example: "birthDate" is functional (everyone has exactly one birth date).
+            #
+            # In backward chaining, this means if we generate P(X, Y1) and then
+            # try to generate P(X, Y2), we must ensure Y1 = Y2.
+            prop = self._get_term(s)
+            constraint = Constraint(
+                name=f"owl_functional_{prop.name}",
+                constraint_type=OWL.FunctionalProperty,
+                terms=[prop, self.X, self.Y],  # Represents uniqueness constraint
             )
             self.constraints.append(constraint)
 
