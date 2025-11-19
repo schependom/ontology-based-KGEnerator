@@ -210,3 +210,7 @@ __marimo__/
 /trees
 /output
 /data/out
+
+.DS_Store
+.agent
+.github

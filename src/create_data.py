@@ -201,7 +201,7 @@ class KGEDatasetGenerator:
         """
         samples = []
         failed_attempts = 0
-        max_failed_attempts = n_samples * 2  # Safety limit
+        max_failed_attempts = n_samples * 10  # Safety limit
 
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
             sample = self._generate_one_sample(
@@ -238,8 +238,8 @@ class KGEDatasetGenerator:
         """
         Generates one complete, independent knowledge graph sample.
 
-            1. Randomly select K rules as starting points (K \in [min_rules, max_rules])
-            2. For each rule, generate M proof trees (M \in [1, 5])
+            1. Randomly select K rules as starting points (K \\in [min_rules, max_rules])
+            2. For each rule, generate M proof trees (M \\in [1, 5])
             3. Extract ALL atoms from all proof trees (using shared utility)
             4. Convert atoms to KG format (using shared utility)
             5. Add negative samples using local CWA corruption
@@ -368,8 +368,6 @@ class KGEDatasetGenerator:
             print(
                 f"Warning: Generated {len(negative_triples)}/{len(positive_triples)} negatives"
             )
-
-        classes = {cls.name for cls in self.schema_classes.values()}
 
         # TODO add way more sophisticated negative sampling!
 

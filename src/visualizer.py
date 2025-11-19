@@ -11,9 +11,13 @@ AUTHOR:
 import argparse
 import os
 import sys
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 from collections import defaultdict
-import graphviz
+
+try:
+    import graphviz
+except ImportError:
+    graphviz = None
 
 # Custom imports
 from data_structures import (
@@ -437,6 +441,10 @@ class ProofTreeVisualizer:
             proof (Proof): The proof tree to visualize.
             proof_id (str): Identifier for this proof (used in filename).
         """
+        if graphviz is None:
+            print("Warning: graphviz module not found. Skipping graph generation.")
+            return
+
         # Reset node tracking for new graph
         self.node_counter = 0
         self.node_ids = {}
@@ -471,7 +479,7 @@ class ProofTreeVisualizer:
             print(f"  Saved .dot file to: {output_path}.dot")
 
     def _add_proof_to_graph(
-        self, proof: Proof, dot: graphviz.Digraph, parent_id: Optional[str]
+        self, proof: Proof, dot: Any, parent_id: Optional[str]
     ) -> str:
         """
         Recursively add proof nodes with substitution info to graphviz graph.
