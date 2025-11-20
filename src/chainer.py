@@ -59,6 +59,7 @@ class BackwardChainer:
         all_rules: List[ExecutableRule],
         constraints: List[Constraint] = None,
         max_recursion_depth: int = 2,
+        global_max_depth: int = 5,
         verbose: bool = False,
     ):
         """
@@ -69,12 +70,14 @@ class BackwardChainer:
             constraints (List[Constraint]):     All constraints from the ontology parser.
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
+            global_max_depth (int):             Hard limit on total proof tree depth.
             verbose (bool):                     Enable detailed debug output.
         """
         # Store rules as dict {rule_name: ExecutableRule} for fast lookup
         self.all_rules = {rule.name: rule for rule in all_rules}
         self.constraints = constraints if constraints else []
         self.max_recursion_depth = max_recursion_depth
+        self.global_max_depth = global_max_depth
         self.verbose = verbose
 
         # Index rules by their conclusion for O(1) lookup
@@ -140,7 +143,7 @@ class BackwardChainer:
                         self.functional_properties.add(prop)
 
         if self.verbose:
-            print(f"\nConstraint indexing complete:")
+            print("Constraint indexing complete:")
             print(
                 f"  Disjoint class pairs: {sum(len(v) for v in self.disjoint_classes.values()) // 2}"
             )
@@ -598,7 +601,7 @@ class BackwardChainer:
         # }
 
         if self.verbose:
-            print(f"\nInitial substitution for conclusion variables:")
+            print("Initial substitution for conclusion variables:")
             for var, ind in subst.items():
                 print(f"  {var} -> {ind}")
 
@@ -654,7 +657,7 @@ class BackwardChainer:
             return
 
         if self.verbose:
-            print(f"\nGround premises to prove:")
+            print("Ground premises to prove:")
             for i, prem in enumerate(ground_premises):
                 print(f"  {i + 1}. {self._format_atom(prem)}")
 
@@ -668,7 +671,7 @@ class BackwardChainer:
         for premise in ground_premises:
             proof_list = list(
                 self._find_proofs_recursive(
-                    premise, recursive_use_counts, atoms_in_path
+                    premise, recursive_use_counts, atoms_in_path, depth=1
                 )
             )
 
@@ -725,6 +728,7 @@ class BackwardChainer:
         goal_atom: Atom,
         recursive_use_counts: frozenset[Tuple[str, int]],
         atoms_in_path: frozenset[Atom],
+        depth: int = 0,
     ) -> Iterator[Proof]:
         """
         Recursively finds all possible proof trees for a given ground atom.
@@ -768,6 +772,12 @@ class BackwardChainer:
         Yields:
             Proof: Valid proof trees for the goal_atom.
         """
+        # Check global depth limit
+        if depth > self.global_max_depth:
+            if self.verbose:
+                print(f"  ✗ Max global depth reached ({self.global_max_depth})")
+            return
+
         if self.verbose:
             indent = "  " * len(atoms_in_path)
             print(f"{indent}→ Proving: {self._format_atom(goal_atom)}")
@@ -945,7 +955,10 @@ class BackwardChainer:
             for premise in ground_premises:
                 proof_list = list(
                     self._find_proofs_recursive(
-                        premise, new_recursive_use_counts, new_atoms_in_path
+                        premise,
+                        new_recursive_use_counts,
+                        new_atoms_in_path,
+                        depth=depth + 1,
                     )
                 )
 

@@ -53,7 +53,7 @@ from data_structures import (
 )
 from parser import OntologyParser
 from chainer import BackwardChainer
-from visualizer import GraphVisualizer
+from graph_visualizer import GraphVisualizer
 
 
 # ============================================================================ #
@@ -216,7 +216,7 @@ class KGenerator:
     def __init__(
         self,
         ontology_file: str,
-        max_recursion: int = 2,
+        max_recursion,
         verbose: bool = False,
     ):
         """
@@ -247,6 +247,7 @@ class KGenerator:
             constraints=self.parser.constraints,
             max_recursion_depth=max_recursion,
             verbose=verbose,
+            global_max_depth=5,
         )
 
         # Store schemas from the parser
@@ -507,8 +508,8 @@ def main():
     """
     # ==================== PARSE ARGUMENTS ==================== #
 
-    default_ontology_path = "data/family.ttl"
-    default_max_recursion = 10
+    default_ontology_path = "data/toy.ttl"
+    default_max_recursion = 3
 
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator with Constraint Checking"

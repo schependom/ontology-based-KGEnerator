@@ -25,17 +25,10 @@ from the `src/` directory as they import sibling modules:
 
 ```bash
 # Visualize proofs (writes output to `output/`)
-python src/visualizer.py --ontology-path data/toy.ttl --output-dir output
+python src/proof_visualizer.py --ontology-path data/toy.ttl --output-dir output
 
 # Generate datasets (CSV output)
 python src/create_data.py --ontology data/family.ttl --output data/out
 ```
 
-If you prefer module-style execution, run from the `src` directory:
-
-```bash
-cd src
-python visualizer.py
-```
-
-Work in progress as of 16/11/2025.
+Work in progress as of 20/11/2025.

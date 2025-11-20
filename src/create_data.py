@@ -50,12 +50,12 @@ from data_structures import (
 )
 
 
-from generator import (
+from generate import (
     KGenerator,
     extract_all_atoms_from_proof,
     atoms_to_knowledge_graph,
 )
-from visualizer import GraphVisualizer
+from graph_visualizer import GraphVisualizer
 
 
 class KGEDatasetGenerator:
@@ -288,7 +288,7 @@ class KGEDatasetGenerator:
             try:
                 proofs = self.generator.generate_proofs_for_rule(
                     rule_name=rule.name,
-                    max_proofs=None,  # generate all proofs
+                    max_proofs=5,  # generate all proofs
                 )
 
                 if not proofs:
