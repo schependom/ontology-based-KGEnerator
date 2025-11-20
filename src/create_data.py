@@ -33,6 +33,7 @@ import argparse
 from pathlib import Path
 from typing import List, Set, Tuple, Optional, Dict
 from collections import defaultdict
+import networkx as nx
 
 # Custom imports
 from data_structures import (
@@ -66,6 +67,7 @@ class KGEDatasetGenerator:
         ontology_file: str,
         max_recursion: int = 2,
         seed: Optional[int] = None,
+        neg_strategy: str = "random",  # "random" or "typed"
         verbose: bool = False,
     ):
         """
@@ -75,6 +77,7 @@ class KGEDatasetGenerator:
             ontology_file (str):    Path to the .ttl ontology file.
             max_recursion (int):    Maximum depth for recursive rules.
             seed (Optional[int]):   Random seed for reproducibility.
+            neg_strategy (str):     Negative sampling strategy ("random" or "typed").
             verbose (bool):         Enable detailed logging.
         """
         if seed is not None:
@@ -82,6 +85,8 @@ class KGEDatasetGenerator:
 
         self.verbose = verbose
         self.ontology_file = ontology_file
+        self.neg_strategy = neg_strategy
+        self.max_recursion_cap = max_recursion
 
         # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         if self.verbose:
@@ -259,8 +264,21 @@ class KGEDatasetGenerator:
                 print("Warning: No rules available for generation")
             return None
 
-        # Randomly select starting rules
+        # ----------------------------------------------------------------
+        # VARIANCE STRATEGY 1: VARY RECURSION DEPTH
+        # ----------------------------------------------------------------
+        # Randomly pick a max recursion depth for this specific sample
+        # This ensures some samples are "deep" and others are "shallow"
+        # providing structural diversity.
+        current_recursion = random.randint(1, self.max_recursion_cap)
+        self.generator.chainer.max_recursion_depth = current_recursion
+
+        # ----------------------------------------------------------------
+        # VARIANCE STRATEGY 2: RANDOM RULE SELECTION
+        # ----------------------------------------------------------------
+        # Randomly determine how many rules to trigger
         n_rules = random.randint(min_rules, min(max_rules, len(self.rules)))
+        # Randomly select the specific rules
         selected_rules = random.sample(self.rules, n_rules)
 
         all_atoms: Set[Atom] = set()
@@ -268,16 +286,18 @@ class KGEDatasetGenerator:
         # Generate proofs and extract atoms
         for rule in selected_rules:
             try:
-                # REFACTORED: Use KGenerator's generate_proofs_for_rule method
                 proofs = self.generator.generate_proofs_for_rule(
                     rule_name=rule.name,
-                    max_proofs=5,  # Randomly select up to 5 proofs per rule
+                    max_proofs=None,  # generate all proofs
                 )
 
                 if not proofs:
                     continue
 
-                # Randomly select some proofs (for variety)
+                # ----------------------------------------------------------------
+                # VARIANCE STRATEGY 3: RAND NB OF PROOFS PER RULE
+                # ----------------------------------------------------------------
+
                 n_proofs = random.randint(1, len(proofs))
                 selected_proofs = random.sample(proofs, n_proofs)
 
@@ -340,40 +360,145 @@ class KGEDatasetGenerator:
         Returns:
             KnowledgeGraph: KG with balanced positive/negative triples.
         """
-        positive_triples = []
+        # 1. RELATION NEGATIVES
+        positive_triples = [t for t in kg.triples if t.positive]
         negative_triples = []
 
-        for triple in kg.triples:
-            if triple.positive:
-                positive_triples.append(triple)
-            else:
-                negative_triples.append(triple)
-
-        # Generate one negative for each positive
         for pos_triple in positive_triples:
-            max_attempts = 10  # Limit attempts to avoid infinite loops
-
-            for attempt in range(max_attempts):
+            max_attempts = 5
+            for _ in range(max_attempts):
                 neg_triple = self._corrupt_triple(pos_triple, kg)
-
-                # Verify consistency: negative shouldn't conflict with positives
-                if not self._creates_inconsistency(neg_triple, kg):
+                if neg_triple and not self._creates_inconsistency(neg_triple, kg):
                     negative_triples.append(neg_triple)
                     break
-
-        # Add negatives to KG
         kg.triples.extend(negative_triples)
 
-        if self.verbose and len(negative_triples) < len(positive_triples):
-            print(
-                f"Warning: Generated {len(negative_triples)}/{len(positive_triples)} negatives"
-            )
+        # 2. CLASS MEMBERSHIP NEGATIVES
+        # Generate one negative membership for each positive membership
+        positive_memberships = [m for m in kg.memberships if m.is_member]
+        negative_memberships = []
 
-        # TODO add way more sophisticated negative sampling!
+        all_classes = self.schema_classes.values()
+
+        for pos_mem in positive_memberships:
+            # Attempt to corrupt class (e.g., Person -> Building)
+            # Logic: Pick a random class that the individual does NOT have
+            current_classes = {
+                m.cls.name
+                for m in kg.memberships
+                if m.individual == pos_mem.individual and m.is_member
+            }
+
+            candidates = [c for c in all_classes if c.name not in current_classes]
+            if candidates:
+                neg_cls = random.choice(candidates)
+                # Verify no disjointness violation?
+                # Actually, for a negative sample (False fact), we want facts that are NOT true.
+                # Being disjoint makes it definitely false (a good negative).
+                neg_mem = Membership(
+                    individual=pos_mem.individual,
+                    cls=neg_cls,
+                    is_member=False,  # Explicitly negative
+                    proofs=[],
+                )
+                negative_memberships.append(neg_mem)
+
+        kg.memberships.extend(negative_memberships)
+
+        # 3. ATTRIBUTE NEGATIVES
+        # Generate negatives by corrupting the value
+        positive_attrs = kg.attribute_triples
+        negative_attrs = []
+
+        # Build pool of values per attribute to create "hard" negatives
+        values_by_attr = defaultdict(list)
+        for attr in positive_attrs:
+            values_by_attr[attr.predicate.name].append(attr.value)
+
+        for pos_attr in positive_attrs:
+            attr_name = pos_attr.predicate.name
+            pool = values_by_attr[attr_name]
+
+            # Try to find a different value from the pool (Hard Negative)
+            candidates = [v for v in pool if v != pos_attr.value]
+
+            if not candidates:
+                # Fallback: Generate random dummy value if no other values exist
+                if isinstance(pos_attr.value, int):
+                    new_val = pos_attr.value + 1
+                elif isinstance(pos_attr.value, float):
+                    new_val = pos_attr.value + 0.1
+                else:
+                    new_val = str(pos_attr.value) + "_neg"
+            else:
+                new_val = random.choice(candidates)
+
+            # Check if this negative already exists as a positive (multi-valued attr?)
+            is_existing = False
+            for existing in positive_attrs:
+                if (
+                    existing.subject == pos_attr.subject
+                    and existing.predicate == pos_attr.predicate
+                    and existing.value == new_val
+                ):
+                    is_existing = True
+                    break
+            if is_existing:
+                print("Warning: Could not create unique negative attribute triple")
+                pass  # Skip adding this negative
 
         return kg
 
-    def _corrupt_triple(self, triple: Triple, kg: KnowledgeGraph) -> Triple:
+    def _get_valid_candidates(
+        self, relation: Relation, position: str, kg: KnowledgeGraph
+    ) -> List[Individual]:
+        """
+        Get candidate individuals for corruption that satisfy domain/range constraints.
+
+        Args:
+            relation (Relation): The relation being corrupted.
+            position (str): "subject" (check domain) or "object" (check range).
+            kg (KnowledgeGraph): The knowledge graph containing individuals.
+
+        Returns:
+            List[Individual]: List of valid candidates.
+        """
+        if self.neg_strategy == "random":
+            return kg.individuals
+
+        # For "typed" strategy, filter by domain/range
+        required_classes = set()
+        if position == "subject":
+            required_classes = self.parser.domains.get(relation.name, set())
+        else:
+            required_classes = self.parser.ranges.get(relation.name, set())
+
+        if not required_classes:
+            # No constraints, any individual is valid
+            return kg.individuals
+
+        valid_candidates = []
+        for ind in kg.individuals:
+            # Check if individual belongs to ANY of the required classes
+            # (Union semantics for multiple domain/range statements)
+            ind_classes = {m.cls.name for m in ind.classes if m.is_member}
+
+            # If individual has no known classes, we might assume it's valid or invalid
+            # Here we assume invalid if constraints exist but individual has no types
+            if not ind_classes:
+                continue
+
+            # Check intersection
+            if not required_classes.isdisjoint(ind_classes):
+                valid_candidates.append(ind)
+
+        # Fallback if no valid candidates found (to avoid empty list)
+        if not valid_candidates:
+            return kg.individuals
+
+        return valid_candidates
+
+    def _corrupt_triple(self, triple: Triple, kg: KnowledgeGraph) -> Optional[Triple]:
         """
         Creates a negative triple by corrupting subject or object.
 
@@ -386,38 +511,38 @@ class KGEDatasetGenerator:
             kg (KnowledgeGraph): Current knowledge graph (for individual pool).
 
         Returns:
-            Triple: Corrupted negative triple.
+            Optional[Triple]: Corrupted negative triple, or None if no candidates.
         """
         if random.random() < 0.5:
             # Corrupt subject
-            candidates = [i for i in kg.individuals if i != triple.subject]
+            candidates = self._get_valid_candidates(triple.predicate, "subject", kg)
+            candidates = [i for i in candidates if i != triple.subject]
+
             if not candidates:
                 # Fallback: corrupt object instead
-                candidates = [i for i in kg.individuals if i != triple.object]
+                candidates = self._get_valid_candidates(triple.predicate, "object", kg)
+                candidates = [i for i in candidates if i != triple.object]
+                if not candidates:
+                    return None
                 new_obj = random.choice(candidates)
                 return Triple(
                     triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
                 )
-
-            new_subj = random.choice(candidates)
-            return Triple(
-                new_subj, triple.predicate, triple.object, positive=False, proofs=[]
-            )
         else:
             # Corrupt object
-            candidates = [i for i in kg.individuals if i != triple.object]
+            candidates = self._get_valid_candidates(triple.predicate, "object", kg)
+            candidates = [i for i in candidates if i != triple.object]
+
             if not candidates:
                 # Fallback: corrupt subject instead
-                candidates = [i for i in kg.individuals if i != triple.subject]
+                candidates = self._get_valid_candidates(triple.predicate, "subject", kg)
+                candidates = [i for i in candidates if i != triple.subject]
+                if not candidates:
+                    return None
                 new_subj = random.choice(candidates)
                 return Triple(
                     new_subj, triple.predicate, triple.object, positive=False, proofs=[]
                 )
-
-            new_obj = random.choice(candidates)
-            return Triple(
-                triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
-            )
 
     def _creates_inconsistency(self, neg_triple: Triple, kg: KnowledgeGraph) -> bool:
         """
@@ -444,6 +569,58 @@ class KGEDatasetGenerator:
                 return True
 
         return False
+
+    @staticmethod
+    def check_structural_isomorphism(kg1: KnowledgeGraph, kg2: KnowledgeGraph) -> bool:
+        """
+        Checks if two Knowledge Graphs are structurally isomorphic.
+
+        Ignores Individual names but preserves:
+        - Graph topology (Relations)
+        - Class memberships (as node attributes)
+        - Attribute values (as node attributes)
+
+        Requires networkx.
+        """
+
+        def to_nx(kg):
+            G = nx.MultiDiGraph()
+            # Nodes with attributes (Classes + Data Attributes)
+            for ind in kg.individuals:
+                # Classes as frozenset for hashable comparison
+                clss = frozenset(
+                    [
+                        m.cls.name
+                        for m in kg.memberships
+                        if m.individual == ind and m.is_member
+                    ]
+                )
+                # Attributes as sorted tuple
+                attrs = []
+                for at in kg.attribute_triples:
+                    if at.subject == ind:
+                        attrs.append((at.predicate.name, str(at.value)))
+                attrs = tuple(sorted(attrs))
+
+                G.add_node(ind.name, classes=clss, attrs=attrs)
+
+            # Edges (Relations)
+            for t in kg.triples:
+                if t.positive:
+                    G.add_edge(t.subject.name, t.object.name, label=t.predicate.name)
+            return G
+
+        G1 = to_nx(kg1)
+        G2 = to_nx(kg2)
+
+        # Node matcher checks classes and attributes
+        nm = nx.algorithms.isomorphism.categorical_node_match(
+            ["classes", "attrs"], [frozenset(), tuple()]
+        )
+        # Edge matcher checks relation type
+        em = nx.algorithms.isomorphism.categorical_edge_match("label", None)
+
+        return nx.is_isomorphic(G1, G2, node_match=nm, edge_match=em)
 
     def _print_dataset_summary(
         self,
@@ -495,6 +672,22 @@ class KGEDatasetGenerator:
         print(f"\n{'=' * 80}")
         print("DATASET GENERATION COMPLETE")
         print(f"{'=' * 80}")
+
+        # Check isomorphism
+        print("Checking structural isomorphism between TRAIN and TEST samples...")
+        isomorphic_count = 0
+        for train_kg in train_samples:
+            for test_kg in test_samples:
+                if self.check_structural_isomorphism(train_kg, test_kg):
+                    isomorphic_count += 1
+                    break  # No need to check further test samples
+        if isomorphic_count > 0:
+            print(
+                f"Warning: Found {isomorphic_count} TRAIN samples "
+                f"structurally isomorphic to TEST samples"
+            )
+        else:
+            print("No structural isomorphism detected between TRAIN and TEST samples.")
 
         print("\nTRAINING SET:")
         print(f"  Samples:              {train_stats.get('n_samples', 0)}")
@@ -676,6 +869,13 @@ def main():
         help="Random seed for reproducibility",
     )
     parser.add_argument(
+        "--neg-strategy",
+        type=str,
+        default="random",
+        choices=["random", "typed"],
+        help="Negative sampling strategy: 'random' (any individual) or 'typed' (respects domain/range)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -688,6 +888,7 @@ def main():
         ontology_file=args.ontology,
         max_recursion=args.max_recursion,
         seed=args.seed,
+        neg_strategy=args.neg_strategy,
         verbose=args.verbose,
     )
 

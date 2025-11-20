@@ -15,6 +15,7 @@ AUTHOR
 from rdflib import Graph, URIRef, Literal, BNode
 from rdflib.namespace import RDF, RDFS, OWL, XSD
 from typing import Dict, List, Set, Optional, Tuple, Union
+from collections import defaultdict
 
 # Custom imports
 from data_structures import (
@@ -67,6 +68,14 @@ class OntologyParser:
         # Storage for parsed rules and constraints
         self.rules: List[ExecutableRule] = []  # Inference rules
         self.constraints: List[Constraint] = []  # Integrity constraints
+
+        # Storage for domain and range constraints (for negative sampling)
+        self.domains: Dict[str, Set[str]] = defaultdict(
+            set
+        )  # relation_name -> {class_names}
+        self.ranges: Dict[str, Set[str]] = defaultdict(
+            set
+        )  # relation_name -> {class_names}
 
         # Pre-defined variables for rule creation
         # These are reused across rules for consistency
@@ -370,6 +379,10 @@ class OntologyParser:
         if isinstance(s, URIRef) and isinstance(o, URIRef):
             prop = self._get_term(s)
             cls = self._get_class(o)
+
+            # Store domain constraint for negative sampling
+            self.domains[prop.name].add(cls.name)
+
             rule = ExecutableRule(
                 name=f"rdfs_domain_{prop.name}_{cls.name}",
                 conclusion=Atom(self.X, RDF.type, cls),
@@ -407,6 +420,10 @@ class OntologyParser:
                 return
 
             cls = self._get_class(o)
+
+            # Store range constraint for negative sampling
+            self.ranges[prop.name].add(cls.name)
+
             rule = ExecutableRule(
                 name=f"rdfs_range_{prop.name}_{cls.name}",
                 conclusion=Atom(self.Y, RDF.type, cls),
