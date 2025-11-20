@@ -41,6 +41,7 @@ AUTHOR
 import sys
 import argparse
 import traceback
+import random
 from typing import Dict, Set, List, Optional
 from rdflib.namespace import RDF
 
@@ -226,6 +227,7 @@ class KGenerator:
         max_recursion: int,
         global_max_depth: int = 5,
         max_proofs_per_atom: int = None,
+        neg_strategy: str = "random",
         verbose: bool = False,
     ):
         """
@@ -238,9 +240,11 @@ class KGenerator:
                                  parent(X,Y) ∧ parent(Y,Z) → ancestor(X,Z)
             global_max_depth (int): Hard limit on total proof tree depth.
             max_proofs_per_atom (int): Max number of proofs to generate for any single atom.
+            neg_strategy (str): Negative sampling strategy ("random" or "constrained").
             verbose (bool): Enable detailed logging.
         """
         self.verbose = verbose
+        self.neg_strategy = neg_strategy
 
         if self.verbose:
             print(f"Loading and parsing ontology from: {ontology_file}")
@@ -287,6 +291,9 @@ class KGenerator:
             "proofs_rejected_by_constraints": 0,
             "proofs_accepted": 0,
         }
+
+        # Negative sampling strategy
+        self.neg_strategy = "random"
 
     def generate_proofs_for_rule(
         self,
@@ -415,9 +422,12 @@ class KGenerator:
 
         # Other atom patterns (e.g., variable predicates) are not handled
 
-    def generate_data(self) -> KnowledgeGraph:
+    def generate_data(self, add_negatives: bool = False) -> KnowledgeGraph:
         """
         Runs the full generation process.
+
+        Args:
+            add_negatives (bool): Whether to generate negative samples.
 
         Returns:
             KnowledgeGraph: The complete generated knowledge graph.
@@ -486,8 +496,222 @@ class KGenerator:
             print("Statistics:")
             print(f"  Total proofs accepted: {self.stats['proofs_accepted']}")
 
-        # Return the assembled knowledge graph
-        return self.build_knowledge_graph()
+        # Build the initial KG
+        kg = self.build_knowledge_graph()
+
+        # Add negative samples if requested
+        if add_negatives:
+            if self.verbose:
+                print("\nGenerating negative samples...")
+            kg = self.add_negative_samples(kg)
+
+        return kg
+
+    def add_negative_samples(self, kg: KnowledgeGraph) -> KnowledgeGraph:
+        """
+        Adds negative samples to the knowledge graph using local CWA.
+        Note that we only generate negatives for positive triples.
+        There are no negatives for memberships or attribute triples.
+
+        (from RRN paper, Appendix D), but work in progress:
+        "We generated exactly one negative inference for each positive
+        inference that exists in the data by corrupting each of these
+        positive inferences exactly once."
+
+        For each positive triple:
+            1. Randomly corrupt either subject OR object
+            2. Verify the corrupted triple doesn't create inconsistency
+            3. Add as negative triple
+
+        EXAMPLE:
+            Positive: parent(Ind_0, Ind_1)
+            Negative: parent(Ind_0, Ind_3)   [corrupted object]
+                   OR parent(Ind_2, Ind_1)   [corrupted subject]
+
+        Args:
+            kg (KnowledgeGraph): KG with only positive triples.
+
+        Returns:
+            KnowledgeGraph: KG with balanced positive/negative triples.
+        """
+        # 1. RELATION NEGATIVES
+        positive_triples = [t for t in kg.triples if t.positive]
+        negative_triples = []
+
+        for pos_triple in positive_triples:
+            max_attempts = 5
+            for _ in range(max_attempts):
+                neg_triple = self._corrupt_triple(pos_triple, kg)
+                if neg_triple and not self._creates_inconsistency(neg_triple, kg):
+                    negative_triples.append(neg_triple)
+                    break
+        kg.triples.extend(negative_triples)
+
+        # 2. CLASS MEMBERSHIP NEGATIVES
+        # Generate one negative membership for each positive membership
+        positive_memberships = [m for m in kg.memberships if m.is_member]
+        negative_memberships = []
+
+        all_classes = self.schema_classes.values()
+
+        for pos_mem in positive_memberships:
+            # Attempt to corrupt class (e.g., Person -> Building)
+            # Logic: Pick a random class that the individual does NOT have
+            current_classes = {
+                m.cls.name
+                for m in kg.memberships
+                if m.individual == pos_mem.individual and m.is_member
+            }
+
+            candidates = [c for c in all_classes if c.name not in current_classes]
+            if candidates:
+                neg_cls = random.choice(candidates)
+                # For a negative sample (False fact), we want facts that are NOT true.
+                # Being disjoint makes it definitely false (a good negative).
+                neg_mem = Membership(
+                    individual=pos_mem.individual,
+                    cls=neg_cls,
+                    is_member=False,  # Explicitly negative
+                    proofs=[],
+                )
+                negative_memberships.append(neg_mem)
+
+        kg.memberships.extend(negative_memberships)
+
+        # No attribute negatives yet (20/11/2026)
+
+        return kg
+
+    def _get_valid_candidates(
+        self, relation: Relation, position: str, kg: KnowledgeGraph
+    ) -> List[Individual]:
+        """
+        Get candidate individuals for corruption that satisfy domain/range constraints.
+
+        Args:
+            relation (Relation): The relation being corrupted.
+            position (str): "subject" (check domain) or "object" (check range).
+            kg (KnowledgeGraph): The knowledge graph containing individuals.
+
+        Returns:
+            List[Individual]: List of valid candidates.
+        """
+        if self.neg_strategy == "random":
+            return kg.individuals
+
+        # Filter by domain/range
+        required_classes = set()
+        if position == "subject":
+            required_classes = self.parser.domains.get(relation.name, set())
+        else:
+            required_classes = self.parser.ranges.get(relation.name, set())
+
+        if not required_classes:
+            # No constraints, any individual is valid
+            return kg.individuals
+
+        valid_candidates = []
+        for ind in kg.individuals:
+            # Check if individual belongs to ANY of the required classes
+            # (Union semantics for multiple domain/range statements)
+            ind_classes = {m.cls.name for m in ind.classes if m.is_member}
+
+            # If individual has no known classes, we might assume it's valid or invalid
+            # Here we assume invalid if constraints exist but individual has no types
+            if not ind_classes:
+                continue
+
+            # Check intersection
+            if not required_classes.isdisjoint(ind_classes):
+                valid_candidates.append(ind)
+
+        # Fallback if no valid candidates found (to avoid empty list)
+        if not valid_candidates:
+            return kg.individuals
+
+        return valid_candidates
+
+    def _corrupt_triple(self, triple: Triple, kg: KnowledgeGraph) -> Optional[Triple]:
+        """
+        Creates a negative triple by corrupting subject or object.
+
+        Randomly chooses to corrupt either:
+            - Subject: Replace with random different individual
+            - Object: Replace with random different individual
+
+        Args:
+            triple (Triple): Positive triple to corrupt.
+            kg (KnowledgeGraph): Current knowledge graph (for individual pool).
+
+        Returns:
+            Optional[Triple]: Corrupted negative triple, or None if no candidates.
+        """
+        if random.random() < 0.5:
+            # Corrupt subject
+            candidates = self._get_valid_candidates(triple.predicate, "subject", kg)
+            candidates = [i for i in candidates if i != triple.subject]
+
+            if not candidates:
+                # Fallback: corrupt object instead
+                candidates = self._get_valid_candidates(triple.predicate, "object", kg)
+                candidates = [i for i in candidates if i != triple.object]
+                if not candidates:
+                    return None
+                new_obj = random.choice(candidates)
+                return Triple(
+                    triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
+                )
+
+            new_subj = random.choice(candidates)
+            return Triple(
+                new_subj, triple.predicate, triple.object, positive=False, proofs=[]
+            )
+        else:
+            # Corrupt object
+            candidates = self._get_valid_candidates(triple.predicate, "object", kg)
+            candidates = [i for i in candidates if i != triple.object]
+
+            if not candidates:
+                # Fallback: corrupt subject instead
+                candidates = self._get_valid_candidates(triple.predicate, "subject", kg)
+                candidates = [i for i in candidates if i != triple.subject]
+                if not candidates:
+                    return None
+                new_subj = random.choice(candidates)
+                return Triple(
+                    new_subj, triple.predicate, triple.object, positive=False, proofs=[]
+                )
+
+            new_obj = random.choice(candidates)
+            return Triple(
+                triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
+            )
+
+    def _creates_inconsistency(self, neg_triple: Triple, kg: KnowledgeGraph) -> bool:
+        """
+        Checks if a negative triple would create inconsistency.
+
+        A negative triple is inconsistent if its positive version
+        exists in the knowledge graph.
+
+        Args:
+            neg_triple (Triple): Negative triple to check.
+            kg (KnowledgeGraph): Current knowledge graph.
+
+        Returns:
+            bool: True if inconsistent, False otherwise.
+        """
+        # Check if positive version exists
+        for triple in kg.triples:
+            if (
+                triple.positive
+                and triple.subject.name == neg_triple.subject.name
+                and triple.predicate.name == neg_triple.predicate.name
+                and triple.object.name == neg_triple.object.name
+            ):
+                return True
+
+        return False
 
     def build_knowledge_graph(self) -> KnowledgeGraph:
         """
@@ -553,7 +777,13 @@ def main():
         help="Max number of proofs to generate for any single atom (default: None)",
     )
     parser.add_argument(
+        "--add-negatives",
+        action="store_true",
+        help="Generate negative samples (local CWA)",
+    )
+    parser.add_argument(
         "--verbose",
+        action="store_true",
         help="Enable verbose logging",
     )
     args = parser.parse_args()
@@ -571,7 +801,7 @@ def main():
         )
 
         # Run Generation
-        kg = generator.generate_data()
+        kg = generator.generate_data(add_negatives=args.add_negatives)
 
         # Print Summary
         print("\n--- Knowledge Graph Generation Summary ---")

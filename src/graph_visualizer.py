@@ -40,7 +40,7 @@ class GraphVisualizer:
         dot.engine = "neato"
         dot.attr(overlap="false")
         dot.attr(splines="true")
-        dot.attr(sep="+10")  # Minimum distance between nodes
+        dot.attr(sep="+25")  # Minimum distance between nodes
 
         # Node attributes
         dot.attr(
