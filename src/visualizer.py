@@ -13,11 +13,7 @@ import os
 import sys
 from typing import Dict, List, Set, Optional, Tuple, Any
 from collections import defaultdict
-
-try:
-    import graphviz
-except ImportError:
-    graphviz = None
+import graphviz
 
 # Custom imports
 from data_structures import (
@@ -28,12 +24,15 @@ from data_structures import (
     Individual,
     Class,
     Relation,
+    KnowledgeGraph,
 )
 
-# REFACTORED: Import KGenerator from generator.py
 from generator import KGenerator
 
 from rdflib.namespace import RDF
+
+import networkx as nx
+import matplotlib.pyplot as plt
 
 
 class ProofTreeVisualizer:
@@ -73,7 +72,7 @@ class ProofTreeVisualizer:
 
     def visualize_all_proofs(
         self,
-        generator: KGenerator,
+        generator: "KGenerator",
         rule_names: Optional[List[str]] = None,
         max_proofs_per_rule: int = 5,
         show_invalid_proofs: bool = False,
@@ -660,6 +659,63 @@ class ProofTreeVisualizer:
         return stats
 
 
+class GraphVisualizer:
+    """
+    Visualizes the Knowledge Graph using NetworkX and Matplotlib.
+    """
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def visualize(self, kg: KnowledgeGraph, filename: str):
+        """
+        Exports the Knowledge Graph as an image.
+        """
+        G = nx.DiGraph()
+
+        # Add nodes for individuals
+        for ind in kg.individuals:
+            G.add_node(ind.name, type="Individual", color="lightblue")
+
+        # Add edges for triples
+        for triple in kg.triples:
+            G.add_edge(
+                triple.subject.name, triple.object.name, label=triple.predicate.name
+            )
+
+        # Add edges for memberships
+        for membership in kg.memberships:
+            cls_name = membership.cls.name
+            G.add_node(cls_name, type="Class", color="lightgreen")
+            G.add_edge(membership.individual.name, cls_name, label="rdf:type")
+
+        plt.figure(figsize=(12, 12))
+        pos = nx.spring_layout(G, k=0.5, iterations=50)
+
+        # Draw nodes
+        node_colors = [G.nodes[n].get("color", "lightblue") for n in G.nodes]
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=700)
+
+        # Draw labels
+        nx.draw_networkx_labels(G, pos, font_size=10, font_family="sans-serif")
+
+        # Draw edges
+        nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5, arrows=True, arrowsize=20)
+
+        # Draw edge labels
+        edge_labels = nx.get_edge_attributes(G, "label")
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+
+        plt.title("Knowledge Graph Visualization")
+        plt.axis("off")
+
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, format="png", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Graph saved to {filepath}")
+
+
 def main():
     """
     Main entry point for the visualizer.
@@ -716,6 +772,8 @@ def main():
     # ==================== RUN VISUALIZATION PIPELINE ==================== #
 
     try:
+        from generator import KGenerator
+
         # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         print(f"Initializing KGenerator from: {args.ontology_path}")
         generator = KGenerator(

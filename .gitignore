@@ -214,3 +214,6 @@ __marimo__/
 .DS_Store
 .agent
 .github
+
+train-test-graphs/
+full-graphs/

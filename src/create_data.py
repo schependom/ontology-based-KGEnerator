@@ -55,6 +55,7 @@ from generator import (
     extract_all_atoms_from_proof,
     atoms_to_knowledge_graph,
 )
+from visualizer import GraphVisualizer
 
 
 class KGEDatasetGenerator:
@@ -903,6 +904,16 @@ def main():
     # Save to CSV
     save_dataset_to_csv(train_samples, f"{args.output}/train", prefix="train_sample")
     save_dataset_to_csv(test_samples, f"{args.output}/test", prefix="test_sample")
+
+    # Visualize
+    print("\nVisualizing samples...")
+    visualizer = GraphVisualizer("train-test-graphs")
+
+    for i, sample in enumerate(train_samples):
+        visualizer.visualize(sample, f"train_sample_{i + 1}.png")
+
+    for i, sample in enumerate(test_samples):
+        visualizer.visualize(sample, f"test_sample_{i + 1}.png")
 
     print("\n✓ Dataset generation complete!")
     print(f"  Training samples: {args.output}/train/")
