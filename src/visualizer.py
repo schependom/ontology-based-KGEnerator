@@ -37,14 +37,8 @@ import matplotlib.pyplot as plt
 
 class ProofTreeVisualizer:
     """
-    Enhanced visualizer that tracks and displays variable substitutions
+    Visualizer that tracks and displays variable substitutions
     throughout the proof tree, and validates proofs against constraints.
-
-    This visualizer reconstructs the variable bindings at each step of the
-    proof by matching rule patterns against ground instances, providing
-    insight into how the backward chainer generates individuals and builds proofs.
-
-    REFACTORED: Now uses KGenerator for proof generation.
     """
 
     def __init__(self, output_dir: str = "output"):
@@ -83,8 +77,6 @@ class ProofTreeVisualizer:
         For each rule, generates up to max_proofs_per_rule proof trees,
         creating both text and graphical representations.
 
-        REFACTORED: Now uses KGenerator's generate_proofs_for_rule method.
-
         Args:
             generator (KGenerator): The KGenerator instance to use.
             rule_names (Optional[List[str]]): List of rule names to visualize.
@@ -110,7 +102,6 @@ class ProofTreeVisualizer:
             print(f"Rule: {rule_name}")
             print(f"{'-' * 80}")
 
-            # REFACTORED: Use KGenerator's generate_proofs_for_rule method
             try:
                 proofs = generator.generate_proofs_for_rule(
                     rule_name=rule_name,
@@ -772,9 +763,6 @@ def main():
     # ==================== RUN VISUALIZATION PIPELINE ==================== #
 
     try:
-        from generator import KGenerator
-
-        # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         print(f"Initializing KGenerator from: {args.ontology_path}")
         generator = KGenerator(
             ontology_file=args.ontology_path,

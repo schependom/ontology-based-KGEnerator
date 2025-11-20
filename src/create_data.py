@@ -89,7 +89,6 @@ class KGEDatasetGenerator:
         self.neg_strategy = neg_strategy
         self.max_recursion_cap = max_recursion
 
-        # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         if self.verbose:
             print(f"Initializing KGenerator from: {ontology_file}")
 
