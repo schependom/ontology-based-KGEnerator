@@ -21,6 +21,7 @@ WORKFLOW
        - Generates negative samples via local CWA
     3. Generate M test samples using same process
     4. Save datasets to CSV files for KGE training
+    5. Visualize samples as graphs using Graphviz and save them as images
 
 AUTHOR
 
@@ -66,10 +67,12 @@ class KGEDatasetGenerator:
     def __init__(
         self,
         ontology_file: str,
-        max_recursion: int = 2,
+        max_recursion: int,
+        global_max_depth: int,
+        max_proofs_per_atom: int,
+        neg_strategy: str,  # "random" or "constrained"
+        verbose: bool,
         seed: Optional[int] = None,
-        neg_strategy: str = "random",  # "random" or "typed"
-        verbose: bool = False,
     ):
         """
         Initializes the dataset generator.
@@ -77,8 +80,10 @@ class KGEDatasetGenerator:
         Args:
             ontology_file (str):    Path to the .ttl ontology file.
             max_recursion (int):    Maximum depth for recursive rules.
+            global_max_depth (int): Hard limit on total proof tree depth.
+            max_proofs_per_atom (int): Max number of proofs to generate for any single atom.
             seed (Optional[int]):   Random seed for reproducibility.
-            neg_strategy (str):     Negative sampling strategy ("random" or "typed").
+            neg_strategy (str):     Negative sampling strategy ("random" or "constrained").
             verbose (bool):         Enable detailed logging.
         """
         if seed is not None:
@@ -95,6 +100,8 @@ class KGEDatasetGenerator:
         self.generator = KGenerator(
             ontology_file=ontology_file,
             max_recursion=max_recursion,
+            global_max_depth=global_max_depth,
+            max_proofs_per_atom=max_proofs_per_atom,
             verbose=False,  # Keep generator quiet during batch generation
         )
 
@@ -392,8 +399,7 @@ class KGEDatasetGenerator:
             candidates = [c for c in all_classes if c.name not in current_classes]
             if candidates:
                 neg_cls = random.choice(candidates)
-                # Verify no disjointness violation?
-                # Actually, for a negative sample (False fact), we want facts that are NOT true.
+                # For a negative sample (False fact), we want facts that are NOT true.
                 # Being disjoint makes it definitely false (a good negative).
                 neg_mem = Membership(
                     individual=pos_mem.individual,
@@ -405,47 +411,7 @@ class KGEDatasetGenerator:
 
         kg.memberships.extend(negative_memberships)
 
-        # 3. ATTRIBUTE NEGATIVES
-        # Generate negatives by corrupting the value
-        positive_attrs = kg.attribute_triples
-        negative_attrs = []
-
-        # Build pool of values per attribute to create "hard" negatives
-        values_by_attr = defaultdict(list)
-        for attr in positive_attrs:
-            values_by_attr[attr.predicate.name].append(attr.value)
-
-        for pos_attr in positive_attrs:
-            attr_name = pos_attr.predicate.name
-            pool = values_by_attr[attr_name]
-
-            # Try to find a different value from the pool (Hard Negative)
-            candidates = [v for v in pool if v != pos_attr.value]
-
-            if not candidates:
-                # Fallback: Generate random dummy value if no other values exist
-                if isinstance(pos_attr.value, int):
-                    new_val = pos_attr.value + 1
-                elif isinstance(pos_attr.value, float):
-                    new_val = pos_attr.value + 0.1
-                else:
-                    new_val = str(pos_attr.value) + "_neg"
-            else:
-                new_val = random.choice(candidates)
-
-            # Check if this negative already exists as a positive (multi-valued attr?)
-            is_existing = False
-            for existing in positive_attrs:
-                if (
-                    existing.subject == pos_attr.subject
-                    and existing.predicate == pos_attr.predicate
-                    and existing.value == new_val
-                ):
-                    is_existing = True
-                    break
-            if is_existing:
-                print("Warning: Could not create unique negative attribute triple")
-                pass  # Skip adding this negative
+        # No attribute negatives yet (20/11/2026)
 
         return kg
 
@@ -466,7 +432,7 @@ class KGEDatasetGenerator:
         if self.neg_strategy == "random":
             return kg.individuals
 
-        # For "typed" strategy, filter by domain/range
+        # For "constrained" strategy, filter by domain/range
         required_classes = set()
         if position == "subject":
             required_classes = self.parser.domains.get(relation.name, set())
@@ -821,7 +787,7 @@ def main():
         description="Generate RRN training/testing datasets from an ontology with constraint checking"
     )
     parser.add_argument(
-        "--ontology",
+        "--ontology-path",
         type=str,
         required=True,
         help="Path to the ontology file (.ttl format)",
@@ -853,14 +819,26 @@ def main():
     parser.add_argument(
         "--max-individuals",
         type=int,
-        default=30,
+        default=60,
         help="Maximum individuals per sample",
     )
     parser.add_argument(
         "--max-recursion",
         type=int,
-        default=6,
+        default=10,
         help="Maximum recursion depth for rules",
+    )
+    parser.add_argument(
+        "--global-max-depth",
+        type=int,
+        default=20,
+        help="Hard limit on total proof tree depth",
+    )
+    parser.add_argument(
+        "--max-proofs-per-atom",
+        type=int,
+        default=30,
+        help="Max number of proofs to generate for any single atom",
     )
     parser.add_argument(
         "--seed",
@@ -871,9 +849,9 @@ def main():
     parser.add_argument(
         "--neg-strategy",
         type=str,
-        default="random",
-        choices=["random", "typed"],
-        help="Negative sampling strategy: 'random' (any individual) or 'typed' (respects domain/range)",
+        default="constrained",
+        choices=["random", "constrained"],
+        help="Negative sampling strategy: 'random' (any individual) or 'constrained' (respects domain/range)",
     )
     parser.add_argument(
         "--verbose",
@@ -885,8 +863,10 @@ def main():
 
     # Initialize generator
     generator = KGEDatasetGenerator(
-        ontology_file=args.ontology,
+        ontology_file=args.ontology_path,
         max_recursion=args.max_recursion,
+        global_max_depth=args.global_max_depth,
+        max_proofs_per_atom=args.max_proofs_per_atom,
         seed=args.seed,
         neg_strategy=args.neg_strategy,
         verbose=args.verbose,

@@ -28,7 +28,9 @@ from the `src/` directory as they import sibling modules:
 python src/proof_visualizer.py --ontology-path data/toy.ttl --output-dir output
 
 # Generate datasets (CSV output)
-python src/create_data.py --ontology data/family.ttl --output data/out
+python src/create_data.py --ontology-path data/family.ttl --output data/out
 ```
+
+For more details on the available options, run with `--help`.
 
 Work in progress as of 20/11/2025.

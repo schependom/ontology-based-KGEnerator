@@ -11,7 +11,7 @@ WORKFLOW
         - Generate new individuals as needed for unbound variables.
         - Track recursive rule usage to prevent infinite loops.
         - Track atoms in proof path to prevent circular reasoning.
-        - CHECK CONSTRAINTS after generating each proof to ensure validity.
+        - Check constriants after generating each proof to ensure validity.
 
 AUTHOR
 
@@ -60,6 +60,7 @@ class BackwardChainer:
         constraints: List[Constraint] = None,
         max_recursion_depth: int = 2,
         global_max_depth: int = 5,
+        max_proofs_per_atom: int = None,
         verbose: bool = False,
     ):
         """
@@ -71,6 +72,7 @@ class BackwardChainer:
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
             global_max_depth (int):             Hard limit on total proof tree depth.
+            max_proofs_per_atom (int):          Max number of proofs to generate for any single atom.
             verbose (bool):                     Enable detailed debug output.
         """
         # Store rules as dict {rule_name: ExecutableRule} for fast lookup
@@ -78,6 +80,7 @@ class BackwardChainer:
         self.constraints = constraints if constraints else []
         self.max_recursion_depth = max_recursion_depth
         self.global_max_depth = global_max_depth
+        self.max_proofs_per_atom = max_proofs_per_atom
         self.verbose = verbose
 
         # Index rules by their conclusion for O(1) lookup
@@ -795,11 +798,19 @@ class BackwardChainer:
                 )
             return  # Yield nothing - this would be circular
 
+        yielded_count = 0
+
         # ==================== BASE CASE ==================== #
         # Allow this atom to be proven as a base fact
         if self.verbose:
             print(f"{indent}  ✓ Yielding BASE FACT proof")
         yield Proof.create_base_proof(goal_atom)
+        yielded_count += 1
+        if self.max_proofs_per_atom and yielded_count >= self.max_proofs_per_atom:
+            print(
+                f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
+            )
+            return
 
         # ==================== RECURSIVE CASE ==================== #
         # Try to derive using rules
@@ -985,6 +996,16 @@ class BackwardChainer:
                     rule=original_rule,  # Use unrenamed rule
                     sub_proofs=list(sub_proof_combination),
                 )
+                yielded_count += 1
+                if (
+                    self.max_proofs_per_atom
+                    and yielded_count >= self.max_proofs_per_atom
+                ):
+                    if self.verbose:
+                        print(
+                            f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
+                        )
+                    return
 
     def _format_atom(self, atom: Atom) -> str:
         """

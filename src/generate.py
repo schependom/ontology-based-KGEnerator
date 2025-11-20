@@ -3,6 +3,13 @@ DESCRIPTION:
 
     Knowledge Graph Generator.
 
+    Running this file as a script will execute the full data generation
+    pipeline from ontology to complete knowledge graph. Note that the Knowledge
+    Graph generated here is the FULL graph with ALL derivable facts, so may be
+    extremely large depending on the ontology and rules.
+
+    Use create_data.py to generate train/test splits.
+
 WORKFLOW:
 
     1. Parse the ontology using OntologyParser to extract:
@@ -216,7 +223,9 @@ class KGenerator:
     def __init__(
         self,
         ontology_file: str,
-        max_recursion,
+        max_recursion: int,
+        global_max_depth: int = 5,
+        max_proofs_per_atom: int = None,
         verbose: bool = False,
     ):
         """
@@ -227,6 +236,8 @@ class KGenerator:
             max_recursion (int): The maximum depth for recursive rules.
                                  This prevents infinite recursion in rules like:
                                  parent(X,Y) ∧ parent(Y,Z) → ancestor(X,Z)
+            global_max_depth (int): Hard limit on total proof tree depth.
+            max_proofs_per_atom (int): Max number of proofs to generate for any single atom.
             verbose (bool): Enable detailed logging.
         """
         self.verbose = verbose
@@ -246,8 +257,9 @@ class KGenerator:
             all_rules=self.parser.rules,
             constraints=self.parser.constraints,
             max_recursion_depth=max_recursion,
+            global_max_depth=global_max_depth,
+            max_proofs_per_atom=max_proofs_per_atom,
             verbose=verbose,
-            global_max_depth=5,
         )
 
         # Store schemas from the parser
@@ -510,6 +522,8 @@ def main():
 
     default_ontology_path = "data/toy.ttl"
     default_max_recursion = 3
+    default_global_max_depth = 5
+    default_max_proofs = None
 
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator with Constraint Checking"
@@ -527,8 +541,19 @@ def main():
         help=f"Maximum depth for recursive rules (default: {default_max_recursion})",
     )
     parser.add_argument(
+        "--global-max-depth",
+        type=int,
+        default=default_global_max_depth,
+        help=f"Hard limit on total proof tree depth (default: {default_global_max_depth})",
+    )
+    parser.add_argument(
+        "--max-proofs-per-atom",
+        type=int,
+        default=default_max_proofs,
+        help="Max number of proofs to generate for any single atom (default: None)",
+    )
+    parser.add_argument(
         "--verbose",
-        action="store_true",
         help="Enable verbose logging",
     )
     args = parser.parse_args()
@@ -540,6 +565,8 @@ def main():
         generator = KGenerator(
             args.ontology_path,
             max_recursion=args.max_recursion,
+            global_max_depth=args.global_max_depth,
+            max_proofs_per_atom=args.max_proofs_per_atom,
             verbose=args.verbose,
         )
 
