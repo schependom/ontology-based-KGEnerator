@@ -1,115 +1,154 @@
 """
 DESCRIPTION:
-
-    Visualizes the Knowledge Graph using Graphviz.
-
-AUTHOR:
-
-    Vincent Van Schependom
+    Visualizes complete Knowledge Graphs (Train/Test samples).
+    Highlights the difference between Base Facts and Inferred Facts.
+    Displays Class Memberships inside nodes and highlights Negative Facts.
 """
 
 import os
-from collections import defaultdict
+import sys
 import graphviz
-
+from collections import defaultdict
+from typing import Optional
 from data_structures import KnowledgeGraph
 
 
 class GraphVisualizer:
-    """
-    Visualizes the Knowledge Graph using Graphviz.
-    """
-
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str = "output_graphs"):
         self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-    def visualize(self, kg: KnowledgeGraph, filename: str):
+    def visualize(
+        self, kg: KnowledgeGraph, filename: str, title: Optional[str] = None
+    ) -> None:
         """
-        Exports the Knowledge Graph as an image using Graphviz.
+        Visualizes a KnowledgeGraph instance.
         """
-        # Remove extension as graphviz adds it based on format
-        name = os.path.splitext(filename)[0]
-        file_format = os.path.splitext(filename)[1][1:] or "png"
+        if "graphviz" not in sys.modules:
+            return
 
-        dot = graphviz.Digraph(name=name, format=file_format)
+        name_no_ext = os.path.splitext(filename)[0]
+        dot = graphviz.Digraph(comment=name_no_ext)
 
-        # Use 'neato' (spring model) or 'fdp' for better non-hierarchical layout
-        # 'overlap=false' helps prevent node overlaps
-        # 'splines=true' makes edges curved to avoid passing through nodes
-        dot.engine = "neato"
-        dot.attr(overlap="false")
-        dot.attr(splines="true")
-        dot.attr(sep="+25")  # Minimum distance between nodes
+        # Layout settings
+        dot.attr(layout="sfdp")
+        dot.attr(overlap="prism")
+        dot.attr(sep="+12")
+        dot.attr(splines="curved")
+        dot.attr(nodesep="0.8")
 
-        # Node attributes
-        dot.attr(
-            "node",
-            shape="circle",
-            style="filled",
-            fillcolor="lightblue",
-            fontname="Helvetica",
-            fontsize="12",
-            margin="0.1",
-        )
+        if title:
+            dot.attr(label=title, labelloc="t", fontsize="20")
 
-        # Edge attributes
-        dot.attr(
-            "edge", fontname="Helvetica", fontsize="10", len="2.0"
-        )  # Target edge length for neato
+        # ---------------------------------------------------------
+        # 1. PRE-PROCESS CLASS MEMBERSHIPS
+        # ---------------------------------------------------------
+        # Group classes by individual to list them inside the node
+        ind_classes = defaultdict(list)
+        for mem in kg.memberships:
+            if mem.is_member:
+                ind_classes[mem.individual.name].append(mem.cls.name)
 
-        # Collect memberships per individual
-        individual_classes = defaultdict(list)
-        for membership in kg.memberships:
-            if membership.is_member:
-                individual_classes[membership.individual.name].append(
-                    membership.cls.name
-                )
+        # ---------------------------------------------------------
+        # 2. ADD NODES (Individuals with Classes)
+        # ---------------------------------------------------------
+        added_nodes = set()
 
-        # Add nodes
         for ind in kg.individuals:
-            label = ind.name
-            classes = individual_classes.get(ind.name, [])
-            if classes:
-                label += f"\n({', '.join(classes)})"
+            if ind.name not in added_nodes:
+                # Construct HTML Label
+                classes = ind_classes.get(ind.name, [])
 
-            dot.node(ind.name, label=label)
+                # Main Name
+                label_html = f"<B>{ind.name}</B>"
 
-        # Group edges by (source, target) to merge labels
-        edges = defaultdict(lambda: {"positive": [], "negative": []})
+                # Append Classes if they exist
+                if classes:
+                    # Sort for consistency
+                    classes_str = "<BR/>".join(sorted(classes))
+                    label_html += f"<BR/><FONT POINT-SIZE='10' COLOR='#6A1B9A'><I>{classes_str}</I></FONT>"
 
-        for triple in kg.triples:
-            key = (triple.subject.name, triple.object.name)
-            if triple.positive:
-                edges[key]["positive"].append(triple.predicate.name)
-            else:
-                edges[key]["negative"].append(triple.predicate.name)
+                # Wrap in HTML-like bracket
+                final_label = f"<{label_html}>"
 
-        # Add edges
-        for (u, v), data in edges.items():
-            # Add positive edges (merged)
-            if data["positive"]:
-                # Deduplicate labels
-                labels = sorted(list(set(data["positive"])))
-                label = "\n".join(labels)
-                dot.edge(u, v, label=label, color="black")
-
-            # Add negative edges (merged)
-            if data["negative"]:
-                # Deduplicate labels
-                labels = sorted(list(set(data["negative"])))
-                label = "\n".join(labels)
-                dot.edge(
-                    u, v, label=label, color="red", style="dashed", fontcolor="red"
+                dot.node(
+                    ind.name,
+                    label=final_label,
+                    shape="box",
+                    style="rounded,filled",
+                    fillcolor="#FFF9C4",
+                    fontname="Helvetica",
                 )
+                added_nodes.add(ind.name)
 
-        output_path = os.path.join(self.output_dir, name)
-        try:
-            # render() saves the source file and then renders it
-            output_file = dot.render(output_path, cleanup=True)
-            print(f"Graph saved to {output_file}")
-        except Exception as e:
-            print(f"Error rendering graph with Graphviz: {e}")
-            print(
-                "Ensure Graphviz is installed on your system (e.g., 'brew install graphviz')."
+        # ---------------------------------------------------------
+        # 3. ADD ATTRIBUTE VALUES (Literals)
+        # ---------------------------------------------------------
+        for attr in kg.attribute_triples:
+            val_str = str(attr.value)
+            node_id = f"lit_{val_str}"
+            if node_id not in added_nodes:
+                dot.node(
+                    node_id,
+                    label=val_str,
+                    shape="box",
+                    style="filled",
+                    fillcolor="#F5F5F5",
+                    fontname="Courier",
+                )
+                added_nodes.add(node_id)
+
+            dot.edge(
+                attr.subject.name,
+                node_id,
+                label=attr.predicate.name,
+                fontsize="10",
+                color="#757575",
             )
+
+        # ---------------------------------------------------------
+        # 4. ADD RELATIONAL EDGES
+        # ---------------------------------------------------------
+        for triple in kg.triples:
+            # --- COLOR LOGIC (Polarity) ---
+            if not triple.positive:
+                break
+                color = "#D32F2F"  # Red for negative
+                fontcolor = "#D32F2F"
+                label_prefix = "¬ "  # Logical NOT symbol
+            else:
+                label_prefix = ""
+                # Positive Base = Black, Positive Inferred = Blue
+                if triple.is_base_fact:
+                    color = "black"
+                    fontcolor = "black"
+                else:
+                    color = "#1565C0"  # Blue
+                    fontcolor = "#1565C0"
+
+            # --- STYLE LOGIC (Derivation) ---
+            if triple.is_base_fact:
+                style = "solid"
+                penwidth = "2.5"  # Thick for visibility
+            else:
+                style = "dashed"
+                penwidth = "1.0"  # Thin for inferred
+
+            # Create Edge
+            dot.edge(
+                triple.subject.name,
+                triple.object.name,
+                label=f"{label_prefix}{triple.predicate.name}",
+                color=color,
+                style=style,
+                penwidth=penwidth,
+                fontcolor=fontcolor,
+            )
+
+        # Render
+        output_path = os.path.join(self.output_dir, name_no_ext)
+        try:
+            dot.render(output_path, format="png", cleanup=True)
+            print(f"Graph Saved: {output_path}.png")
+        except Exception as e:
+            print(f"GraphViz Error: {e}")

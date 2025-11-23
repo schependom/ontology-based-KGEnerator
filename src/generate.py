@@ -38,6 +38,7 @@ AUTHOR
     Vincent Van Schependom
 """
 
+from collections import defaultdict
 import sys
 import argparse
 import traceback
@@ -67,6 +68,28 @@ from graph_visualizer import GraphVisualizer
 # ============================================================================ #
 #                         SHARED UTILITY FUNCTIONS                             #
 # ============================================================================ #
+
+
+def extract_proof_map(proof: Proof) -> Dict[Atom, List[Proof]]:
+    """
+    Recursively extracts atoms and maps them to the proofs that derive them.
+
+    Unlike 'extract_all_atoms_from_proof', this preserves the Proof objects,
+    allowing us to determine if a fact was derived (Rule) or is base (None).
+    """
+    # map: Atom -> List[Proof]
+    proof_map = defaultdict(list)
+
+    # 1. Map the goal of this specific proof node
+    proof_map[proof.goal].append(proof)
+
+    # 2. Recursively collect from sub-proofs
+    for sub_proof in proof.sub_proofs:
+        sub_map = extract_proof_map(sub_proof)
+        for atom, proofs in sub_map.items():
+            proof_map[atom].extend(proofs)
+
+    return proof_map
 
 
 def extract_all_atoms_from_proof(proof: Proof) -> Set[Atom]:
@@ -118,6 +141,7 @@ def atoms_to_knowledge_graph(
     schema_classes: Dict[str, Class],
     schema_relations: Dict[str, Relation],
     schema_attributes: Dict[str, Attribute],
+    proof_map: Optional[Dict[Atom, List[Proof]]],
 ) -> KnowledgeGraph:
     """
     Converts a set of ground atoms into a KnowledgeGraph.
@@ -154,43 +178,44 @@ def atoms_to_knowledge_graph(
     for atom in atoms:
         s, p, o = atom.subject, atom.predicate, atom.object
 
-        # Class membership: (Individual, rdf:type, Class)
+        # Get proofs for this atom if available
+        current_proofs = []
+        if proof_map and atom in proof_map:
+            current_proofs = proof_map[atom]
+
+        # 1. MEMBERSHIPS
         if p == RDF.type and isinstance(o, Class):
             register_individual(s)
             key = (s.name, o.name)
             if key not in memberships:
-                memberships[key] = Membership(
-                    individual=s,
-                    cls=o,
-                    is_member=True,
-                    proofs=[],
-                )
+                memberships[key] = Membership(s, o, True, proofs=[])
 
-        # Relational triple: (Individual, Relation, Individual)
+            # Attach proofs
+            if current_proofs:
+                memberships[key].proofs.extend(current_proofs)
+
+        # 2. RELATIONAL TRIPLES
         elif isinstance(o, Individual) and isinstance(p, Relation):
             register_individual(s)
             register_individual(o)
             key = (s.name, p.name, o.name)
             if key not in triples:
-                triples[key] = Triple(
-                    subject=s,
-                    predicate=p,
-                    object=o,
-                    positive=True,
-                    proofs=[],
-                )
+                triples[key] = Triple(s, p, o, True, proofs=[])
 
-        # Attribute triple: (Individual, Attribute, LiteralValue)
+            # Attach proofs
+            if current_proofs:
+                triples[key].proofs.extend(current_proofs)
+
+        # 3. ATTRIBUTES
         elif isinstance(p, Attribute):
             register_individual(s)
             key = (s.name, p.name, o)
             if key not in attr_triples:
-                attr_triples[key] = AttributeTriple(
-                    subject=s,
-                    predicate=p,
-                    value=o,
-                    proofs=[],
-                )
+                attr_triples[key] = AttributeTriple(s, p, o, proofs=[])
+
+            # Attach proofs
+            if current_proofs:
+                attr_triples[key].proofs.extend(current_proofs)
 
     # Create knowledge graph
     return KnowledgeGraph(

@@ -28,6 +28,7 @@ AUTHOR
     Vincent Van Schependom
 """
 
+from collections import defaultdict
 import random
 import argparse
 from pathlib import Path
@@ -43,6 +44,7 @@ from generate import (
     KGenerator,
     extract_all_atoms_from_proof,
     atoms_to_knowledge_graph,
+    extract_proof_map,
 )
 from graph_visualizer import GraphVisualizer
 
@@ -277,54 +279,48 @@ class KGEDatasetGenerator:
         # Randomly select the specific rules
         selected_rules = random.sample(self.rules, n_rules)
 
-        all_atoms: Set[Atom] = set()
+        # Dictionary to store Atoms AND their Proofs
+        # Dict[Atom, List[Proof]]
+        sample_proof_map = defaultdict(list)
+        atoms_found = False
 
-        # Generate proofs and extract atoms
         for rule in selected_rules:
-            try:
-                proofs = self.generator.generate_proofs_for_rule(
-                    rule_name=rule.name,
-                    max_proofs=5,  # generate all proofs
-                )
-
-                if not proofs:
-                    continue
-
-                # ----------------------------------------------------------------
-                # VARIANCE STRATEGY 3: RAND NB OF PROOFS PER RULE
-                # ----------------------------------------------------------------
-
-                n_proofs = random.randint(1, len(proofs))
-                selected_proofs = random.sample(proofs, n_proofs)
-
-                for proof in selected_proofs:
-                    all_atoms.update(extract_all_atoms_from_proof(proof))
-
-            except Exception as e:
-                if self.verbose:
-                    print(
-                        f"Warning: Failed to generate proofs for rule {rule.name}: {e}"
-                    )
+            proofs = self.generator.generate_proofs_for_rule(rule.name, max_proofs=5)
+            if not proofs:
                 continue
 
-        # Check if we have any atoms
-        if not all_atoms:
+            # Select random subset of proofs
+            n_select = random.randint(1, len(proofs))
+            selected = random.sample(proofs, n_select)
+
+            for proof in selected:
+                # USE THE NEW HELPER HERE
+                # This extracts {Atom: [Proof, ...]}
+                extracted_map = extract_proof_map(proof)
+
+                # Merge into main map
+                for atom, proof_list in extracted_map.items():
+                    sample_proof_map[atom].extend(proof_list)
+
+                atoms_found = True
+
+        if not atoms_found:
             return None
 
-        # Convert atoms to knowledge graph
+        # Convert atoms to KG, PASSING THE PROOF MAP
         kg = atoms_to_knowledge_graph(
-            atoms=all_atoms,
+            atoms=set(sample_proof_map.keys()),
             schema_classes=self.schema_classes,
             schema_relations=self.schema_relations,
             schema_attributes=self.schema_attributes,
+            proof_map=sample_proof_map,  # <--- This ensures proofs are attached!
         )
 
-        # Check size constraints
-        n_individuals = len(kg.individuals)
-        if n_individuals < min_individuals or n_individuals > max_individuals:
+        # Validate size
+        if not (min_individuals <= len(kg.individuals) <= max_individuals):
             return None
 
-        # Add negative samples
+        # Add Negatives (using generator logic)
         kg = self.generator.add_negative_samples(kg)
 
         return kg
@@ -606,7 +602,7 @@ def main():
     parser.add_argument(
         "--min-individuals",
         type=int,
-        default=5,
+        default=10,
         help="Minimum individuals per sample",
     )
     parser.add_argument(
@@ -677,19 +673,22 @@ def main():
     save_dataset_to_csv(train_samples, f"{args.output}/train", prefix="train_sample")
     save_dataset_to_csv(test_samples, f"{args.output}/test", prefix="test_sample")
 
-    # Visualize
     print("\nVisualizing samples...")
     visualizer = GraphVisualizer("train-test-graphs")
 
     for i, sample in enumerate(train_samples):
-        visualizer.visualize(sample, f"train_sample_{i + 1}.png")
+        # Visualize Graph
+        visualizer.visualize(
+            sample, f"train_sample_{i + 1}.png", title=f"TRAIN Sample {i + 1}"
+        )
 
     for i, sample in enumerate(test_samples):
-        visualizer.visualize(sample, f"test_sample_{i + 1}.png")
+        # Visualize Graph
+        visualizer.visualize(
+            sample, f"test_sample_{i + 1}.png", title=f"TEST Sample {i + 1}"
+        )
 
-    print("\n✓ Dataset generation complete!")
-    print(f"  Training samples: {args.output}/train/")
-    print(f"  Test samples: {args.output}/test/")
+    # FOr all
 
 
 if __name__ == "__main__":

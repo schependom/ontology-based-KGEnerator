@@ -134,7 +134,6 @@ class Membership:
     individual: Individual
     cls: Class
     is_member: bool  # True if member, False if explicitly not a member
-    # is_inferred: bool  # Still needed for old reldata compatibility
 
     # Keep track of all proofs leading to this membership fact
     proofs: List["Proof"] = field(default_factory=list)
@@ -178,7 +177,6 @@ class Triple:
     predicate: Relation
     object: Individual
     positive: bool  # True for positive predicate, False for negated predicate
-    # is_inferred: bool  # Still needed for old reldata compatibility
 
     # Keep track of all proofs leading to this triple fact
     proofs: List["Proof"] = field(default_factory=list)
@@ -649,6 +647,14 @@ class Atom:
             object=substitution.get(self.object, self.object),
         )
 
+    def get_variables(self) -> Set[Var]:
+        """Returns all variables in this atom."""
+        vars = set()
+        for term in [self.subject, self.predicate, self.object]:
+            if isinstance(term, Var):
+                vars.add(term)
+        return vars
+
 
 @dataclass
 class ExecutableRule:
@@ -751,6 +757,9 @@ class Proof:
     recursive_use_counts: frozenset[Tuple[str, int]] = field(default_factory=frozenset)
     # field() returns an empty frozenset
 
+    # Maps variables in the rule to their ground terms
+    substitutions: Dict[Var, Term] = field(default_factory=dict)
+
     def __post_init__(self):
         # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
@@ -781,7 +790,7 @@ class Proof:
         """
 
         # This is a base fact (a leaf)
-        if self.rule is None:
+        if self.is_base_fact():
             return {self.goal}
 
         # Derived fact: gather base facts from sub-proofs
@@ -790,66 +799,129 @@ class Proof:
             base_facts.update(sp.get_base_facts())
         return base_facts
 
-    def get_recursion_depth(self, rule: ExecutableRule) -> int:
-        """
-        Gets the number of times the given recursive rule was used in this proof path.
-        """
-        for name, count in self.recursive_use_counts:
-            if name == rule.name:
-                return count
-        return 0
+    def get_all_atoms(self) -> Set[Atom]:
+        """Returns all atoms (base + inferred) in this proof tree."""
+        atoms = {self.goal}
+        for sp in self.sub_proofs:
+            atoms.update(sp.get_all_atoms())
+        return atoms
 
-    def get_max_recursion_depth(self) -> int:
-        """
-        Gets the maximum depth of any recursive rule in this proof.
-        """
-        # Check if there are any recursive rules used
-        if not self.recursive_use_counts:
+    def get_depth(self) -> int:
+        """Returns the maximum depth of this proof tree."""
+        if self.is_base_fact():
             return 0
+        return 1 + max((sp.get_depth() for sp in self.sub_proofs), default=0)
 
-        # If there are, return the max count
-        return max(count for _, count in self.recursive_use_counts)
+    def get_statistics(self) -> Dict[str, Any]:
+        """Returns statistics about this proof tree."""
+        all_atoms = self.get_all_atoms()
+        base_facts = self.get_base_facts()
+
+        individuals = set()
+        for atom in all_atoms:
+            for term in [atom.subject, atom.object]:
+                if isinstance(term, Individual):
+                    individuals.add(term.name)
+
+        rules_used = set()
+
+        def collect_rules(p: Proof):
+            if p.rule:
+                rules_used.add(p.rule.name)
+            for sp in p.sub_proofs:
+                collect_rules(sp)
+
+        collect_rules(self)
+
+        return {
+            "total_atoms": len(all_atoms),
+            "base_facts": len(base_facts),
+            "inferred_facts": len(all_atoms) - len(base_facts),
+            "depth": self.get_depth(),
+            "individuals": len(individuals),
+            "rules_used": sorted(rules_used),
+            "max_recursion": max(
+                (count for _, count in self.recursive_use_counts), default=0
+            ),
+        }
+
+    def format_tree(self, indent: int = 0) -> str:
+        """Returns a formatted string representation of the proof tree."""
+        lines = []
+        prefix = "  " * indent
+
+        goal_str = self._format_atom(self.goal)
+
+        if self.is_base_fact():
+            lines.append(f"{prefix}[BASE] {goal_str}")
+        else:
+            lines.append(f"{prefix}[DERIVE] {goal_str}")
+            lines.append(f"{prefix}  via: {self.rule.name}")
+
+            if self.substitutions:
+                lines.append(f"{prefix}  subs: {self._format_subs()}")
+
+            if self.sub_proofs:
+                lines.append(f"{prefix}  from:")
+                for i, sp in enumerate(self.sub_proofs):
+                    lines.append(f"{prefix}    [{i + 1}]")
+                    lines.append(sp.format_tree(indent + 3))
+
+        return "\n".join(lines)
+
+    def _format_atom(self, atom: Atom) -> str:
+        """Helper to format an atom."""
+        s = self._format_term(atom.subject)
+        p = self._format_term(atom.predicate)
+        o = self._format_term(atom.object)
+        return f"({s}, {p}, {o})"
+
+    def _format_term(self, term: Term) -> str:
+        """Helper to format a term."""
+        if hasattr(term, "name"):
+            return term.name
+        if term == RDF.type:
+            return "rdf:type"
+        return str(term)
+
+    def _format_subs(self) -> str:
+        """Helper to format substitutions."""
+        items = [
+            f"{v.name}->{self._format_term(t)}" for v, t in self.substitutions.items()
+        ]
+        return "{" + ", ".join(items) + "}"
 
     @staticmethod
     def create_base_proof(atom: Atom) -> "Proof":
-        """
-        Creates a proof for a base fact (a leaf).
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a base fact (leaf)."""
         if not atom.is_ground():
             raise ValueError("Base fact proof must be for a ground atom.")
-
-        # Return a proof with no rule and no sub-proofs for the base fact (ground Atom)
-        return Proof(goal=atom, rule=None, sub_proofs=tuple())
+        return Proof(goal=atom, rule=None, sub_proofs=tuple(), substitutions={})
 
     @staticmethod
     def create_derived_proof(
-        goal: Atom, rule: ExecutableRule, sub_proofs: List["Proof"]
+        goal: Atom,
+        rule: ExecutableRule,
+        sub_proofs: List["Proof"],
+        substitutions: Dict[Var, Term],
     ) -> "Proof":
-        """
-        Creates a proof for a derived fact (a node), tracking recursion.
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a derived fact (node), tracking substitutions."""
         if not goal.is_ground():
-            raise ValueError("Derived proof goal must be a ground atom.")
+            raise ValueError("Derived proof goal must be ground.")
 
-        # Combine recursive_use_counts from sub-proofs
+        # Combine recursive counts from sub-proofs
         new_counts: Dict[str, int] = {}
         for sp in sub_proofs:
             for name, count in sp.recursive_use_counts:
-                # We take the MAX depth from any sub-proof branch for each rule
-                # to make sure that the depth doesn't get underestimated.
                 new_counts[name] = max(new_counts.get(name, 0), count)
 
-        # Update this rule's count if it's recursive
         if rule.is_recursive():
-            name = rule.name
-            new_counts[name] = new_counts.get(name, 0) + 1
+            new_counts[rule.name] = new_counts.get(rule.name, 0) + 1
 
-        # Return the proof
         return Proof(
             goal=goal,
             rule=rule,
             sub_proofs=tuple(sub_proofs),
             recursive_use_counts=frozenset(new_counts.items()),
+            substitutions=substitutions.copy(),  # Store the substitutions
         )
