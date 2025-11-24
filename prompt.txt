@@ -1,0 +1,32 @@
+Be critical about my current implementation. Does it align with my thesis goals?
+
+
+
+The KGenerator class should house the main data generation logic. The create_data.py file should be the main train/test split creator, and it should call the logic in the KGenerator (generate.py) to do so. The NegativeSampler should handle all sampling logic.
+
+
+
+When running generate.py on a small toy dataset, it should export all proof trees so that I can visualize verify that it's using all possible paths of deduction. 
+
+ 
+
+
+
+
+
+
+
+Remove the duplicate negative sampling logic from generate.py
+
+
+
+Refactor the codebase to meet the requirements above
+
+
+
+Keep all comments that are still relevant
+
+
+
+Remove unnecessary verbose print statements, only print when hitting errors, or important generation milestones, like no possible proofs for a rule, etc
+

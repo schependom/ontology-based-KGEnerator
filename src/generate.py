@@ -852,10 +852,10 @@ def main():
         # Print full knowledge graph
         kg.print()
 
-        # Visualize
-        print("\nVisualizing Knowledge Graph...")
-        visualizer = GraphVisualizer("full-graphs")
-        visualizer.visualize(kg, "full_knowledge_graph.png")
+        # Don't visualize for now (can be huge)
+        # print("\nVisualizing Knowledge Graph...")
+        # visualizer = GraphVisualizer("full-graphs")
+        # visualizer.visualize(kg, "full_knowledge_graph.png")
 
     # ==================== ERROR HANDLING ==================== #
 

@@ -112,7 +112,7 @@ class GraphVisualizer:
         for triple in kg.triples:
             # --- COLOR LOGIC (Polarity) ---
             if not triple.positive:
-                break
+                # break
                 color = "#D32F2F"  # Red for negative
                 fontcolor = "#D32F2F"
                 label_prefix = "¬ "  # Logical NOT symbol

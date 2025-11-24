@@ -200,13 +200,6 @@ class KGEDatasetGenerator:
         """
         Generates a list of independent knowledge graph samples.
 
-        Each sample is created by:
-            1. Randomly selecting rules to trigger
-            2. Generating proof trees for those rules (using KGenerator)
-            3. Extracting all atoms from proof trees (using shared utility)
-            4. Converting atoms to KG format (using shared utility)
-            5. Adding negative samples using local corruption (work in progress)
-
         Args:
             n_samples (int):        Number of samples to generate.
             min_individuals (int):  Min individuals per sample.
@@ -260,13 +253,6 @@ class KGEDatasetGenerator:
     ) -> Optional[KnowledgeGraph]:
         """
         Generates one complete, independent knowledge graph sample.
-
-            1. Randomly select K rules as starting points (K \\in [min_rules, max_rules])
-            2. For each rule, generate M proof trees (M \\in [1, 5])
-            3. Extract ALL atoms from all proof trees (using shared utility)
-            4. Convert atoms to KG format (using shared utility)
-            5. Add negative samples using local CWA corruption
-            6. Verify sample meets size constraints
 
         Args:
             min_individuals (int):  Minimum individuals required.
