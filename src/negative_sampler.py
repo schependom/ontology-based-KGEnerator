@@ -262,7 +262,12 @@ class NegativeSampler:
         exported_count = 0
         MAX_EXPORTS = 5
 
-        for i in range(n_negatives):
+        attempts = 0
+        max_attempts = n_negatives * 10  # Safety limit to prevent infinite loops
+
+        while len(negative_triples) < n_negatives and attempts < max_attempts:
+            attempts += 1
+
             if not triples_with_proofs:
                 break
 
@@ -278,6 +283,12 @@ class NegativeSampler:
             # Get base facts from this proof
             base_facts = proof.get_base_facts()
 
+            # Filter out RDF.type facts if we are in corrupt_base_facts mode
+            if corrupt_base_facts:
+                base_facts = {bf for bf in base_facts if bf.predicate != RDF.type}
+
+            neg_triple = None
+
             if not base_facts or not corrupt_base_facts:
                 # Corrupt the goal instead
                 neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
@@ -286,57 +297,48 @@ class NegativeSampler:
                 # This creates a negative that would break the inference chain
                 base_fact = random.choice(list(base_facts))
 
-                # Convert atom to triple and corrupt it
-                if base_fact.predicate != RDF.type:
-                    # Find corresponding triple in KG
-                    matching_triples = [
-                        t
-                        for t in kg.triples
-                        if (
-                            t.subject.name == base_fact.subject.name
-                            and t.predicate.name == base_fact.predicate.name
-                            and t.object.name == base_fact.object.name
-                            and t.positive
+                # Find corresponding triple in KG
+                matching_triples = [
+                    t
+                    for t in kg.triples
+                    if (
+                        t.subject.name == base_fact.subject.name
+                        and t.predicate.name == base_fact.predicate.name
+                        and t.object.name == base_fact.object.name
+                        and t.positive
+                    )
+                ]
+
+                if matching_triples:
+                    base_triple = matching_triples[0]
+                    neg_triple = self._corrupt_triple_random(
+                        base_triple, kg.individuals
+                    )
+
+                    # If we have a negative triple and we want to export proofs
+                    if (
+                        neg_triple
+                        # and export_proofs
+                        and output_dir
+                        and exported_count < MAX_EXPORTS
+                    ):
+                        # Create atom from negative triple
+                        new_atom = Atom(
+                            predicate=neg_triple.predicate,
+                            subject=neg_triple.subject,
+                            object=neg_triple.object,
                         )
-                    ]
 
-                    if matching_triples:
-                        base_triple = matching_triples[0]
-                        neg_triple = self._corrupt_triple_random(
-                            base_triple, kg.individuals
-                        )
+                        # Create corrupted proof
+                        corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
 
-                        # If we have a negative triple and we want to export proofs
-                        if (
-                            neg_triple
-                            # and export_proofs
-                            and output_dir
-                            and exported_count < MAX_EXPORTS
-                        ):
-                            # Create atom from negative triple
-                            new_atom = Atom(
-                                predicate=neg_triple.predicate,
-                                subject=neg_triple.subject,
-                                object=neg_triple.object,
-                            )
-
-                            # Create corrupted proof
-                            corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
-
-                            # Save visualization
-                            filename = f"corrupted_proof_{i}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
-                            full_path = os.path.join(output_dir, filename)
-                            corrupted_proof.save_visualization(full_path, format="pdf")
-                            exported_count += 1
-                            if self.verbose:
-                                print(
-                                    f"Exported corrupted proof visualization: {filename}"
-                                )
-
-                    else:
-                        continue
-                else:
-                    continue
+                        # Save visualization
+                        filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
+                        full_path = os.path.join(output_dir, filename)
+                        corrupted_proof.save_visualization(full_path, format="png")
+                        exported_count += 1
+                        if self.verbose:
+                            print(f"Exported corrupted proof visualization: {filename}")
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)

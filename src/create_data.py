@@ -305,6 +305,10 @@ class KGEDatasetGenerator:
                 atoms_found = True
 
         if not atoms_found:
+            if self.verbose:
+                print(
+                    f"  [DEBUG] Sample rejected: No atoms found for rules {[r.name for r in selected_rules]}"
+                )
             return None
 
         # Convert to KG
@@ -318,6 +322,10 @@ class KGEDatasetGenerator:
 
         # Validate size
         if not (min_individuals <= len(kg.individuals) <= max_individuals):
+            if self.verbose:
+                print(
+                    f"  [DEBUG] Sample rejected: Size mismatch. Got {len(kg.individuals)} individuals (min: {min_individuals}, max: {max_individuals})"
+                )
             return None
 
         # Add negatives via NegativeSampler
@@ -585,11 +593,11 @@ def main():
         "--n-train", type=int, default=5, help="Number of training samples"
     )
     parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
-    parser.add_argument("--min-individuals", type=int, default=20)
+    parser.add_argument("--min-individuals", type=int, default=5)
     parser.add_argument("--max-individuals", type=int, default=1000)
     parser.add_argument("--max-recursion", type=int, default=10)
     parser.add_argument("--global-max-depth", type=int, default=10)
-    parser.add_argument("--max-proofs-per-atom", type=int, default=10)
+    parser.add_argument("--max-proofs-per-atom", type=int, default=20)
     parser.add_argument(
         "--individual-pool-size", type=int, default=1000, help="Size of individual pool"
     )
