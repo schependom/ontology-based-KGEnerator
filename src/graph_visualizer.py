@@ -7,7 +7,10 @@ DESCRIPTION:
 
 import os
 import sys
-import graphviz
+try:
+    import graphviz
+except ImportError:
+    graphviz = None
 from collections import defaultdict
 from typing import Optional
 from data_structures import KnowledgeGraph
@@ -25,7 +28,8 @@ class GraphVisualizer:
         """
         Visualizes a KnowledgeGraph instance.
         """
-        if "graphviz" not in sys.modules:
+        if graphviz is None:
+            print("Warning: Graphviz not installed. Skipping visualization.")
             return
 
         name_no_ext = os.path.splitext(filename)[0]

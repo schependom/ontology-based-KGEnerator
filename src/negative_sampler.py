@@ -49,6 +49,27 @@ class NegativeSampler:
         self.domains = domains or {}
         self.ranges = ranges or {}
         self.verbose = verbose
+        
+        # Optimization: Sets for fast lookup of existing facts
+        self.existing_triples: Set[str] = set()
+        self.existing_memberships: Set[str] = set()
+
+    def _index_existing_facts(self, kg: KnowledgeGraph):
+        """Build sets of existing facts for O(1) lookup."""
+        self.existing_triples.clear()
+        self.existing_memberships.clear()
+        
+        for t in kg.triples:
+            if t.positive:
+                # Key: (subject, predicate, object)
+                key = f"{t.subject.name}|{t.predicate.name}|{t.object.name}"
+                self.existing_triples.add(key)
+                
+        for m in kg.memberships:
+            if m.is_member:
+                # Key: (individual, class)
+                key = f"{m.individual.name}|{m.cls.name}"
+                self.existing_memberships.add(key)
 
     def add_negative_samples(
         self,
@@ -69,6 +90,7 @@ class NegativeSampler:
                 - "constrained": Respects domain/range constraints
                 - "proof_based": Corrupts base facts in proof trees
                 - "type_aware": Considers class memberships
+                - "mixed": Randomly selects one of the above for each sample
             ratio: Ratio of negative to positive samples (1.0 = balanced)
             corrupt_base_facts: If True, also corrupt base facts in proofs
             export_proofs: Whether to export visualizations of corrupted proofs
@@ -77,6 +99,9 @@ class NegativeSampler:
         Returns:
             Knowledge graph with negative samples added
         """
+        # Index existing facts for fast lookup
+        self._index_existing_facts(kg)
+        
         if strategy == "random":
             return self._random_corruption(kg, ratio)
         elif strategy == "constrained":
@@ -87,6 +112,10 @@ class NegativeSampler:
             )
         elif strategy == "type_aware":
             return self._type_aware_corruption(kg, ratio)
+        elif strategy == "mixed":
+            return self._mixed_corruption(
+                kg, ratio, corrupt_base_facts, export_proofs, output_dir
+            )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -418,6 +447,139 @@ class NegativeSampler:
                 negative_triples.append(neg_triple)
 
         kg.triples.extend(negative_triples)
+        kg.triples.extend(negative_triples)
+        return kg
+
+    def _mixed_corruption(
+        self,
+        kg: KnowledgeGraph,
+        ratio: float,
+        corrupt_base_facts: bool,
+        export_proofs: bool,
+        output_dir: str,
+    ) -> KnowledgeGraph:
+        """
+        Strategy 5: Mixed corruption.
+        
+        Randomly selects a strategy for each negative sample to create a diverse dataset.
+        """
+        positive_triples = [t for t in kg.triples if t.positive]
+        n_negatives = int(len(positive_triples) * ratio)
+        negative_triples = []
+        
+        # Pre-calculate data structures needed for different strategies
+        ind_classes = self._build_individual_classes_map(kg)
+        
+        # Group individuals by their class sets (for type_aware)
+        class_groups = defaultdict(list)
+        for ind in kg.individuals:
+            classes = frozenset(ind_classes.get(ind, set()))
+            class_groups[classes].append(ind)
+            
+        triples_with_proofs = [(t, t.proofs) for t in positive_triples if t.proofs]
+        
+        strategies = ["random", "constrained", "type_aware"]
+        if triples_with_proofs:
+            strategies.append("proof_based")
+            
+        for _ in range(n_negatives):
+            if not positive_triples:
+                break
+                
+            # Pick a random strategy for this sample
+            strategy = random.choice(strategies)
+            
+            neg_triple = None
+            
+            if strategy == "random":
+                pos_triple = random.choice(positive_triples)
+                neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+                
+            elif strategy == "constrained":
+                pos_triple = random.choice(positive_triples)
+                if random.random() < 0.5:
+                    # Corrupt subject
+                    candidates = self._get_domain_candidates(
+                        pos_triple.predicate, kg.individuals, ind_classes
+                    )
+                    candidates = [c for c in candidates if c != pos_triple.subject]
+                    if candidates:
+                        new_subj = random.choice(candidates)
+                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[])
+                else:
+                    # Corrupt object
+                    candidates = self._get_range_candidates(
+                        pos_triple.predicate, kg.individuals, ind_classes
+                    )
+                    candidates = [c for c in candidates if c != pos_triple.object]
+                    if candidates:
+                        new_obj = random.choice(candidates)
+                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[])
+                        
+            elif strategy == "type_aware":
+                pos_triple = random.choice(positive_triples)
+                if random.random() < 0.5:
+                    # Corrupt subject
+                    subj_classes = frozenset(ind_classes.get(pos_triple.subject, set()))
+                    candidates = [c for c in class_groups[subj_classes] if c != pos_triple.subject]
+                    if candidates:
+                        new_subj = random.choice(candidates)
+                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[])
+                else:
+                    # Corrupt object
+                    obj_classes = frozenset(ind_classes.get(pos_triple.object, set()))
+                    candidates = [c for c in class_groups[obj_classes] if c != pos_triple.object]
+                    if candidates:
+                        new_obj = random.choice(candidates)
+                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[])
+                        
+            elif strategy == "proof_based":
+                # Simplified proof based logic for single sample
+                if triples_with_proofs:
+                    pos_triple, proofs = random.choice(triples_with_proofs)
+                    if proofs:
+                        proof = random.choice(proofs)
+                        base_facts = proof.get_base_facts()
+                        
+                        if corrupt_base_facts:
+                            base_facts = {bf for bf in base_facts if bf.predicate != RDF.type}
+                            
+                        if not base_facts or not corrupt_base_facts:
+                            neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+                        else:
+                            base_fact = random.choice(list(base_facts))
+                            # Find matching triple
+                            matching_triples = [
+                                t for t in kg.triples 
+                                if t.positive and 
+                                t.subject.name == base_fact.subject.name and 
+                                t.predicate.name == base_fact.predicate.name and 
+                                t.object.name == base_fact.object.name
+                            ]
+                            if matching_triples:
+                                neg_triple = self._corrupt_triple_random(matching_triples[0], kg.individuals)
+
+            if neg_triple and not self._is_positive_fact(neg_triple, kg):
+                negative_triples.append(neg_triple)
+                
+        kg.triples.extend(negative_triples)
+        
+        # For memberships, we just use random corruption for now as it's less critical
+        # or we could implement mixed logic there too, but let's stick to random for simplicity in mixed mode
+        # unless we want to be very thorough. Let's reuse random corruption for memberships.
+        positive_memberships = [m for m in kg.memberships if m.is_member]
+        n_neg_memberships = int(len(positive_memberships) * ratio)
+        negative_memberships = []
+        
+        for _ in range(n_neg_memberships):
+            if not positive_memberships:
+                break
+            pos_mem = random.choice(positive_memberships)
+            neg_mem = self._corrupt_membership_random(pos_mem, list(self.schema_classes.values()))
+            if neg_mem and not self._is_positive_membership(neg_mem, kg):
+                negative_memberships.append(neg_mem)
+                
+        kg.memberships.extend(negative_memberships)
         return kg
 
     # ==================== HELPER METHODS ==================== #
@@ -512,23 +674,12 @@ class NegativeSampler:
 
     def _is_positive_fact(self, neg_triple: Triple, kg: KnowledgeGraph) -> bool:
         """Check if a negative triple conflicts with a positive fact."""
-        for triple in kg.triples:
-            if (
-                triple.positive
-                and triple.subject.name == neg_triple.subject.name
-                and triple.predicate.name == neg_triple.predicate.name
-                and triple.object.name == neg_triple.object.name
-            ):
-                return True
-        return False
+        # Optimized O(1) lookup
+        key = f"{neg_triple.subject.name}|{neg_triple.predicate.name}|{neg_triple.object.name}"
+        return key in self.existing_triples
 
     def _is_positive_membership(self, neg_mem: Membership, kg: KnowledgeGraph) -> bool:
         """Check if a negative membership conflicts with a positive one."""
-        for mem in kg.memberships:
-            if (
-                mem.is_member
-                and mem.individual.name == neg_mem.individual.name
-                and mem.cls.name == neg_mem.cls.name
-            ):
-                return True
-        return False
+        # Optimized O(1) lookup
+        key = f"{neg_mem.individual.name}|{neg_mem.cls.name}"
+        return key in self.existing_memberships

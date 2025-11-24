@@ -116,6 +116,10 @@ class KGEDatasetGenerator:
         # Track rule usage for coverage analysis
         self.train_rule_usage: Dict[str, int] = defaultdict(int)
         self.test_rule_usage: Dict[str, int] = defaultdict(int)
+        
+        # Detailed tracking for debugging
+        self.rule_selection_count: Dict[str, int] = defaultdict(int)
+        self.rule_success_count: Dict[str, int] = defaultdict(int)
 
         print(f"Loaded {len(self.rules)} rules from ontology")
         print(
@@ -282,6 +286,7 @@ class KGEDatasetGenerator:
         )
         for rule in selected_rules:
             rule_usage[rule.name] += 1
+            self.rule_selection_count[rule.name] += 1
 
         # Generate proofs and build proof map
         sample_proof_map = defaultdict(list)
@@ -291,6 +296,8 @@ class KGEDatasetGenerator:
             proofs = self.generator.generate_proofs_for_rule(rule.name, max_proofs=None)
             if not proofs:
                 continue
+                
+            self.rule_success_count[rule.name] += 1
 
             # Select random subset of proofs
             n_select = random.randint(
@@ -473,6 +480,20 @@ class KGEDatasetGenerator:
             print(f"Warning: {len(unused_in_train)} rules unused in training")
         if unused_in_test:
             print(f"Warning: {len(unused_in_test)} rules unused in testing")
+            
+        # Detailed breakdown of unused rules
+        all_unused = unused_in_train.intersection(unused_in_test)
+        if all_unused:
+            print(f"\n--- Unused Rules Analysis ---")
+            print(f"{'Rule Name':<40} | {'Reason':<20} | {'Attempts':<10}")
+            print("-" * 80)
+            for rule_name in sorted(all_unused):
+                attempts = self.rule_selection_count[rule_name]
+                if attempts == 0:
+                    reason = "Never Selected"
+                else:
+                    reason = "Failed to Generate"
+                print(f"{rule_name:<40} | {reason:<20} | {attempts:<10}")
 
         print("\nTRAINING SET:")
         print(f"  Samples:           {train_stats.get('n_samples', 0)}")
@@ -610,8 +631,8 @@ def main():
     parser.add_argument(
         "--neg-strategy",
         type=str,
-        default="proof_based",
-        choices=["random", "constrained", "proof_based", "type_aware"],
+        default="mixed",
+        choices=["random", "constrained", "proof_based", "type_aware", "mixed"],
         help="Negative sampling strategy",
     )
     parser.add_argument(
