@@ -14,6 +14,7 @@ AUTHOR
     Vincent Van Schependom
 """
 
+import os
 import random
 from typing import List, Set, Dict, Optional
 from data_structures import *
@@ -55,6 +56,8 @@ class NegativeSampler:
         strategy: str = "constrained",
         ratio: float = 1.0,
         corrupt_base_facts: bool = False,
+        export_proofs: bool = False,
+        output_dir: str = None,
     ) -> KnowledgeGraph:
         """
         Add negative samples to a knowledge graph.
@@ -68,6 +71,8 @@ class NegativeSampler:
                 - "type_aware": Considers class memberships
             ratio: Ratio of negative to positive samples (1.0 = balanced)
             corrupt_base_facts: If True, also corrupt base facts in proofs
+            export_proofs: Whether to export visualizations of corrupted proofs
+            output_dir: Directory to save visualizations
 
         Returns:
             Knowledge graph with negative samples added
@@ -77,7 +82,9 @@ class NegativeSampler:
         elif strategy == "constrained":
             return self._constrained_corruption(kg, ratio)
         elif strategy == "proof_based":
-            return self._proof_based_corruption(kg, ratio, corrupt_base_facts)
+            return self._proof_based_corruption(
+                kg, ratio, corrupt_base_facts, export_proofs, output_dir
+            )
         elif strategy == "type_aware":
             return self._type_aware_corruption(kg, ratio)
         else:
@@ -223,7 +230,12 @@ class NegativeSampler:
         return kg
 
     def _proof_based_corruption(
-        self, kg: KnowledgeGraph, ratio: float, corrupt_base_facts: bool
+        self,
+        kg: KnowledgeGraph,
+        ratio: float,
+        corrupt_base_facts: bool,
+        export_proofs: bool = False,
+        output_dir: str = None,
     ) -> KnowledgeGraph:
         """
         Strategy 3: Proof-based corruption.
@@ -246,7 +258,11 @@ class NegativeSampler:
             # Fallback to random if no proofs available
             return self._random_corruption(kg, ratio)
 
-        for _ in range(n_negatives):
+        # Limit exported visualizations to prevent freezing
+        exported_count = 0
+        MAX_EXPORTS = 5
+
+        for i in range(n_negatives):
             if not triples_with_proofs:
                 break
 
@@ -289,6 +305,34 @@ class NegativeSampler:
                         neg_triple = self._corrupt_triple_random(
                             base_triple, kg.individuals
                         )
+
+                        # If we have a negative triple and we want to export proofs
+                        if (
+                            neg_triple
+                            # and export_proofs
+                            and output_dir
+                            and exported_count < MAX_EXPORTS
+                        ):
+                            # Create atom from negative triple
+                            new_atom = Atom(
+                                predicate=neg_triple.predicate,
+                                subject=neg_triple.subject,
+                                object=neg_triple.object,
+                            )
+
+                            # Create corrupted proof
+                            corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
+
+                            # Save visualization
+                            filename = f"corrupted_proof_{i}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
+                            full_path = os.path.join(output_dir, filename)
+                            corrupted_proof.save_visualization(full_path, format="pdf")
+                            exported_count += 1
+                            if self.verbose:
+                                print(
+                                    f"Exported corrupted proof visualization: {filename}"
+                                )
+
                     else:
                         continue
                 else:

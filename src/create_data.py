@@ -15,6 +15,7 @@ AUTHOR
 from collections import defaultdict
 import random
 import argparse
+import os
 from pathlib import Path
 from typing import List, Dict, Optional
 import networkx as nx
@@ -49,6 +50,8 @@ class KGEDatasetGenerator:
         neg_corrupt_base_facts: bool,
         verbose: bool,
         seed: Optional[int] = None,
+        export_proofs: bool = False,
+        output_dir: str = None,
     ):
         """
         Initialize dataset generator.
@@ -65,6 +68,8 @@ class KGEDatasetGenerator:
             neg_corrupt_base_facts: Whether to corrupt base facts
             verbose: Enable detailed logging
             seed: Random seed for reproducibility
+            export_proofs: Whether to export proof visualizations
+            output_dir: Directory to save visualizations
         """
         if seed is not None:
             random.seed(seed)
@@ -73,6 +78,8 @@ class KGEDatasetGenerator:
         self.max_recursion_cap = max_recursion
         self.individual_pool_size = individual_pool_size
         self.individual_reuse_prob = individual_reuse_prob
+        self.export_proofs = export_proofs
+        self.output_dir = output_dir
 
         # Initialize KGenerator
         self.generator = KGenerator(
@@ -83,7 +90,7 @@ class KGEDatasetGenerator:
             individual_pool_size=individual_pool_size,
             individual_reuse_prob=individual_reuse_prob,
             verbose=False,  # Keep generator quiet during batch generation
-            export_proof_visualizations=False,
+            export_proof_visualizations=export_proofs,
         )
 
         # Store schema references
@@ -192,8 +199,8 @@ class KGEDatasetGenerator:
             n_samples: Number of samples to generate
             min_individuals: Min individuals per sample
             max_individuals: Max individuals per sample
-            min_rules: Min rules per sample
-            max_rules: Max rules per sample
+            min_rules: Min rules to trigger per sample
+            max_rules: Max rules to trigger per sample
             sample_type: "TRAIN" or "TEST" (for logging)
 
         Returns:
@@ -286,8 +293,9 @@ class KGEDatasetGenerator:
                 continue
 
             # Select random subset of proofs
-            max_proofs_to_merge = 3  # Keep small to control graph size
-            n_select = random.randint(1, min(len(proofs), max_proofs_to_merge))
+            n_select = random.randint(
+                1, min(len(proofs), 10000)
+            )  # TODO: adjust max as needed
             selected = random.sample(proofs, n_select)
 
             for proof in selected:
@@ -318,6 +326,8 @@ class KGEDatasetGenerator:
             strategy=self.neg_strategy,
             ratio=self.neg_ratio,
             corrupt_base_facts=self.neg_corrupt_base_facts,
+            export_proofs=self.export_proofs,
+            output_dir=self.output_dir,
         )
 
         return kg
@@ -437,7 +447,7 @@ class KGEDatasetGenerator:
                 f"Warning: Found {isomorphic_count} isomorphic samples between train/test"
             )
         else:
-            print("✓ No structural isomorphism between train and test")
+            print("No structural isomorphism between train and test")
 
         # Rule coverage
         print(f"\n--- Rule Coverage ---")
@@ -575,24 +585,24 @@ def main():
         "--n-train", type=int, default=5, help="Number of training samples"
     )
     parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
-    parser.add_argument("--min-individuals", type=int, default=1)
+    parser.add_argument("--min-individuals", type=int, default=20)
     parser.add_argument("--max-individuals", type=int, default=1000)
     parser.add_argument("--max-recursion", type=int, default=10)
     parser.add_argument("--global-max-depth", type=int, default=10)
     parser.add_argument("--max-proofs-per-atom", type=int, default=10)
     parser.add_argument(
-        "--individual-pool-size", type=int, default=50, help="Size of individual pool"
+        "--individual-pool-size", type=int, default=1000, help="Size of individual pool"
     )
     parser.add_argument(
         "--individual-reuse-prob",
         type=float,
-        default=0,
+        default=0.2,
         help="Probability of reusing individuals (0.0-1.0)",
     )
     parser.add_argument(
         "--neg-strategy",
         type=str,
-        default="constrained",
+        default="proof_based",
         choices=["random", "constrained", "proof_based", "type_aware"],
         help="Negative sampling strategy",
     )
@@ -610,7 +620,14 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
-        "--visualize", action="store_true", help="Generate graph visualizations"
+        "--export-proofs",
+        action="store_true",
+        help="Export proof trees for all samples",
+    )
+    parser.add_argument(
+        "--export-graphs",
+        action="store_true",
+        help="Export graph visualizations for all samples",
     )
 
     args = parser.parse_args()
@@ -628,6 +645,8 @@ def main():
         neg_corrupt_base_facts=args.neg_corrupt_base_facts,
         seed=args.seed,
         verbose=args.verbose,
+        export_proofs=args.export_proofs,
+        output_dir=args.output,
     )
 
     # Generate datasets
@@ -644,19 +663,31 @@ def main():
 
     print("\nDataset generation complete!")
 
-    # Optional visualization
-    if args.visualize:
-        print("\nVisualizing samples...")
-        visualizer = GraphVisualizer("train-test-graphs")
+    # Export Graphs (a few samples)
+    if args.export_graphs:
+        print("\nExporting all graph visualizations...")
+        graph_dir = os.path.join(args.output, "graphs")
+        os.makedirs(graph_dir, exist_ok=True)
 
-        for i, sample in enumerate(train_samples[:5]):  # Limit to 5
-            visualizer.visualize(
-                sample, f"train_sample_{i + 1}.png", title=f"TRAIN Sample {i + 1}"
+        # Limit the number of visualizations to avoid excessive output
+        max_visualizations_train = min(3, len(train_samples))
+        max_visualizations_test = min(3, len(test_samples))
+
+        subset_train_samples = random.sample(train_samples, max_visualizations_train)
+        subset_test_samples = random.sample(test_samples, max_visualizations_test)
+
+        for i, sample in enumerate(subset_train_samples):
+            sample.save_visualization(
+                output_path=graph_dir,
+                output_name=f"train_sample_{i}",
+                title=f"Train Sample {i}",
             )
 
-        for i, sample in enumerate(test_samples[:5]):  # Limit to 5
-            visualizer.visualize(
-                sample, f"test_sample_{i + 1}.png", title=f"TEST Sample {i + 1}"
+        for i, sample in enumerate(subset_test_samples):
+            sample.save_visualization(
+                output_path=graph_dir,
+                output_name=f"test_sample_{i}",
+                title=f"Test Sample {i}",
             )
 
 

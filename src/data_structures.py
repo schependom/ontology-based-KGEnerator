@@ -572,7 +572,11 @@ class KnowledgeGraph:
         return samples
 
     def save_visualization(
-        self, output_path: str, format: str = "pdf", title: Optional[str] = None
+        self,
+        output_path: str,
+        output_name: str,
+        format: str = "pdf",
+        title: Optional[str] = None,
     ) -> None:
         """
         Save knowledge graph visualization to file.
@@ -584,8 +588,14 @@ class KnowledgeGraph:
         """
         from graph_visualizer import GraphVisualizer
 
-        visualizer = GraphVisualizer()
-        visualizer.visualize(self, output_path, title=title)
+        if len(self.individuals) > 100:
+            print(
+                f"Graph too large to visualize ({len(self.individuals)} individuals). Skipping visualization."
+            )
+            return
+
+        visualizer = GraphVisualizer(output_dir=output_path)
+        visualizer.visualize(self, filename=output_name, title=title)
 
 
 @dataclass
@@ -788,6 +798,12 @@ class Proof:
         default_factory=dict, hash=False, compare=False
     )
 
+    # Validity flag (for negative sampling visualization)
+    is_valid: bool = field(default=True, compare=False)
+
+    # Flag if this specific node is the corrupted leaf
+    is_corrupted_leaf: bool = field(default=False, compare=False)
+
     def __post_init__(self):
         # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
@@ -873,6 +889,52 @@ class Proof:
             ),
         }
 
+    def corrupt_leaf(self, original_atom: Atom, corrupted_atom: Atom) -> "Proof":
+        """
+        Creates a new Proof tree where the leaf matching original_atom is replaced
+        by a corrupted leaf (corrupted_atom), and the path is marked invalid.
+        """
+        # Base case: this is the leaf we want to corrupt
+        if self.is_base_fact():
+            if self.goal == original_atom:
+                return Proof(
+                    goal=corrupted_atom,
+                    rule=None,
+                    sub_proofs=tuple(),
+                    recursive_use_counts=self.recursive_use_counts,
+                    substitutions=self.substitutions,
+                    is_valid=False,
+                    is_corrupted_leaf=True,
+                )
+            return self
+
+        # Recursive step
+        if self.rule:
+            new_sub_proofs = []
+            changed = False
+            for sp in self.sub_proofs:
+                # Recursively try to corrupt the leaf in sub-proofs
+                new_sp = sp.corrupt_leaf(original_atom, corrupted_atom)
+                new_sub_proofs.append(new_sp)
+
+                # If the sub-proof changed (i.e., it contained the target leaf),
+                # then this node also changes
+                if new_sp is not sp:
+                    changed = True
+
+            if changed:
+                return Proof(
+                    goal=self.goal,  # Goal remains same (but is now invalidly derived)
+                    rule=self.rule,
+                    sub_proofs=tuple(new_sub_proofs),
+                    recursive_use_counts=self.recursive_use_counts,
+                    substitutions=self.substitutions,
+                    is_valid=False,  # Invalid because a child is invalid
+                )
+
+        # If not found or not changed, return self
+        return self
+
     def save_visualization(
         self, filepath: str, format: str = "pdf", title: Optional[str] = None
     ) -> None:
@@ -934,7 +996,18 @@ class Proof:
             node_ids[proof] = node_id
 
             # Determine node styling
-            if proof.is_base_fact():
+            if proof.is_corrupted_leaf:
+                header_color = "#FFEBEE"  # Light red
+                border_color = "#C62828"  # Dark red
+                type_label = "CORRUPTED FACT"
+            elif not proof.is_valid:
+                header_color = "#FFEBEE"  # Light red
+                border_color = "#EF9A9A"  # Lighter red for propagation
+                if proof.is_base_fact():
+                    type_label = "BASE FACT"
+                else:
+                    type_label = f"Rule: {proof.rule.name} (INVALID)"
+            elif proof.is_base_fact():
                 header_color = "#E8F5E9"  # Light green
                 border_color = "#2E7D32"  # Dark green
                 type_label = "BASE FACT"
@@ -945,6 +1018,10 @@ class Proof:
 
             # Format goal atom
             goal_html = proof.goal.__repr__()
+            if not proof.is_valid and not proof.is_corrupted_leaf:
+                goal_html = (
+                    f"<S>{goal_html}</S> <B><FONT COLOR='#C62828'>[INVALID]</FONT></B>"
+                )
 
             # Build HTML label
             label = (

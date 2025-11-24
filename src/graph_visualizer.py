@@ -16,6 +16,7 @@ from data_structures import KnowledgeGraph
 class GraphVisualizer:
     def __init__(self, output_dir: str = "output_graphs"):
         self.output_dir = output_dir
+        print(f"Graph Visualizations will be saved to: {self.output_dir}")
         os.makedirs(output_dir, exist_ok=True)
 
     def visualize(
@@ -112,7 +113,7 @@ class GraphVisualizer:
         for triple in kg.triples:
             # --- COLOR LOGIC (Polarity) ---
             if not triple.positive:
-                # break
+                break
                 color = "#D32F2F"  # Red for negative
                 fontcolor = "#D32F2F"
                 label_prefix = "¬ "  # Logical NOT symbol
