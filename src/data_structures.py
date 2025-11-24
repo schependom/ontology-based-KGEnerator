@@ -758,7 +758,9 @@ class Proof:
     # field() returns an empty frozenset
 
     # Maps variables in the rule to their ground terms
-    substitutions: Dict[Var, Term] = field(default_factory=dict)
+    substitutions: Dict[Var, Term] = field(
+        default_factory=dict, hash=False, compare=False
+    )
 
     def __post_init__(self):
         # A base fact proof cannot have sub-proofs
@@ -845,29 +847,189 @@ class Proof:
             ),
         }
 
-    def format_tree(self, indent: int = 0) -> str:
-        """Returns a formatted string representation of the proof tree."""
-        lines = []
-        prefix = "  " * indent
+    def save_visualization(
+        self, filepath: str, format: str = "pdf", title: Optional[str] = None
+    ) -> None:
+        """
+        Save proof tree visualization to file.
 
-        goal_str = self._format_atom(self.goal)
+        Args:
+            filepath: Output file path (without extension)
+            format: Output format ("pdf", "png", "svg")
+            title: Optional title for the graph
+        """
 
-        if self.is_base_fact():
-            lines.append(f"{prefix}[BASE] {goal_str}")
-        else:
-            lines.append(f"{prefix}[DERIVE] {goal_str}")
-            lines.append(f"{prefix}  via: {self.rule.name}")
+        dot = self._create_graphviz()
 
-            if self.substitutions:
-                lines.append(f"{prefix}  subs: {self._format_subs()}")
+        if title:
+            dot.attr(
+                label=title, labelloc="t", fontsize="16", fontname="Helvetica-Bold"
+            )
 
-            if self.sub_proofs:
-                lines.append(f"{prefix}  from:")
-                for i, sp in enumerate(self.sub_proofs):
-                    lines.append(f"{prefix}    [{i + 1}]")
-                    lines.append(sp.format_tree(indent + 3))
+        try:
+            dot.render(filepath, format=format, cleanup=True)
+            print(f"✓ Saved proof visualization to: {filepath}.{format}")
+        except Exception as e:
+            print(f"✗ Failed to render graph: {e}")
+            # Save .dot file as fallback
+            dot.save(filepath + ".dot")
+            print(f"  Saved .dot file to: {filepath}.dot")
 
-        return "\n".join(lines)
+    def _create_graphviz(self) -> Any:
+        """
+        Create a Graphviz graph object for this proof tree.
+
+        Returns:
+            graphviz.Digraph: The graph object
+        """
+        import graphviz
+
+        dot = graphviz.Digraph(comment="Proof Tree")
+
+        # Layout settings
+        dot.attr(rankdir="BT")  # Bottom to top (premises support conclusions)
+        dot.attr(splines="ortho")
+        dot.attr(nodesep="0.6", ranksep="0.8")
+        dot.attr("node", shape="plain", fontname="Helvetica")
+
+        # Track node IDs
+        node_counter = [0]  # Use list for mutable counter in closure
+        node_ids: Dict[Proof, str] = {}
+
+        def add_proof_node(proof: Proof, parent_id: Optional[str] = None) -> str:
+            """Recursively add proof nodes to graph."""
+            # Reuse node if already created (DAG structure)
+            if proof in node_ids:
+                return node_ids[proof]
+
+            # Create unique node ID
+            node_id = f"node_{node_counter[0]}"
+            node_counter[0] += 1
+            node_ids[proof] = node_id
+
+            # Determine node styling
+            if proof.is_base_fact():
+                header_color = "#E8F5E9"  # Light green
+                border_color = "#2E7D32"  # Dark green
+                type_label = "BASE FACT"
+            else:
+                header_color = "#E3F2FD"  # Light blue
+                border_color = "#1565C0"  # Dark blue
+                type_label = f"Rule: {proof.rule.name}"
+
+            # Format goal atom
+            goal_html = self._format_atom_html(proof.goal)
+
+            # Build HTML label
+            label = (
+                f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="{border_color}">'
+                f'<TR><TD BGCOLOR="{border_color}"><FONT COLOR="white"><B>{type_label}</B></FONT></TD></TR>'
+                f'<TR><TD BGCOLOR="{header_color}">{goal_html}</TD></TR>'
+            )
+
+            # Add substitutions section
+            if proof.substitutions:
+                label += '<TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#555555"><I>Substitutions:</I><BR/>'
+                sub_rows = [
+                    f"{k.name} &rarr; <B>{self._format_term(v)}</B>"
+                    for k, v in proof.substitutions.items()
+                ]
+
+                # Split into columns if many substitutions
+                if len(sub_rows) > 3:
+                    mid = len(sub_rows) // 2 + 1
+                    col1 = "<BR/>".join(sub_rows[:mid])
+                    col2 = "<BR/>".join(sub_rows[mid:])
+                    label += f'<TABLE BORDER="0" CELLSPACING="5"><TR><TD>{col1}</TD><TD>{col2}</TD></TR></TABLE>'
+                else:
+                    label += "<BR/>".join(sub_rows)
+                label += "</FONT></TD></TR>"
+
+            # Add recursion info
+            if proof.recursive_use_counts:
+                rec_info = ", ".join(
+                    [f"{name}:{count}" for name, count in proof.recursive_use_counts]
+                )
+                label += f'<TR><TD BGCOLOR="#FFF3E0"><FONT POINT-SIZE="8">Recursion: {rec_info}</FONT></TD></TR>'
+
+            label += "</TABLE>>"
+
+            # Add node to graph
+            dot.node(node_id, label=label)
+
+            # Recursively add sub-proofs
+            if proof.rule:
+                for i, (premise_pattern, sub_proof) in enumerate(
+                    zip(proof.rule.premises, proof.sub_proofs)
+                ):
+                    sub_id = add_proof_node(sub_proof, node_id)
+
+                    # Edge label
+                    edge_label = (
+                        f"premise {i + 1}:\n{self._format_atom(premise_pattern)}"
+                    )
+
+                    # Edge from premise to conclusion (BT layout)
+                    dot.edge(
+                        sub_id,
+                        node_id,
+                        label=edge_label,
+                        fontsize="9",
+                        fontcolor="#666666",
+                        style="dashed",
+                    )
+
+            return node_id
+
+        # Build the graph starting from root
+        add_proof_node(self)
+
+        return dot
+
+    def _format_atom_html(self, atom: Atom) -> str:
+        """Format an atom with HTML tags for bold Subject/Object."""
+        s = self._format_term(atom.subject)
+        p = self._format_term(atom.predicate)
+        o = self._format_term(atom.object)
+
+        # Beautify RDF Type
+        if p == "rdf:type":
+            p = '<FONT COLOR="#666666">rdf:type</FONT>'
+
+        return f"<B>{s}</B> {p} <B>{o}</B>"
+
+    def print(self, indent: int = 0) -> None:
+        """Print the proof tree to console."""
+        print(self.format_tree(indent))
+
+    def save_text(self, filepath: str) -> None:
+        """
+        Save proof tree as formatted text file.
+
+        Args:
+            filepath: Output file path
+        """
+        with open(filepath, "w") as f:
+            f.write("PROOF TREE\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Write statistics
+            stats = self.get_statistics()
+            f.write("Statistics:\n")
+            f.write(f"  Total atoms: {stats['total_atoms']}\n")
+            f.write(f"  Base facts: {stats['base_facts']}\n")
+            f.write(f"  Inferred facts: {stats['inferred_facts']}\n")
+            f.write(f"  Max depth: {stats['depth']}\n")
+            f.write(f"  Individuals: {stats['individuals']}\n")
+            f.write(f"  Rules used: {', '.join(stats['rules_used'])}\n")
+            f.write(f"  Max recursion: {stats['max_recursion']}\n")
+            f.write("\n" + "=" * 80 + "\n\n")
+
+            # Write proof tree
+            f.write("Proof Tree:\n")
+            f.write(self.format_tree())
+
+        print(f"✓ Saved proof tree to: {filepath}")
 
     def _format_atom(self, atom: Atom) -> str:
         """Helper to format an atom."""

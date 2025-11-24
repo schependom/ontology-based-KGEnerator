@@ -10,29 +10,6 @@ DESCRIPTION:
 
     Use create_data.py to generate train/test splits.
 
-WORKFLOW:
-
-    1. Parse the ontology using OntologyParser to extract:
-       - Schema (classes, relations, attributes)
-       - Rules (OWL 2 RL axioms converted to ExecutableRules)
-       - Constraints (disjointWith, IrreflexiveProperty, FunctionalProperty)
-
-    2. Initialize BackwardChainer with parsed rules AND constraints
-
-    3. For each rule in the ontology:
-       - Generate all possible proof trees starting from that rule
-       - Traverse each proof tree (depth-first) to extract all ground atoms
-       - Validate each proof against constraints before accepting
-
-    4. Convert ground atoms into KnowledgeGraph facts:
-       - Class memberships: (Individual, rdf:type, Class)
-       - Relational triples: (Individual, Relation, Individual)
-       - Attribute triples: (Individual, Attribute, LiteralValue)
-
-    5. Store facts in KnowledgeGraph with deduplication:
-       - Each fact tracks all proofs that derive it
-       - Facts are deduplicated using unique keys
-
 AUTHOR
 
     Vincent Van Schependom
@@ -250,23 +227,29 @@ class KGenerator:
         self,
         ontology_file: str,
         max_recursion: int,
-        global_max_depth: int = 5,
+        global_max_depth: int,
+        individual_pool_size: int,
+        individual_reuse_prob: float,
         max_proofs_per_atom: int = None,
         neg_strategy: str = "random",
         verbose: bool = False,
+        export_proof_visualizations=False,
     ):
         """
         Initializes the parser and chainer.
 
         Args:
-            ontology_file (str): Path to the .ttl ontology file.
-            max_recursion (int): The maximum depth for recursive rules.
-                                 This prevents infinite recursion in rules like:
-                                 parent(X,Y) ∧ parent(Y,Z) → ancestor(X,Z)
-            global_max_depth (int): Hard limit on total proof tree depth.
-            max_proofs_per_atom (int): Max number of proofs to generate for any single atom.
-            neg_strategy (str): Negative sampling strategy ("random" or "constrained").
-            verbose (bool): Enable detailed logging.
+            ontology_file (str):                Path to the .ttl ontology file.
+            max_recursion (int):                The maximum depth for recursive rules.
+                                                This prevents infinite recursion in rules like:
+                                                    parent(X,Y) ∧ parent(Y,Z) → ancestor(X,Z)
+            global_max_depth (int):             Hard limit on total proof tree depth.
+            individual_pool_size (int):         Size of the individual pool for generation.
+            individual_reuse_prob (float):      Probability of reusing existing individuals.
+            max_proofs_per_atom (int):          Max number of proofs to generate for any single atom.
+            neg_strategy (str):                 "random", "constrained", "proof_based", "type_aware"
+            verbose (bool):                     Enable detailed logging.
+            export_proof_visualizations (bool): Whether to export proof visualizations.
         """
         self.verbose = verbose
         self.neg_strategy = neg_strategy
@@ -286,9 +269,12 @@ class KGenerator:
             all_rules=self.parser.rules,
             constraints=self.parser.constraints,
             max_recursion_depth=max_recursion,
+            individual_pool_size=individual_pool_size,
+            individual_reuse_prob=individual_reuse_prob,
             global_max_depth=global_max_depth,
             max_proofs_per_atom=max_proofs_per_atom,
             verbose=verbose,
+            export_proof_visualizations=export_proof_visualizations,
         )
 
         # Store schemas from the parser
@@ -772,7 +758,7 @@ def main():
     default_ontology_path = "data/toy.ttl"
     default_max_recursion = 3
     default_global_max_depth = 5
-    default_max_proofs = None
+    default_max_proofs = 5
 
     parser = argparse.ArgumentParser(
         description="Ontology-based Knowledge Graph Data Generator with Constraint Checking"
@@ -807,6 +793,25 @@ def main():
         help="Generate negative samples (local CWA)",
     )
     parser.add_argument(
+        "--individual-pool-size",
+        type=int,
+        default=50000,
+        help="Size of the individual pool for generation (default: 50000)",
+    )
+    parser.add_argument(
+        "--individual-reuse-prob",
+        type=float,
+        default=0.7,
+        help="Probability of reusing existing individuals (default: 0.7)",
+    )
+    parser.add_argument(
+        "--neg-strategy",
+        type=str,
+        choices=["random", "constrained", "proof_based", "type_aware"],
+        default="random",
+        help="Negative sampling strategy (default: 'random')",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -821,8 +826,12 @@ def main():
             args.ontology_path,
             max_recursion=args.max_recursion,
             global_max_depth=args.global_max_depth,
+            individual_pool_size=args.individual_pool_size,
+            individual_reuse_prob=args.individual_reuse_prob,
             max_proofs_per_atom=args.max_proofs_per_atom,
+            neg_strategy=args.neg_strategy,
             verbose=args.verbose,
+            export_proof_visualizations=False,
         )
 
         # Run Generation
