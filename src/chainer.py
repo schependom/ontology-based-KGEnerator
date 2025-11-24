@@ -256,7 +256,7 @@ class BackwardChainer:
             if key not in visited:
                 dfs(key)
 
-        # Map recursive atom keys back to rule names
+        # Map recursive atom keys to rule names
         recursive_rule_names: Set[str] = set()
         for rule in all_rules:
             head_key = self._get_atom_key(rule.conclusion)
@@ -281,6 +281,7 @@ class BackwardChainer:
             and self.individual_pool
             and random.random() < self.individual_reuse_prob
         ):
+            print("Reusing individual from pool.")
             return random.choice(self.individual_pool)
 
         # Create new individual
@@ -474,7 +475,7 @@ class BackwardChainer:
                     if atom.subject == atom.object:
                         if self.verbose:
                             print(
-                                f"  ✗ CONSTRAINT VIOLATION: {self._format_atom(atom)} "
+                                f"CONSTRAINT VIOLATION: {atom} "
                                 f"violates irreflexive property {atom.predicate.name}"
                             )
                         return False
@@ -533,11 +534,6 @@ class BackwardChainer:
             print(f"Error: Rule '{start_rule_name}' not found.")
             return
 
-        if self.verbose:
-            print(f"\n{'=' * 80}")
-            print(f"GENERATING PROOF TREES FOR: {start_rule_name}")
-            print(f"{'=' * 80}")
-
         # Get the starting rule (unrenamed)
         start_rule = self.all_rules[start_rule_name]
         # Example: ExecutableRule(
@@ -568,23 +564,15 @@ class BackwardChainer:
         # Generate fresh individuals for all conclusion variables
         subst: Dict[Var, Term] = {}
         for var in conclusion_vars:
-            subst[var] = self._get_individual(reuse=True)
+            subst[var] = self._get_valid_individual(var, subst, rule)
         # Example: subst = {
         #   Var('X_1'): Individual('Ind_0'),
         #   Var('Z_1'): Individual('Ind_1')
         # }
 
-        if self.verbose:
-            print("Initial substitution for conclusion variables:")
-            for var, ind in subst.items():
-                print(f"  {var} -> {ind}")
-
         # Create the ground goal we intend to prove
         ground_goal = rule.conclusion.substitute(subst)
         # Example: Atom(Individual('Ind_0'), hasGrandparent, Individual('Ind_1'))
-
-        if self.verbose:
-            print(f"\nGround goal to prove: {self._format_atom(ground_goal)}")
 
         # Track recursive rule usage
         recursive_use_counts = frozenset()
@@ -606,9 +594,7 @@ class BackwardChainer:
         # Generate individuals for unbound variables
         for var in unbound_vars:
             if var not in subst:
-                subst[var] = self._get_individual(reuse=True)
-                if self.verbose:
-                    print(f"  Generated {subst[var]} for unbound variable {var}")
+                subst[var] = self._get_valid_individual(var, subst, rule)
         # Example: subst = {
         #   Var('X_1'): Individual('Ind_0'),
         #   Var('Z_1'): Individual('Ind_1'),
@@ -630,11 +616,6 @@ class BackwardChainer:
                 yield proof
             return
 
-        if self.verbose:
-            print("Ground premises to prove:")
-            for i, prem in enumerate(ground_premises):
-                print(f"  {i + 1}. {self._format_atom(prem)}")
-
         # Track atoms in the current proof path to prevent circular reasoning
         atoms_in_path: frozenset[Atom] = frozenset([ground_goal])
 
@@ -652,19 +633,11 @@ class BackwardChainer:
             if not proof_list:
                 # No proofs found for this premise
                 failed_to_prove_a_premise = True
-                if self.verbose:
-                    print(f"  ✗ Failed to prove: {self._format_atom(premise)}")
                 break
 
-            if self.verbose:
-                print(
-                    f"  ✓ Found {len(proof_list)} proof(s) for: {self._format_atom(premise)}"
-                )
             premise_sub_proof_iters.append(proof_list)
 
         if failed_to_prove_a_premise:
-            if self.verbose:
-                print("\n✗ Proof generation failed (couldn't prove all premises)")
             return
 
         # Yield all combinations of sub-proofs (Cartesian product)
@@ -700,12 +673,9 @@ class BackwardChainer:
 
                 yield complete_proof
             elif self.verbose:
-                print(f"  ✗ Proof {proof_count} rejected due to constraint violation")
-
-        if self.verbose:
-            print(
-                f"\n✓ Generated {valid_proof_count}/{proof_count} valid proof tree(s)"
-            )
+                print(
+                    f"  ✗ Proof {proof_count} for {start_rule_name} rejected due to constraint violation"
+                )
 
     def _find_proofs_recursive(
         self,
@@ -759,38 +729,22 @@ class BackwardChainer:
         # Check global depth limit
         if depth > self.global_max_depth:
             if self.verbose:
-                print(f"  ✗ Max global depth reached ({self.global_max_depth})")
+                print(
+                    f"  ✗ Max global depth reached ({self.global_max_depth}) for goal: {goal_atom}"
+                )
             return
-
-        if self.verbose:
-            indent = "  " * len(atoms_in_path)
-            print(f"{indent}→ Proving: {self._format_atom(goal_atom)}")
-
-            if atoms_in_path and len(atoms_in_path) > 1:
-                print(f"{indent}  Current proof path:")
-                for i, atom in enumerate(atoms_in_path, 1):
-                    print(f"{indent}    {i}. {self._format_atom(atom)}")
 
         # Check for circular reasoning
         if goal_atom in atoms_in_path:
-            if self.verbose:
-                print(
-                    f"{indent}  ✗ CIRCULAR: Atom already in proof path, skipping entirely"
-                )
             return  # Yield nothing - this would be circular
 
         yielded_count = 0
 
         # ==================== BASE CASE ==================== #
         # Allow this atom to be proven as a base fact
-        if self.verbose:
-            print(f"{indent}  ✓ Yielding BASE FACT proof")
         yield Proof.create_base_proof(goal_atom)
         yielded_count += 1
         if self.max_proofs_per_atom and yielded_count >= self.max_proofs_per_atom:
-            print(
-                f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
-            )
             return
 
         # ==================== RECURSIVE CASE ==================== #
@@ -803,9 +757,6 @@ class BackwardChainer:
         key = self._get_atom_key(goal_atom)
         matching_rules = self.rules_by_head.get(key, [])
 
-        if self.verbose and matching_rules:
-            print(f"{indent}  Found {len(matching_rules)} matching rule(s)")
-
         # Try each matching rule
         for original_rule in matching_rules:
             # Check recursion limits
@@ -816,9 +767,7 @@ class BackwardChainer:
 
                 if current_recursive_uses >= self.max_recursion_depth:
                     if self.verbose:
-                        print(
-                            f"{indent}  ✗ Skipping {original_rule.name} (recursion limit)"
-                        )
+                        print(f"Skipping {original_rule.name} (recursion limit)")
                     continue
 
                 # Update recursion counter
@@ -838,27 +787,14 @@ class BackwardChainer:
             for premise in rule.premises:
                 rule_vars.update(premise.get_variables())
 
-            if self.verbose:
-                print(f"{indent}  Trying rule: {rule.name}")
-                print(f"{indent}    Rule pattern: {self._format_atom(rule.conclusion)}")
-
             # Unify goal with rule conclusion
             subst = self._unify(goal_atom, rule.conclusion)
             if subst is None:
                 if self.verbose:
-                    print(f"{indent}    ✗ Unification failed")
+                    print(
+                        f"Unification between {goal_atom} and {rule.conclusion} failed for rule {rule.name}"
+                    )
                 continue
-
-            if self.verbose:
-                print(f"{indent}    ✓ Unified with substitutions:")
-                for var in sorted(subst.keys(), key=lambda v: v.name):
-                    if var in rule_vars:  # Only show variables from this rule
-                        term_str = (
-                            subst[var].name
-                            if hasattr(subst[var], "name")
-                            else str(subst[var])
-                        )
-                        print(f"{indent}      {var.name} → {term_str}")
 
             # Create a new substitution dict for this rule's scope
             rule_subst = dict(subst)
@@ -898,7 +834,7 @@ class BackwardChainer:
                         ]
                     else:
                         # CREATE NEW: Either not functional, or first time for this (subject, property)
-                        new_ind = self._get_individual(reuse=True)
+                        new_ind = self._get_valid_individual(var, rule_subst, rule)
                         rule_subst[var] = new_ind
 
                         # STORE for future reuse if functional
@@ -912,8 +848,6 @@ class BackwardChainer:
 
             # Handle zero-premise rules (axioms)
             if not ground_premises:
-                if self.verbose:
-                    print(f"{indent}    ✓ No premises (axiom)")
                 yield Proof.create_derived_proof(
                     goal=goal_atom,
                     rule=original_rule,
@@ -939,10 +873,6 @@ class BackwardChainer:
                 if not proof_list:
                     # No proofs found for this premise
                     failed_to_prove_a_premise = True
-                    if self.verbose:
-                        print(
-                            f"{indent}    ✗ Failed to prove premise: {self._format_atom(premise)}"
-                        )
                     break
 
                 premise_sub_proof_iters.append(proof_list)
@@ -952,8 +882,6 @@ class BackwardChainer:
 
             # Yield all combinations of sub-proofs (Cartesian product)
             for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
-                if self.verbose:
-                    print(f"{indent}    ✓ Derived via {rule.name}")
                 yield Proof.create_derived_proof(
                     goal=goal_atom,
                     rule=original_rule,  # Use unrenamed rule
@@ -967,25 +895,97 @@ class BackwardChainer:
                 ):
                     if self.verbose:
                         print(
-                            f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
+                            f"Max proofs per atom reached ({self.max_proofs_per_atom}) for goal: {goal_atom}"
                         )
                     return
 
-    def _format_atom(self, atom: Atom) -> str:
+    def _is_substitution_valid(
+        self, subst: Dict[Var, Term], rule: ExecutableRule
+    ) -> bool:
         """
-        Helper to format atom for debug output.
-
-        Args:
-            atom (Atom): The atom to format.
-
-        Returns:
-            str: A human-readable representation like "(Ind_0, hasParent, Ind_1)".
+        Checks if the current partial substitution violates any constraints.
+        Only checks fully ground atoms.
         """
-        s = atom.subject.name if hasattr(atom.subject, "name") else str(atom.subject)
-        p = (
-            atom.predicate.name
-            if hasattr(atom.predicate, "name")
-            else str(atom.predicate)
-        )
-        o = atom.object.name if hasattr(atom.object, "name") else str(atom.object)
-        return f"({s}, {p}, {o})"
+        # Check all atoms in the rule
+        for atom in [rule.conclusion] + rule.premises:
+            # We need to substitute.
+            # atom.substitute() returns a new Atom.
+            ground_atom = atom.substitute(subst)
+
+            # If the atom is fully ground (no variables), check constraints
+            if ground_atom.is_ground():
+                # Check Irreflexive
+                if (
+                    isinstance(ground_atom.predicate, Relation)
+                    and ground_atom.predicate in self.irreflexive_properties
+                ):
+                    if ground_atom.subject == ground_atom.object:
+                        # Violation!
+                        return False
+
+                # Check FunctionalProperty (within the rule scope)
+                if (
+                    isinstance(ground_atom.predicate, Relation)
+                    and ground_atom.predicate in self.functional_properties
+                ):
+                    # We need to check if we have multiple values for the same subject/predicate in this rule
+                    # But we need to collect them first.
+                    pass
+
+        # Check FunctionalProperty consistency within the rule
+        func_values = {}
+        for atom in [rule.conclusion] + rule.premises:
+            ground_atom = atom.substitute(subst)
+            if (
+                ground_atom.is_ground()
+                and isinstance(ground_atom.predicate, Relation)
+                and ground_atom.predicate in self.functional_properties
+            ):
+                key = (ground_atom.subject, ground_atom.predicate)
+                if key in func_values:
+                    if func_values[key] != ground_atom.object:
+                        return False
+                else:
+                    func_values[key] = ground_atom.object
+
+        return True
+
+    def _get_valid_individual(
+        self, var: Var, current_subst: Dict[Var, Term], rule: ExecutableRule
+    ) -> Term:
+        """
+        Tries to get an individual that doesn't violate constraints when added to substitution.
+        """
+        # Try to reuse first
+        for _ in range(10):  # Try 10 times to reuse
+            ind = self._get_individual(reuse=True)
+
+            # Check if this individual causes a violation
+            temp_subst = current_subst.copy()
+            temp_subst[var] = ind
+
+            if self._is_substitution_valid(temp_subst, rule):
+                return ind
+
+        # If reuse fails, force a new individual (reuse=False)
+        # A new individual is unlikely to violate constraints with existing ones
+        return self._get_individual(reuse=False)
+
+    # def _format_atom(self, atom: Atom) -> str:
+    #     """
+    #     Helper to format atom for debug output.
+
+    #     Args:
+    #         atom (Atom): The atom to format.
+
+    #     Returns:
+    #         str: A human-readable representation like "(Ind_0, hasParent, Ind_1)".
+    #     """
+    #     s = atom.subject.name if hasattr(atom.subject, "name") else str(atom.subject)
+    #     p = (
+    #         atom.predicate.name
+    #         if hasattr(atom.predicate, "name")
+    #         else str(atom.predicate)
+    #     )
+    #     o = atom.object.name if hasattr(atom.object, "name") else str(atom.object)
+    #     return f"({s}, {p}, {o})"

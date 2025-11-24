@@ -479,7 +479,7 @@ def main():
     parser.add_argument(
         "--global-max-depth",
         type=int,
-        default=5,
+        default=10,
         help="Hard limit on total proof tree depth",
     )
     parser.add_argument(
@@ -527,6 +527,16 @@ def main():
 
         # Generate full graph
         kg = generator.generate_full_graph()
+
+        # check if the kg is not too big
+        if len(kg.triples) + len(kg.memberships) > 100:
+            print("Warning: Generated knowledge graph is very large (>10,000 facts).")
+            print("Not saving visualization to avoid performance issues.")
+        else:
+            kg.save_visualization(
+                output_path="full_knowledge_graph",
+                title="Complete Knowledge Graph",
+            )
 
         # Print summary
         print("\n--- Knowledge Graph Summary ---")

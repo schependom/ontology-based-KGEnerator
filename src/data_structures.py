@@ -571,6 +571,22 @@ class KnowledgeGraph:
 
         return samples
 
+    def save_visualization(
+        self, output_path: str, format: str = "pdf", title: Optional[str] = None
+    ) -> None:
+        """
+        Save knowledge graph visualization to file.
+
+        Args:
+            output_path: Output file path (without extension)
+            format: Output format ("pdf", "png", "svg")
+            title: Optional title for the graph
+        """
+        from graph_visualizer import GraphVisualizer
+
+        visualizer = GraphVisualizer()
+        visualizer.visualize(self, output_path, title=title)
+
 
 @dataclass
 class DataType(Enum):
@@ -654,6 +670,16 @@ class Atom:
             if isinstance(term, Var):
                 vars.add(term)
         return vars
+
+    def __repr__(self):
+        s = self.subject.name if hasattr(self.subject, "name") else str(self.subject)
+        p = (
+            self.predicate.name
+            if hasattr(self.predicate, "name")
+            else str(self.predicate)
+        )
+        o = self.object.name if hasattr(self.object, "name") else str(self.object)
+        return f"({s}, {p}, {o})"
 
 
 @dataclass
@@ -918,7 +944,7 @@ class Proof:
                 type_label = f"Rule: {proof.rule.name}"
 
             # Format goal atom
-            goal_html = self._format_atom_html(proof.goal)
+            goal_html = proof.goal.__repr__()
 
             # Build HTML label
             label = (
@@ -965,15 +991,13 @@ class Proof:
                     sub_id = add_proof_node(sub_proof, node_id)
 
                     # Edge label
-                    edge_label = (
-                        f"premise {i + 1}:\n{self._format_atom(premise_pattern)}"
-                    )
+                    edge_label = f"premise {i + 1}:\n{premise_pattern}"
 
                     # Edge from premise to conclusion (BT layout)
                     dot.edge(
                         sub_id,
                         node_id,
-                        label=edge_label,
+                        xlabel=edge_label,
                         fontsize="9",
                         fontcolor="#666666",
                         style="dashed",
@@ -1029,14 +1053,7 @@ class Proof:
             f.write("Proof Tree:\n")
             f.write(self.format_tree())
 
-        print(f"✓ Saved proof tree to: {filepath}")
-
-    def _format_atom(self, atom: Atom) -> str:
-        """Helper to format an atom."""
-        s = self._format_term(atom.subject)
-        p = self._format_term(atom.predicate)
-        o = self._format_term(atom.object)
-        return f"({s}, {p}, {o})"
+        print(f"Saved proof tree to: {filepath}")
 
     def _format_term(self, term: Term) -> str:
         """Helper to format a term."""
