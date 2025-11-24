@@ -6,54 +6,35 @@ DESCRIPTION
     This script generates independent knowledge graph samples suitable for
     training KGE models. Each sample is a complete knowledge graph with:
         - Unique individuals (different per sample)
-        - Mix of base facts and derived inferences
+        - Base facts and derived inferences
         - Positive and negative triples
         - All ground atoms (no variables)
-
-WORKFLOW
-
-    1. Initialize KGenerator with ontology
-    2. Generate N training samples where each sample:
-       - Randomly selects starting rules
-       - Generates proof trees via backward chaining
-       - Extracts ALL atoms from proof trees (base + inferred)
-       - Converts atoms to KG facts using shared utilities
-       - Generates negative samples via local CWA
-    3. Generate M test samples using same process
-    4. Save datasets to CSV files for KGE training
 
 AUTHOR
 
     Vincent Van Schependom
 """
 
-import csv
+from collections import defaultdict
 import random
 import argparse
 from pathlib import Path
 from typing import List, Set, Tuple, Optional, Dict
-from collections import defaultdict
+import networkx as nx
 
 # Custom imports
 from data_structures import (
     KnowledgeGraph,
-    Triple,
-    Membership,
-    AttributeTriple,
-    Individual,
-    Class,
-    Relation,
-    Attribute,
     Atom,
-    Proof,
 )
-
-
-from generator import (
+from generate import (
     KGenerator,
     extract_all_atoms_from_proof,
     atoms_to_knowledge_graph,
+    extract_proof_map,
 )
+from graph_visualizer import GraphVisualizer
+from negative_sampler import NegativeSampler
 
 
 class KGEDatasetGenerator:
@@ -64,33 +45,59 @@ class KGEDatasetGenerator:
     def __init__(
         self,
         ontology_file: str,
-        max_recursion: int = 2,
+        max_recursion: int,
+        global_max_depth: int,
+        max_proofs_per_atom: int,
+        individual_pool_size: int,
+        individual_reuse_prob: float,
+        neg_strategy: str,
+        neg_ratio: float,
+        neg_corrupt_base_facts: bool,
+        verbose: bool,
         seed: Optional[int] = None,
-        verbose: bool = False,
     ):
         """
         Initializes the dataset generator.
 
         Args:
-            ontology_file (str):    Path to the .ttl ontology file.
-            max_recursion (int):    Maximum depth for recursive rules.
-            seed (Optional[int]):   Random seed for reproducibility.
-            verbose (bool):         Enable detailed logging.
+            ontology_file:              Path to the .ttl ontology file.
+            max_recursion:              Maximum depth for recursive rules.
+            global_max_depth:           Hard limit on total proof tree depth.
+            max_proofs_per_atom:        Max number of proofs to generate for any single atom.
+            individual_pool_size:       Size of the individual pool for sampling.
+            individual_reuse_prob:      Probability of reusing existing individuals.
+            neg_strategy:               Negative sampling strategy ("random", "constrained", "proof_based", "type_aware").
+            neg_ratio:                  Ratio of negative to positive samples.
+            neg_corrupt_base_facts:     Whether to corrupt base facts during negative sampling.
+            verbose:                    Enable detailed logging.
         """
         if seed is not None:
             random.seed(seed)
 
         self.verbose = verbose
         self.ontology_file = ontology_file
+        self.neg_strategy = neg_strategy
+        self.neg_ratio = neg_ratio
+        self.neg_corrupt_base_facts = neg_corrupt_base_facts
+        self.max_recursion_cap = max_recursion
+        self.individual_pool_size = individual_pool_size
+        self.individual_reuse_prob = individual_reuse_prob
 
-        # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         if self.verbose:
             print(f"Initializing KGenerator from: {ontology_file}")
+            print(f"Individual pool size: {individual_pool_size}")
+            print(f"Individual reuse probability: {individual_reuse_prob}")
+            print(f"Negative sampling: {neg_strategy} (ratio: {neg_ratio})")
 
         self.generator = KGenerator(
             ontology_file=ontology_file,
             max_recursion=max_recursion,
-            verbose=False,  # Keep generator quiet during batch generation
+            global_max_depth=global_max_depth,
+            max_proofs_per_atom=max_proofs_per_atom,
+            individual_pool_size=individual_pool_size,
+            individual_reuse_prob=individual_reuse_prob,
+            neg_strategy=neg_strategy,
+            verbose=True,  # Keep generator quiet during batch generation
         )
 
         # Store references for convenience
@@ -101,6 +108,14 @@ class KGEDatasetGenerator:
         self.schema_attributes = self.generator.schema_attributes
         self.rules = self.parser.rules
 
+        self.negative_sampler = NegativeSampler(
+            schema_classes=self.schema_classes,
+            schema_relations=self.schema_relations,
+            domains=self.parser.domains,
+            ranges=self.parser.ranges,
+            verbose=verbose,
+        )
+
         if self.verbose:
             print(f"Loaded {len(self.rules)} rules from ontology")
             print(
@@ -109,6 +124,10 @@ class KGEDatasetGenerator:
                 f"{len(self.schema_attributes)} attributes"
             )
             print(f"Constraints: {len(self.parser.constraints)}")
+
+        # Track rule usage for coverage analysis
+        self.train_rule_usage: Dict[str, int] = defaultdict(int)
+        self.test_rule_usage: Dict[str, int] = defaultdict(int)
 
     def generate_dataset(
         self,
@@ -181,13 +200,6 @@ class KGEDatasetGenerator:
         """
         Generates a list of independent knowledge graph samples.
 
-        Each sample is created by:
-            1. Randomly selecting rules to trigger
-            2. Generating proof trees for those rules (using KGenerator)
-            3. Extracting all atoms from proof trees (using shared utility)
-            4. Converting atoms to KG format (using shared utility)
-            5. Adding negative samples using local corruption (work in progress)
-
         Args:
             n_samples (int):        Number of samples to generate.
             min_individuals (int):  Min individuals per sample.
@@ -201,14 +213,17 @@ class KGEDatasetGenerator:
         """
         samples = []
         failed_attempts = 0
-        max_failed_attempts = n_samples * 2  # Safety limit
+        max_failed_attempts = n_samples * 10  # Safety limit
 
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
+            self.chainer.reset_individual_pool()
+
             sample = self._generate_one_sample(
                 min_individuals=min_individuals,
                 max_individuals=max_individuals,
                 min_rules=min_rules,
                 max_rules=max_rules,
+                sample_type=sample_type,
             )
 
             if sample is not None:
@@ -234,22 +249,17 @@ class KGEDatasetGenerator:
         max_individuals: int,
         min_rules: int,
         max_rules: int,
+        sample_type: str,
     ) -> Optional[KnowledgeGraph]:
         """
         Generates one complete, independent knowledge graph sample.
-
-            1. Randomly select K rules as starting points (K \in [min_rules, max_rules])
-            2. For each rule, generate M proof trees (M \in [1, 5])
-            3. Extract ALL atoms from all proof trees (using shared utility)
-            4. Convert atoms to KG format (using shared utility)
-            5. Add negative samples using local CWA corruption
-            6. Verify sample meets size constraints
 
         Args:
             min_individuals (int):  Minimum individuals required.
             max_individuals (int):  Maximum individuals allowed.
             min_rules (int):        Minimum rules to trigger.
             max_rules (int):        Maximum rules to trigger.
+            sample_type (str):      "TRAIN" or "TEST" (for logging).
 
         Returns:
             Optional[KnowledgeGraph]: Generated sample, or None if generation failed.
@@ -259,209 +269,143 @@ class KGEDatasetGenerator:
                 print("Warning: No rules available for generation")
             return None
 
-        # Randomly select starting rules
+        # ----------------------------------------------------------------
+        # VARIANCE STRATEGY 1: VARY RECURSION DEPTH
+        # ----------------------------------------------------------------
+        # Randomly pick a max recursion depth for this specific sample
+        # This ensures some samples are "deep" and others are "shallow"
+        # providing structural diversity.
+        current_recursion = random.randint(1, self.max_recursion_cap)
+        self.generator.chainer.max_recursion_depth = current_recursion
+
+        # ----------------------------------------------------------------
+        # VARIANCE STRATEGY 2: RANDOM RULE SELECTION
+        # ----------------------------------------------------------------
+        # Randomly determine how many rules to trigger
         n_rules = random.randint(min_rules, min(max_rules, len(self.rules)))
+        # Randomly select the specific rules
         selected_rules = random.sample(self.rules, n_rules)
 
-        all_atoms: Set[Atom] = set()
-
-        # Generate proofs and extract atoms
+        # Track rule usage
+        rule_usage = (
+            self.train_rule_usage if sample_type == "TRAIN" else self.test_rule_usage
+        )
         for rule in selected_rules:
-            try:
-                # REFACTORED: Use KGenerator's generate_proofs_for_rule method
-                proofs = self.generator.generate_proofs_for_rule(
-                    rule_name=rule.name,
-                    max_proofs=5,  # Randomly select up to 5 proofs per rule
-                )
+            rule_usage[rule.name] += 1
 
-                if not proofs:
-                    continue
+        # Dictionary to store Atoms AND their Proofs
+        # Dict[Atom, List[Proof]]
+        sample_proof_map = defaultdict(list)
+        atoms_found = False
 
-                # Randomly select some proofs (for variety)
-                n_proofs = random.randint(1, len(proofs))
-                selected_proofs = random.sample(proofs, n_proofs)
-
-                for proof in selected_proofs:
-                    all_atoms.update(extract_all_atoms_from_proof(proof))
-
-            except Exception as e:
-                if self.verbose:
-                    print(
-                        f"Warning: Failed to generate proofs for rule {rule.name}: {e}"
-                    )
+        for rule in selected_rules:
+            proofs = self.generator.generate_proofs_for_rule(rule.name, max_proofs=None)
+            if not proofs:
                 continue
 
-        # Check if we have any atoms
-        if not all_atoms:
+            # Select random subset of proofs
+            max_proofs_to_merge = (
+                3  # Keep this small to ensure graph stays within size limits
+            )
+            n_select = random.randint(1, min(len(proofs), max_proofs_to_merge))
+            selected = random.sample(proofs, n_select)
+
+            for proof in selected:
+                # This extracts {Atom: [Proof, ...]}
+                extracted_map = extract_proof_map(proof)
+
+                # Merge into main map
+                for atom, proof_list in extracted_map.items():
+                    sample_proof_map[atom].extend(proof_list)
+
+                atoms_found = True
+
+        if not atoms_found:
             return None
 
-        # Convert atoms to knowledge graph
+        # Convert atoms to KG, PASSING THE PROOF MAP
         kg = atoms_to_knowledge_graph(
-            atoms=all_atoms,
+            atoms=set(sample_proof_map.keys()),
             schema_classes=self.schema_classes,
             schema_relations=self.schema_relations,
             schema_attributes=self.schema_attributes,
+            proof_map=sample_proof_map,
         )
 
-        # Check size constraints
-        n_individuals = len(kg.individuals)
-        if n_individuals < min_individuals or n_individuals > max_individuals:
+        # Validate size
+        if not (min_individuals <= len(kg.individuals) <= max_individuals):
             return None
 
-        # Add negative samples
-        kg = self._add_negative_samples(kg)
+        # Add negatives using the configured strategy
+        kg = self.negative_sampler.add_negative_samples(
+            kg,
+            strategy=self.neg_strategy,
+            ratio=self.neg_ratio,
+            corrupt_base_facts=self.neg_corrupt_base_facts,
+        )
 
         return kg
 
-    def _add_negative_samples(self, kg: KnowledgeGraph) -> KnowledgeGraph:
+    @staticmethod
+    def check_structural_isomorphism(kg1: KnowledgeGraph, kg2: KnowledgeGraph) -> bool:
         """
-        Adds negative samples to the knowledge graph using local CWA.
-        Note that we only generate negatives for positive triples.
-        There are no negatives for memberships or attribute triples.
+        Checks if two Knowledge Graphs are structurally isomorphic.
 
-        (from RRN paper, Appendix D), but work in progress:
-        "We generated exactly one negative inference for each positive
-        inference that exists in the data by corrupting each of these
-        positive inferences exactly once."
+        Ignores Individual names but preserves:
+        - Graph topology (Relations)
+        - Class memberships (as node attributes)
+        - Attribute values (as node attributes)
 
-        For each positive triple:
-            1. Randomly corrupt either subject OR object
-            2. Verify the corrupted triple doesn't create inconsistency
-            3. Add as negative triple
-
-        EXAMPLE:
-            Positive: parent(Ind_0, Ind_1)
-            Negative: parent(Ind_0, Ind_3)   [corrupted object]
-                   OR parent(Ind_2, Ind_1)   [corrupted subject]
-
-        Args:
-            kg (KnowledgeGraph): KG with only positive triples.
-
-        Returns:
-            KnowledgeGraph: KG with balanced positive/negative triples.
+        Requires networkx.
         """
-        positive_triples = []
-        negative_triples = []
 
-        for triple in kg.triples:
-            if triple.positive:
-                positive_triples.append(triple)
-            else:
-                negative_triples.append(triple)
-
-        # Generate one negative for each positive
-        for pos_triple in positive_triples:
-            max_attempts = 10  # Limit attempts to avoid infinite loops
-
-            for attempt in range(max_attempts):
-                neg_triple = self._corrupt_triple(pos_triple, kg)
-
-                # Verify consistency: negative shouldn't conflict with positives
-                if not self._creates_inconsistency(neg_triple, kg):
-                    negative_triples.append(neg_triple)
-                    break
-
-        # Add negatives to KG
-        kg.triples.extend(negative_triples)
-
-        if self.verbose and len(negative_triples) < len(positive_triples):
-            print(
-                f"Warning: Generated {len(negative_triples)}/{len(positive_triples)} negatives"
-            )
-
-        classes = {cls.name for cls in self.schema_classes.values()}
-
-        # TODO add way more sophisticated negative sampling!
-
-        return kg
-
-    def _corrupt_triple(self, triple: Triple, kg: KnowledgeGraph) -> Triple:
-        """
-        Creates a negative triple by corrupting subject or object.
-
-        Randomly chooses to corrupt either:
-            - Subject: Replace with random different individual
-            - Object: Replace with random different individual
-
-        Args:
-            triple (Triple): Positive triple to corrupt.
-            kg (KnowledgeGraph): Current knowledge graph (for individual pool).
-
-        Returns:
-            Triple: Corrupted negative triple.
-        """
-        if random.random() < 0.5:
-            # Corrupt subject
-            candidates = [i for i in kg.individuals if i != triple.subject]
-            if not candidates:
-                # Fallback: corrupt object instead
-                candidates = [i for i in kg.individuals if i != triple.object]
-                new_obj = random.choice(candidates)
-                return Triple(
-                    triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
+        def to_nx(kg):
+            G = nx.MultiDiGraph()
+            # Nodes with attributes (Classes + Data Attributes)
+            for ind in kg.individuals:
+                # Classes as frozenset for hashable comparison
+                clss = frozenset(
+                    [
+                        m.cls.name
+                        for m in kg.memberships
+                        if m.individual == ind and m.is_member
+                    ]
                 )
+                # Attributes as sorted tuple
+                attrs = []
+                for at in kg.attribute_triples:
+                    if at.subject == ind:
+                        attrs.append((at.predicate.name, str(at.value)))
+                attrs = tuple(sorted(attrs))
 
-            new_subj = random.choice(candidates)
-            return Triple(
-                new_subj, triple.predicate, triple.object, positive=False, proofs=[]
-            )
-        else:
-            # Corrupt object
-            candidates = [i for i in kg.individuals if i != triple.object]
-            if not candidates:
-                # Fallback: corrupt subject instead
-                candidates = [i for i in kg.individuals if i != triple.subject]
-                new_subj = random.choice(candidates)
-                return Triple(
-                    new_subj, triple.predicate, triple.object, positive=False, proofs=[]
-                )
+                G.add_node(ind.name, classes=clss, attrs=attrs)
 
-            new_obj = random.choice(candidates)
-            return Triple(
-                triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
-            )
+            # Edges (Relations)
+            for t in kg.triples:
+                if t.positive:
+                    G.add_edge(t.subject.name, t.object.name, label=t.predicate.name)
+            return G
 
-    def _creates_inconsistency(self, neg_triple: Triple, kg: KnowledgeGraph) -> bool:
-        """
-        Checks if a negative triple would create inconsistency.
+        G1 = to_nx(kg1)
+        G2 = to_nx(kg2)
 
-        A negative triple is inconsistent if its positive version
-        exists in the knowledge graph.
+        # Node matcher checks classes and attributes
+        nm = nx.algorithms.isomorphism.categorical_node_match(
+            ["classes", "attrs"], [frozenset(), tuple()]
+        )
+        # Edge matcher checks relation type
+        em = nx.algorithms.isomorphism.categorical_edge_match("label", None)
 
-        Args:
-            neg_triple (Triple): Negative triple to check.
-            kg (KnowledgeGraph): Current knowledge graph.
-
-        Returns:
-            bool: True if inconsistent, False otherwise.
-        """
-        # Check if positive version exists
-        for triple in kg.triples:
-            if (
-                triple.positive
-                and triple.subject.name == neg_triple.subject.name
-                and triple.predicate.name == neg_triple.predicate.name
-                and triple.object.name == neg_triple.object.name
-            ):
-                return True
-
-        return False
+        return nx.is_isomorphic(G1, G2, node_match=nm, edge_match=em)
 
     def _print_dataset_summary(
         self,
         train_samples: List[KnowledgeGraph],
         test_samples: List[KnowledgeGraph],
     ) -> None:
-        """
-        Prints summary statistics for generated datasets.
-
-        Args:
-            train_samples (List[KG]): Training samples.
-            test_samples (List[KG]): Test samples.
-        """
+        """Print summary statistics for generated datasets."""
 
         def compute_stats(samples: List[KnowledgeGraph]) -> Dict:
-            """Compute statistics for a list of samples."""
             if not samples:
                 return {}
 
@@ -470,22 +414,22 @@ class KGEDatasetGenerator:
                 "avg_individuals": sum(len(s.individuals) for s in samples)
                 / len(samples),
                 "avg_triples": sum(len(s.triples) for s in samples) / len(samples),
-                "avg_memberships": sum(len(s.memberships) for s in samples)
-                / len(samples),
                 "avg_pos_triples": sum(
-                    len([t for t in s.triples if t.positive]) for s in samples
+                    sum(1 for t in s.triples if t.positive) for s in samples
                 )
                 / len(samples),
                 "avg_neg_triples": sum(
-                    len([t for t in s.triples if not t.positive]) for s in samples
+                    sum(1 for t in s.triples if not t.positive) for s in samples
+                )
+                / len(samples),
+                "avg_memberships": sum(len(s.memberships) for s in samples)
+                / len(samples),
+                "avg_pos_memberships": sum(
+                    sum(1 for m in s.memberships if m.is_member) for s in samples
                 )
                 / len(samples),
                 "avg_neg_memberships": sum(
-                    len([m for m in s.memberships if not m.is_member]) for s in samples
-                )
-                / len(samples),
-                "avg_pos_memberships": sum(
-                    len([m for m in s.memberships if m.is_member]) for s in samples
+                    sum(1 for m in s.memberships if not m.is_member) for s in samples
                 )
                 / len(samples),
             }
@@ -497,6 +441,39 @@ class KGEDatasetGenerator:
         print(f"\n{'=' * 80}")
         print("DATASET GENERATION COMPLETE")
         print(f"{'=' * 80}")
+
+        # Check isomorphism
+        print("Checking structural isomorphism...")
+        isomorphic_count = 0
+        for train_kg in train_samples:
+            for test_kg in test_samples:
+                if self.check_structural_isomorphism(train_kg, test_kg):
+                    isomorphic_count += 1
+                    break
+
+        if isomorphic_count > 0:
+            print(
+                f"Warning: Found {isomorphic_count} isomorphic samples between train/test"
+            )
+        else:
+            print("✓ No structural isomorphism between train and test")
+
+        # Rule coverage analysis
+        print(f"\n--- Rule Coverage Analysis ---")
+        print(f"Train set uses {len(self.train_rule_usage)}/{len(self.rules)} rules")
+        print(f"Test set uses {len(self.test_rule_usage)}/{len(self.rules)} rules")
+
+        unused_in_train = set(r.name for r in self.rules) - set(
+            self.train_rule_usage.keys()
+        )
+        unused_in_test = set(r.name for r in self.rules) - set(
+            self.test_rule_usage.keys()
+        )
+
+        if unused_in_train:
+            print(f"Warning: {len(unused_in_train)} rules unused in training")
+        if unused_in_test:
+            print(f"Warning: {len(unused_in_test)} rules unused in testing")
 
         print("\nTRAINING SET:")
         print(f"  Samples:              {train_stats.get('n_samples', 0)}")
@@ -630,65 +607,71 @@ def main():
         description="Generate RRN training/testing datasets from an ontology with constraint checking"
     )
     parser.add_argument(
-        "--ontology",
+        "--ontology-path", type=str, required=True, help="Path to ontology file (.ttl)"
+    )
+    parser.add_argument(
+        "--output", type=str, default="data/out/", help="Output directory"
+    )
+    parser.add_argument(
+        "--n-train", type=int, default=5, help="Number of training samples"
+    )
+    parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
+    parser.add_argument("--min-individuals", type=int, default=1)
+    parser.add_argument("--max-individuals", type=int, default=1000)
+    parser.add_argument("--max-recursion", type=int, default=10)
+    parser.add_argument("--global-max-depth", type=int, default=10)
+    parser.add_argument("--max-proofs-per-atom", type=int, default=10)
+
+    # Individual pooling arguments
+    parser.add_argument(
+        "--individual-pool-size",
+        type=int,
+        default=50,
+        help="Size of individual pool for reuse",
+    )
+    parser.add_argument(
+        "--individual-reuse-prob",
+        type=float,
+        default=0,
+        help="Probability of reusing vs creating new individual (0.0-1.0)",
+    )
+
+    # Negative sampling arguments
+    parser.add_argument(
+        "--neg-strategy",
         type=str,
-        required=True,
-        help="Path to the ontology file (.ttl format)",
+        default="constrained",
+        choices=["random", "constrained", "proof_based", "type_aware"],
+        help="Negative sampling strategy",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="data/out/",
-        help="Output directory for CSV files",
+        "--neg-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of negative to positive samples",
     )
     parser.add_argument(
-        "--n-train",
-        type=int,
-        default=5,
-        help="Number of training samples to generate",
-    )
-    parser.add_argument(
-        "--n-test",
-        type=int,
-        default=2,
-        help="Number of test samples to generate",
-    )
-    parser.add_argument(
-        "--min-individuals",
-        type=int,
-        default=5,
-        help="Minimum individuals per sample",
-    )
-    parser.add_argument(
-        "--max-individuals",
-        type=int,
-        default=30,
-        help="Maximum individuals per sample",
-    )
-    parser.add_argument(
-        "--max-recursion",
-        type=int,
-        default=6,
-        help="Maximum recursion depth for rules",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
-        "--verbose",
+        "--neg-corrupt-base-facts",
         action="store_true",
-        help="Enable verbose logging",
+        help="For proof_based: corrupt base facts in proof trees",
     )
+
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
 
     # Initialize generator
     generator = KGEDatasetGenerator(
-        ontology_file=args.ontology,
+        ontology_file=args.ontology_path,
         max_recursion=args.max_recursion,
+        global_max_depth=args.global_max_depth,
+        max_proofs_per_atom=args.max_proofs_per_atom,
+        individual_pool_size=args.individual_pool_size,
+        individual_reuse_prob=args.individual_reuse_prob,
+        neg_strategy=args.neg_strategy,
+        neg_ratio=args.neg_ratio,
+        neg_corrupt_base_facts=args.neg_corrupt_base_facts,
         seed=args.seed,
         verbose=args.verbose,
     )
@@ -705,9 +688,22 @@ def main():
     save_dataset_to_csv(train_samples, f"{args.output}/train", prefix="train_sample")
     save_dataset_to_csv(test_samples, f"{args.output}/test", prefix="test_sample")
 
-    print("\n✓ Dataset generation complete!")
-    print(f"  Training samples: {args.output}/train/")
-    print(f"  Test samples: {args.output}/test/")
+    print("\nDataset generation complete!")
+
+    print("\nVisualizing samples...")
+    visualizer = GraphVisualizer("train-test-graphs")
+
+    for i, sample in enumerate(train_samples):
+        # Visualize Graph
+        visualizer.visualize(
+            sample, f"train_sample_{i + 1}.png", title=f"TRAIN Sample {i + 1}"
+        )
+
+    for i, sample in enumerate(test_samples):
+        # Visualize Graph
+        visualizer.visualize(
+            sample, f"test_sample_{i + 1}.png", title=f"TEST Sample {i + 1}"
+        )
 
 
 if __name__ == "__main__":

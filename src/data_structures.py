@@ -134,7 +134,6 @@ class Membership:
     individual: Individual
     cls: Class
     is_member: bool  # True if member, False if explicitly not a member
-    # is_inferred: bool  # Still needed for old reldata compatibility
 
     # Keep track of all proofs leading to this membership fact
     proofs: List["Proof"] = field(default_factory=list)
@@ -178,7 +177,6 @@ class Triple:
     predicate: Relation
     object: Individual
     positive: bool  # True for positive predicate, False for negated predicate
-    # is_inferred: bool  # Still needed for old reldata compatibility
 
     # Keep track of all proofs leading to this triple fact
     proofs: List["Proof"] = field(default_factory=list)
@@ -649,6 +647,14 @@ class Atom:
             object=substitution.get(self.object, self.object),
         )
 
+    def get_variables(self) -> Set[Var]:
+        """Returns all variables in this atom."""
+        vars = set()
+        for term in [self.subject, self.predicate, self.object]:
+            if isinstance(term, Var):
+                vars.add(term)
+        return vars
+
 
 @dataclass
 class ExecutableRule:
@@ -751,6 +757,11 @@ class Proof:
     recursive_use_counts: frozenset[Tuple[str, int]] = field(default_factory=frozenset)
     # field() returns an empty frozenset
 
+    # Maps variables in the rule to their ground terms
+    substitutions: Dict[Var, Term] = field(
+        default_factory=dict, hash=False, compare=False
+    )
+
     def __post_init__(self):
         # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
@@ -781,7 +792,7 @@ class Proof:
         """
 
         # This is a base fact (a leaf)
-        if self.rule is None:
+        if self.is_base_fact():
             return {self.goal}
 
         # Derived fact: gather base facts from sub-proofs
@@ -790,66 +801,289 @@ class Proof:
             base_facts.update(sp.get_base_facts())
         return base_facts
 
-    def get_recursion_depth(self, rule: ExecutableRule) -> int:
-        """
-        Gets the number of times the given recursive rule was used in this proof path.
-        """
-        for name, count in self.recursive_use_counts:
-            if name == rule.name:
-                return count
-        return 0
+    def get_all_atoms(self) -> Set[Atom]:
+        """Returns all atoms (base + inferred) in this proof tree."""
+        atoms = {self.goal}
+        for sp in self.sub_proofs:
+            atoms.update(sp.get_all_atoms())
+        return atoms
 
-    def get_max_recursion_depth(self) -> int:
-        """
-        Gets the maximum depth of any recursive rule in this proof.
-        """
-        # Check if there are any recursive rules used
-        if not self.recursive_use_counts:
+    def get_depth(self) -> int:
+        """Returns the maximum depth of this proof tree."""
+        if self.is_base_fact():
             return 0
+        return 1 + max((sp.get_depth() for sp in self.sub_proofs), default=0)
 
-        # If there are, return the max count
-        return max(count for _, count in self.recursive_use_counts)
+    def get_statistics(self) -> Dict[str, Any]:
+        """Returns statistics about this proof tree."""
+        all_atoms = self.get_all_atoms()
+        base_facts = self.get_base_facts()
+
+        individuals = set()
+        for atom in all_atoms:
+            for term in [atom.subject, atom.object]:
+                if isinstance(term, Individual):
+                    individuals.add(term.name)
+
+        rules_used = set()
+
+        def collect_rules(p: Proof):
+            if p.rule:
+                rules_used.add(p.rule.name)
+            for sp in p.sub_proofs:
+                collect_rules(sp)
+
+        collect_rules(self)
+
+        return {
+            "total_atoms": len(all_atoms),
+            "base_facts": len(base_facts),
+            "inferred_facts": len(all_atoms) - len(base_facts),
+            "depth": self.get_depth(),
+            "individuals": len(individuals),
+            "rules_used": sorted(rules_used),
+            "max_recursion": max(
+                (count for _, count in self.recursive_use_counts), default=0
+            ),
+        }
+
+    def save_visualization(
+        self, filepath: str, format: str = "pdf", title: Optional[str] = None
+    ) -> None:
+        """
+        Save proof tree visualization to file.
+
+        Args:
+            filepath: Output file path (without extension)
+            format: Output format ("pdf", "png", "svg")
+            title: Optional title for the graph
+        """
+
+        dot = self._create_graphviz()
+
+        if title:
+            dot.attr(
+                label=title, labelloc="t", fontsize="16", fontname="Helvetica-Bold"
+            )
+
+        try:
+            dot.render(filepath, format=format, cleanup=True)
+            print(f"✓ Saved proof visualization to: {filepath}.{format}")
+        except Exception as e:
+            print(f"✗ Failed to render graph: {e}")
+            # Save .dot file as fallback
+            dot.save(filepath + ".dot")
+            print(f"  Saved .dot file to: {filepath}.dot")
+
+    def _create_graphviz(self) -> Any:
+        """
+        Create a Graphviz graph object for this proof tree.
+
+        Returns:
+            graphviz.Digraph: The graph object
+        """
+        import graphviz
+
+        dot = graphviz.Digraph(comment="Proof Tree")
+
+        # Layout settings
+        dot.attr(rankdir="BT")  # Bottom to top (premises support conclusions)
+        dot.attr(splines="ortho")
+        dot.attr(nodesep="0.6", ranksep="0.8")
+        dot.attr("node", shape="plain", fontname="Helvetica")
+
+        # Track node IDs
+        node_counter = [0]  # Use list for mutable counter in closure
+        node_ids: Dict[Proof, str] = {}
+
+        def add_proof_node(proof: Proof, parent_id: Optional[str] = None) -> str:
+            """Recursively add proof nodes to graph."""
+            # Reuse node if already created (DAG structure)
+            if proof in node_ids:
+                return node_ids[proof]
+
+            # Create unique node ID
+            node_id = f"node_{node_counter[0]}"
+            node_counter[0] += 1
+            node_ids[proof] = node_id
+
+            # Determine node styling
+            if proof.is_base_fact():
+                header_color = "#E8F5E9"  # Light green
+                border_color = "#2E7D32"  # Dark green
+                type_label = "BASE FACT"
+            else:
+                header_color = "#E3F2FD"  # Light blue
+                border_color = "#1565C0"  # Dark blue
+                type_label = f"Rule: {proof.rule.name}"
+
+            # Format goal atom
+            goal_html = self._format_atom_html(proof.goal)
+
+            # Build HTML label
+            label = (
+                f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="{border_color}">'
+                f'<TR><TD BGCOLOR="{border_color}"><FONT COLOR="white"><B>{type_label}</B></FONT></TD></TR>'
+                f'<TR><TD BGCOLOR="{header_color}">{goal_html}</TD></TR>'
+            )
+
+            # Add substitutions section
+            if proof.substitutions:
+                label += '<TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#555555"><I>Substitutions:</I><BR/>'
+                sub_rows = [
+                    f"{k.name} &rarr; <B>{self._format_term(v)}</B>"
+                    for k, v in proof.substitutions.items()
+                ]
+
+                # Split into columns if many substitutions
+                if len(sub_rows) > 3:
+                    mid = len(sub_rows) // 2 + 1
+                    col1 = "<BR/>".join(sub_rows[:mid])
+                    col2 = "<BR/>".join(sub_rows[mid:])
+                    label += f'<TABLE BORDER="0" CELLSPACING="5"><TR><TD>{col1}</TD><TD>{col2}</TD></TR></TABLE>'
+                else:
+                    label += "<BR/>".join(sub_rows)
+                label += "</FONT></TD></TR>"
+
+            # Add recursion info
+            if proof.recursive_use_counts:
+                rec_info = ", ".join(
+                    [f"{name}:{count}" for name, count in proof.recursive_use_counts]
+                )
+                label += f'<TR><TD BGCOLOR="#FFF3E0"><FONT POINT-SIZE="8">Recursion: {rec_info}</FONT></TD></TR>'
+
+            label += "</TABLE>>"
+
+            # Add node to graph
+            dot.node(node_id, label=label)
+
+            # Recursively add sub-proofs
+            if proof.rule:
+                for i, (premise_pattern, sub_proof) in enumerate(
+                    zip(proof.rule.premises, proof.sub_proofs)
+                ):
+                    sub_id = add_proof_node(sub_proof, node_id)
+
+                    # Edge label
+                    edge_label = (
+                        f"premise {i + 1}:\n{self._format_atom(premise_pattern)}"
+                    )
+
+                    # Edge from premise to conclusion (BT layout)
+                    dot.edge(
+                        sub_id,
+                        node_id,
+                        label=edge_label,
+                        fontsize="9",
+                        fontcolor="#666666",
+                        style="dashed",
+                    )
+
+            return node_id
+
+        # Build the graph starting from root
+        add_proof_node(self)
+
+        return dot
+
+    def _format_atom_html(self, atom: Atom) -> str:
+        """Format an atom with HTML tags for bold Subject/Object."""
+        s = self._format_term(atom.subject)
+        p = self._format_term(atom.predicate)
+        o = self._format_term(atom.object)
+
+        # Beautify RDF Type
+        if p == "rdf:type":
+            p = '<FONT COLOR="#666666">rdf:type</FONT>'
+
+        return f"<B>{s}</B> {p} <B>{o}</B>"
+
+    def print(self, indent: int = 0) -> None:
+        """Print the proof tree to console."""
+        print(self.format_tree(indent))
+
+    def save_text(self, filepath: str) -> None:
+        """
+        Save proof tree as formatted text file.
+
+        Args:
+            filepath: Output file path
+        """
+        with open(filepath, "w") as f:
+            f.write("PROOF TREE\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Write statistics
+            stats = self.get_statistics()
+            f.write("Statistics:\n")
+            f.write(f"  Total atoms: {stats['total_atoms']}\n")
+            f.write(f"  Base facts: {stats['base_facts']}\n")
+            f.write(f"  Inferred facts: {stats['inferred_facts']}\n")
+            f.write(f"  Max depth: {stats['depth']}\n")
+            f.write(f"  Individuals: {stats['individuals']}\n")
+            f.write(f"  Rules used: {', '.join(stats['rules_used'])}\n")
+            f.write(f"  Max recursion: {stats['max_recursion']}\n")
+            f.write("\n" + "=" * 80 + "\n\n")
+
+            # Write proof tree
+            f.write("Proof Tree:\n")
+            f.write(self.format_tree())
+
+        print(f"✓ Saved proof tree to: {filepath}")
+
+    def _format_atom(self, atom: Atom) -> str:
+        """Helper to format an atom."""
+        s = self._format_term(atom.subject)
+        p = self._format_term(atom.predicate)
+        o = self._format_term(atom.object)
+        return f"({s}, {p}, {o})"
+
+    def _format_term(self, term: Term) -> str:
+        """Helper to format a term."""
+        if hasattr(term, "name"):
+            return term.name
+        if term == RDF.type:
+            return "rdf:type"
+        return str(term)
+
+    def _format_subs(self) -> str:
+        """Helper to format substitutions."""
+        items = [
+            f"{v.name}->{self._format_term(t)}" for v, t in self.substitutions.items()
+        ]
+        return "{" + ", ".join(items) + "}"
 
     @staticmethod
     def create_base_proof(atom: Atom) -> "Proof":
-        """
-        Creates a proof for a base fact (a leaf).
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a base fact (leaf)."""
         if not atom.is_ground():
             raise ValueError("Base fact proof must be for a ground atom.")
-
-        # Return a proof with no rule and no sub-proofs for the base fact (ground Atom)
-        return Proof(goal=atom, rule=None, sub_proofs=tuple())
+        return Proof(goal=atom, rule=None, sub_proofs=tuple(), substitutions={})
 
     @staticmethod
     def create_derived_proof(
-        goal: Atom, rule: ExecutableRule, sub_proofs: List["Proof"]
+        goal: Atom,
+        rule: ExecutableRule,
+        sub_proofs: List["Proof"],
+        substitutions: Dict[Var, Term],
     ) -> "Proof":
-        """
-        Creates a proof for a derived fact (a node), tracking recursion.
-        """
-        # Goal must be a ground atom
+        """Creates a proof for a derived fact (node), tracking substitutions."""
         if not goal.is_ground():
-            raise ValueError("Derived proof goal must be a ground atom.")
+            raise ValueError("Derived proof goal must be ground.")
 
-        # Combine recursive_use_counts from sub-proofs
+        # Combine recursive counts from sub-proofs
         new_counts: Dict[str, int] = {}
         for sp in sub_proofs:
             for name, count in sp.recursive_use_counts:
-                # We take the MAX depth from any sub-proof branch for each rule
-                # to make sure that the depth doesn't get underestimated.
                 new_counts[name] = max(new_counts.get(name, 0), count)
 
-        # Update this rule's count if it's recursive
         if rule.is_recursive():
-            name = rule.name
-            new_counts[name] = new_counts.get(name, 0) + 1
+            new_counts[rule.name] = new_counts.get(rule.name, 0) + 1
 
-        # Return the proof
         return Proof(
             goal=goal,
             rule=rule,
             sub_proofs=tuple(sub_proofs),
             recursive_use_counts=frozenset(new_counts.items()),
+            substitutions=substitutions.copy(),  # Store the substitutions
         )

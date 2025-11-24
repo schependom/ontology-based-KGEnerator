@@ -4,39 +4,35 @@
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
-:Person rdf:type owl:Class .
+:Person        rdf:type            owl:Class .
 
-:Man rdf:type owl:Class ;
-     rdfs:subClassOf :Person .
+:Man           rdf:type            owl:Class ;
+               rdfs:subClassOf     :Person .                # class hierarchy
+
+:Woman         rdf:type            owl:Class ;
+               rdfs:subClassOf     :Person ;
+               owl:disjointWith    :Man .                   # constraints
+
+:hasParent     rdf:type       owl:ObjectProperty ;
+               rdfs:domain    :Person ;
+               rdfs:range     :Person ;
+               rdf:type       owl:IrreflexiveProperty .
+
+:hasChild      rdf:type       owl:ObjectProperty ;
+               owl:inverseOf  :hasParent ;
+               rdf:type       owl:IrreflexiveProperty ;
+               rdfs:domain    :Person ;
+               rdfs:range     :Person .
     
-:Woman rdf:type owl:Class ;
-       rdfs:subClassOf :Person ;
-       owl:disjointWith :Man .
+:hasGrandparent     rdf:type                 owl:ObjectProperty ;
+                    rdf:type                 owl:IrreflexiveProperty ;
+                    owl:propertyChainAxiom   ( :hasParent :hasParent ) ;
+                    rdfs:domain             :Person ;
+                    rdfs:range              :Person .
 
-:hasParent rdf:type owl:ObjectProperty ;
-           rdfs:domain :Person ;
-           rdfs:range :Person ;
-           rdf:type owl:IrreflexiveProperty .
-
-:hasGrandparent rdf:type owl:ObjectProperty ;
-             rdf:type owl:IrreflexiveProperty ;
-             rdfs:domain :Person ;
-             rdfs:range :Person .
-
-:hasGrandfather rdf:type owl:ObjectProperty ;
-            rdfs:subPropertyOf :hasGrandparent ;
-            rdfs:domain :Person ;
-            rdfs:range :Person .
-
-:hasGrandfather owl:propertyChainAxiom ( :hasParent :hasFather ) .
-
-:hasFather rdfs:range :Man ;
-           rdfs:subPropertyOf :hasParent .
-
-:hasChild   rdf:type owl:ObjectProperty ;
-            owl:inverseOf :hasParent ;
-            rdf:type owl:IrreflexiveProperty ;
-            rdfs:domain :Person ;
-            rdfs:range :Person .
+:hasGrandfather     rdf:type            owl:ObjectProperty ;
+                    rdfs:subPropertyOf  :hasGrandparent ;
+                    rdfs:domain         :Person ;
+                    rdfs:range          :Man ;
+                    rdf:type            owl:IrreflexiveProperty .

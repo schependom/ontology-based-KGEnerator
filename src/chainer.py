@@ -1,17 +1,7 @@
 """
 DESCRIPTION
 
-    Pure Python Backward-Chaining Knowledge Graph Generator with detailed logging.
-
-WORKFLOW
-
-    - Initialize BackwardChainer with all rules from the ontology parser.
-    - Start from a "goal rule" and attempt to prove its conclusion.
-        - Recursively find proofs for each premise of the rule.
-        - Generate new individuals as needed for unbound variables.
-        - Track recursive rule usage to prevent infinite loops.
-        - Track atoms in proof path to prevent circular reasoning.
-        - CHECK CONSTRAINTS after generating each proof to ensure validity.
+    Pure Python Backward-Chaining Knowledge Graph Generator.
 
 AUTHOR
 
@@ -19,6 +9,7 @@ AUTHOR
 """
 
 from collections import defaultdict
+import random
 from data_structures import (
     Atom,
     ExecutableRule,
@@ -43,15 +34,6 @@ class BackwardChainer:
 
     This engine starts with a "goal rule" and tries to find all possible
     proof trees for its conclusion, generating new individuals along the way.
-
-    Key features:
-    - Backward chaining from goal to premises
-    - Automatic individual generation for unbound variables
-    - Recursion depth limiting for recursive rules
-    - Circular reasoning prevention via atom path tracking
-    - Constraint checking to ensure valid proofs
-    - Support for ReflexiveProperty, FunctionalProperty, and attributes
-    - Optional verbose logging for debugging
     """
 
     def __init__(
@@ -59,7 +41,12 @@ class BackwardChainer:
         all_rules: List[ExecutableRule],
         constraints: List[Constraint] = None,
         max_recursion_depth: int = 2,
+        global_max_depth: int = 5,
+        max_proofs_per_atom: int = None,
+        individual_pool_size: int = 50,
+        individual_reuse_prob: float = 0.7,
         verbose: bool = False,
+        export_proof_visualizations: bool = False,
     ):
         """
         Initializes the chainer.
@@ -69,35 +56,43 @@ class BackwardChainer:
             constraints (List[Constraint]):     All constraints from the ontology parser.
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
+            global_max_depth (int):             Hard limit on total proof tree depth.
+            max_proofs_per_atom (int):          Max number of proofs to generate for any single atom.
+            individual_pool_size (int):         Number of individuals to keep in the pool for reuse.
+            individual_reuse_prob (float):      Probability of reusing an existing individual from the pool.
             verbose (bool):                     Enable detailed debug output.
+            export_proof_visualizations (bool): Whether to export proof visualizations.
         """
         # Store rules as dict {rule_name: ExecutableRule} for fast lookup
         self.all_rules = {rule.name: rule for rule in all_rules}
         self.constraints = constraints if constraints else []
         self.max_recursion_depth = max_recursion_depth
+        self.global_max_depth = global_max_depth
+        self.max_proofs_per_atom = max_proofs_per_atom
         self.verbose = verbose
+        self.export_proof_visualizations = export_proof_visualizations
 
-        # Index rules by their conclusion for O(1) lookup
-        # Dict[Tuple, List[ExecutableRule]]: atom_key -> [rules with that conclusion]
+        # Individual pooling parameters
+        self.individual_pool_size = individual_pool_size
+        self.individual_reuse_prob = individual_reuse_prob
+        self.individual_pool: List[Individual] = []
+        self._individual_counter = 0
+
+        # Index rules and find recursive ones
         self.rules_by_head = self._index_rules(all_rules)
-
-        # Find all rule names that are part of a recursive cycle
-        # (including mutual recursion, e.g., P -> Q, Q -> P)
         self.recursive_rules: Set[str] = self._find_recursive_rules(all_rules)
-        if self.recursive_rules:
-            print(f"Chainer identified {len(self.recursive_rules)} recursive rules:")
-            for rule_name in self.recursive_rules:
-                print(f"  - {rule_name}")
 
-        # Index constraints for efficient checking
+        if self.recursive_rules and self.verbose:
+            print(f"Identified {len(self.recursive_rules)} recursive rules")
+
+        # Index constraints
         self._index_constraints()
 
-        # Counters for generating unique entities
-        self._var_rename_counter = 0  # For renaming rule variables
-        self._individual_counter = 0  # For generating new individuals
+        # Counters
+        self._var_rename_counter = 0
 
-        # Track functional property values to ensure uniqueness
-        # Dict[Tuple[Individual, Relation], Term]: (subject, functional_prop) -> unique_object
+        # Track functional property values (ensure uniqueness)
+        # A functional property must have at most one value per subject
         self._functional_property_values: Dict[Tuple[Individual, Relation], Term] = {}
 
     def _index_constraints(self) -> None:
@@ -140,7 +135,7 @@ class BackwardChainer:
                         self.functional_properties.add(prop)
 
         if self.verbose:
-            print(f"\nConstraint indexing complete:")
+            print("Constraint indexing complete:")
             print(
                 f"  Disjoint class pairs: {sum(len(v) for v in self.disjoint_classes.values()) // 2}"
             )
@@ -270,35 +265,40 @@ class BackwardChainer:
 
         return recursive_rule_names
 
-    def _get_fresh_individual(self) -> Individual:
+    def _get_individual(self, reuse: bool = False) -> Individual:
         """
-        Generates a new, unique Individual with an auto-incremented name.
-
-        Returns:
-            Individual: A new individual with a unique name (e.g., "Ind_0", "Ind_1").
-        """
-        idx = self._individual_counter
-        self._individual_counter += 1
-        return Individual(index=idx, name=f"Ind_{idx}")
-
-    def _get_vars_in_atom(self, atom: Atom) -> Set[Var]:
-        """
-        Extracts all Var objects present in an atom.
+        Gets an individual from the pool or creates a new one.
 
         Args:
-            atom (Atom): The atom to extract variables from.
+            reuse: Whether to attempt reuse from pool
 
         Returns:
-            Set[Var]: Set of all variables in the atom.
+            Individual: Either from pool or newly created
         """
-        vars: Set[Var] = set()
-        if isinstance(atom.subject, Var):
-            vars.add(atom.subject)
-        if isinstance(atom.predicate, Var):
-            vars.add(atom.predicate)
-        if isinstance(atom.object, Var):
-            vars.add(atom.object)
-        return vars
+        # Decide whether to reuse based on probability and pool availability
+        if (
+            reuse
+            and self.individual_pool
+            and random.random() < self.individual_reuse_prob
+        ):
+            return random.choice(self.individual_pool)
+
+        # Create new individual
+        idx = self._individual_counter
+        self._individual_counter += 1
+        ind = Individual(index=idx, name=f"Ind_{idx}")
+
+        # Add to pool if not full
+        if len(self.individual_pool) < self.individual_pool_size:
+            self.individual_pool.append(ind)
+
+        return ind
+
+    def reset_individual_pool(self):
+        """Resets the individual pool (call between samples)."""
+        self.individual_pool = []
+        self._individual_counter = 0
+        self._functional_property_values = {}
 
     def _rename_rule_vars(self, rule: ExecutableRule) -> ExecutableRule:
         """
@@ -498,31 +498,8 @@ class BackwardChainer:
         return True
 
     def _collect_all_atoms(self, proof: Proof) -> Set[Atom]:
-        """
-        Collects all atoms (goals) from a proof tree via traversal.
-
-        This is used for constraint checking - we need to examine all derived
-        facts in the proof tree to detect violations.
-
-        Args:
-            proof (Proof): The proof tree to traverse.
-
-        Returns:
-            Set[Atom]: Set of all ground atoms in the proof tree.
-        """
-        atoms: Set[Atom] = set()
-        visited: Set[Proof] = set()
-
-        def traverse(p: Proof):
-            if p in visited:
-                return
-            visited.add(p)
-            atoms.add(p.goal)
-            for sub_proof in p.sub_proofs:
-                traverse(sub_proof)
-
-        traverse(proof)
-        return atoms
+        """Collects all atoms from a proof tree."""
+        return proof.get_all_atoms()
 
     def generate_proof_trees(self, start_rule_name: str) -> Iterator[Proof]:
         """
@@ -578,7 +555,7 @@ class BackwardChainer:
         # )
 
         # Extract variables from the conclusion
-        conclusion_vars = self._get_vars_in_atom(rule.conclusion)
+        conclusion_vars = rule.conclusion.get_variables()
         # Example: {Var('X_1'), Var('Z_1')}
 
         if not conclusion_vars:
@@ -591,14 +568,14 @@ class BackwardChainer:
         # Generate fresh individuals for all conclusion variables
         subst: Dict[Var, Term] = {}
         for var in conclusion_vars:
-            subst[var] = self._get_fresh_individual()
+            subst[var] = self._get_individual(reuse=True)
         # Example: subst = {
         #   Var('X_1'): Individual('Ind_0'),
         #   Var('Z_1'): Individual('Ind_1')
         # }
 
         if self.verbose:
-            print(f"\nInitial substitution for conclusion variables:")
+            print("Initial substitution for conclusion variables:")
             for var, ind in subst.items():
                 print(f"  {var} -> {ind}")
 
@@ -623,13 +600,13 @@ class BackwardChainer:
         # Find any remaining unbound variables in premises
         unbound_vars: Set[Var] = set()
         for p in premises_with_bound_vars:
-            unbound_vars.update(self._get_vars_in_atom(p))
+            unbound_vars.update(p.get_variables())
         # Example: {Var('Y_1')}
 
         # Generate individuals for unbound variables
         for var in unbound_vars:
             if var not in subst:
-                subst[var] = self._get_fresh_individual()
+                subst[var] = self._get_individual(reuse=True)
                 if self.verbose:
                     print(f"  Generated {subst[var]} for unbound variable {var}")
         # Example: subst = {
@@ -654,7 +631,7 @@ class BackwardChainer:
             return
 
         if self.verbose:
-            print(f"\nGround premises to prove:")
+            print("Ground premises to prove:")
             for i, prem in enumerate(ground_premises):
                 print(f"  {i + 1}. {self._format_atom(prem)}")
 
@@ -668,7 +645,7 @@ class BackwardChainer:
         for premise in ground_premises:
             proof_list = list(
                 self._find_proofs_recursive(
-                    premise, recursive_use_counts, atoms_in_path
+                    premise, recursive_use_counts, atoms_in_path, depth=1
                 )
             )
 
@@ -702,6 +679,7 @@ class BackwardChainer:
                 goal=ground_goal,
                 rule=start_rule,  # Use unrenamed rule
                 sub_proofs=list(sub_proof_combination),
+                substitutions=subst,
             )
 
             # ==================== CONSTRAINT CHECKING ==================== #
@@ -711,6 +689,15 @@ class BackwardChainer:
             # Check if proof satisfies all constraints
             if self._check_constraints(complete_proof, all_atoms):
                 valid_proof_count += 1
+
+                if self.export_proof_visualizations:
+                    # write out the valid proof
+                    complete_proof.save_visualization(
+                        f"proof-trees/{start_rule_name}_{valid_proof_count}",
+                        "pdf",
+                        f"proof_{start_rule_name}_{valid_proof_count}",
+                    )
+
                 yield complete_proof
             elif self.verbose:
                 print(f"  ✗ Proof {proof_count} rejected due to constraint violation")
@@ -725,6 +712,7 @@ class BackwardChainer:
         goal_atom: Atom,
         recursive_use_counts: frozenset[Tuple[str, int]],
         atoms_in_path: frozenset[Atom],
+        depth: int = 0,
     ) -> Iterator[Proof]:
         """
         Recursively finds all possible proof trees for a given ground atom.
@@ -768,6 +756,12 @@ class BackwardChainer:
         Yields:
             Proof: Valid proof trees for the goal_atom.
         """
+        # Check global depth limit
+        if depth > self.global_max_depth:
+            if self.verbose:
+                print(f"  ✗ Max global depth reached ({self.global_max_depth})")
+            return
+
         if self.verbose:
             indent = "  " * len(atoms_in_path)
             print(f"{indent}→ Proving: {self._format_atom(goal_atom)}")
@@ -785,11 +779,19 @@ class BackwardChainer:
                 )
             return  # Yield nothing - this would be circular
 
+        yielded_count = 0
+
         # ==================== BASE CASE ==================== #
         # Allow this atom to be proven as a base fact
         if self.verbose:
             print(f"{indent}  ✓ Yielding BASE FACT proof")
         yield Proof.create_base_proof(goal_atom)
+        yielded_count += 1
+        if self.max_proofs_per_atom and yielded_count >= self.max_proofs_per_atom:
+            print(
+                f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
+            )
+            return
 
         # ==================== RECURSIVE CASE ==================== #
         # Try to derive using rules
@@ -832,9 +834,9 @@ class BackwardChainer:
 
             # Get all variables in this renamed rule for debug output
             rule_vars = set()
-            rule_vars.update(self._get_vars_in_atom(rule.conclusion))
+            rule_vars.update(rule.conclusion.get_variables())
             for premise in rule.premises:
-                rule_vars.update(self._get_vars_in_atom(premise))
+                rule_vars.update(premise.get_variables())
 
             if self.verbose:
                 print(f"{indent}  Trying rule: {rule.name}")
@@ -867,14 +869,11 @@ class BackwardChainer:
             # Find unbound variables
             unbound_vars: Set[Var] = set()
             for p in premises_with_bound_vars:
-                unbound_vars.update(self._get_vars_in_atom(p))
+                unbound_vars.update(p.get_variables())
 
-            # ==================== FUNCTIONAL PROPERTY HANDLING ==================== #
-            # For functional properties, reuse existing values if they exist
-            newly_generated = []
+            # Handle functional properties and generate individuals
             for var in unbound_vars:
                 if var not in rule_subst:
-                    # Check if this variable will be used as object of a functional property
                     needs_functional_value = False
                     functional_key = None
 
@@ -893,36 +892,18 @@ class BackwardChainer:
                         needs_functional_value
                         and functional_key in self._functional_property_values
                     ):
-                        # Reuse existing value for this functional property
+                        # REUSE: This subject already has a value for this property
                         rule_subst[var] = self._functional_property_values[
                             functional_key
                         ]
-                        if self.verbose:
-                            existing_val = self._functional_property_values[
-                                functional_key
-                            ]
-                            val_name = (
-                                existing_val.name
-                                if hasattr(existing_val, "name")
-                                else str(existing_val)
-                            )
-                            print(
-                                f"{indent}    Reused functional property value: {var.name} → {val_name}"
-                            )
                     else:
-                        # Generate new individual
-                        new_ind = self._get_fresh_individual()
+                        # CREATE NEW: Either not functional, or first time for this (subject, property)
+                        new_ind = self._get_individual(reuse=True)
                         rule_subst[var] = new_ind
-                        newly_generated.append((var, new_ind))
 
-                        # Track functional property value if applicable
+                        # STORE for future reuse if functional
                         if needs_functional_value and functional_key:
                             self._functional_property_values[functional_key] = new_ind
-
-            if self.verbose and newly_generated:
-                print(f"{indent}    Generated new individuals:")
-                for var, ind in newly_generated:
-                    print(f"{indent}      {var.name} → {ind.name}")
 
             # Final grounding of premises
             ground_premises = [
@@ -934,7 +915,10 @@ class BackwardChainer:
                 if self.verbose:
                     print(f"{indent}    ✓ No premises (axiom)")
                 yield Proof.create_derived_proof(
-                    goal=goal_atom, rule=original_rule, sub_proofs=[]
+                    goal=goal_atom,
+                    rule=original_rule,
+                    sub_proofs=[],
+                    substitutions=rule_subst,
                 )
                 continue
 
@@ -945,7 +929,10 @@ class BackwardChainer:
             for premise in ground_premises:
                 proof_list = list(
                     self._find_proofs_recursive(
-                        premise, new_recursive_use_counts, new_atoms_in_path
+                        premise,
+                        new_recursive_use_counts,
+                        new_atoms_in_path,
+                        depth=depth + 1,
                     )
                 )
 
@@ -971,7 +958,18 @@ class BackwardChainer:
                     goal=goal_atom,
                     rule=original_rule,  # Use unrenamed rule
                     sub_proofs=list(sub_proof_combination),
+                    substitutions=rule_subst,
                 )
+                yielded_count += 1
+                if (
+                    self.max_proofs_per_atom
+                    and yielded_count >= self.max_proofs_per_atom
+                ):
+                    if self.verbose:
+                        print(
+                            f"{indent}  ! Max proofs per atom reached ({self.max_proofs_per_atom})"
+                        )
+                    return
 
     def _format_atom(self, atom: Atom) -> str:
         """

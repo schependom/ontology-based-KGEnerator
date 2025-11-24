@@ -11,8 +11,7 @@ AUTHOR:
 import argparse
 import os
 import sys
-from typing import Dict, List, Set, Optional, Tuple
-from collections import defaultdict
+from typing import Dict, List, Set, Optional, Tuple, Any
 import graphviz
 
 # Custom imports
@@ -26,22 +25,15 @@ from data_structures import (
     Relation,
 )
 
-# REFACTORED: Import KGenerator from generator.py
-from generator import KGenerator
+from generate import KGenerator
 
 from rdflib.namespace import RDF
 
 
 class ProofTreeVisualizer:
     """
-    Enhanced visualizer that tracks and displays variable substitutions
+    Visualizer that tracks and displays variable substitutions
     throughout the proof tree, and validates proofs against constraints.
-
-    This visualizer reconstructs the variable bindings at each step of the
-    proof by matching rule patterns against ground instances, providing
-    insight into how the backward chainer generates individuals and builds proofs.
-
-    REFACTORED: Now uses KGenerator for proof generation.
     """
 
     def __init__(self, output_dir: str = "output"):
@@ -51,6 +43,7 @@ class ProofTreeVisualizer:
         Args:
             output_dir (str): Directory to save output files. Created if it doesn't exist.
         """
+
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
@@ -69,7 +62,7 @@ class ProofTreeVisualizer:
 
     def visualize_all_proofs(
         self,
-        generator: KGenerator,
+        generator: "KGenerator",
         rule_names: Optional[List[str]] = None,
         max_proofs_per_rule: int = 5,
         show_invalid_proofs: bool = False,
@@ -79,8 +72,6 @@ class ProofTreeVisualizer:
 
         For each rule, generates up to max_proofs_per_rule proof trees,
         creating both text and graphical representations.
-
-        REFACTORED: Now uses KGenerator's generate_proofs_for_rule method.
 
         Args:
             generator (KGenerator): The KGenerator instance to use.
@@ -107,7 +98,6 @@ class ProofTreeVisualizer:
             print(f"Rule: {rule_name}")
             print(f"{'-' * 80}")
 
-            # REFACTORED: Use KGenerator's generate_proofs_for_rule method
             try:
                 proofs = generator.generate_proofs_for_rule(
                     rule_name=rule_name,
@@ -424,37 +414,46 @@ class ProofTreeVisualizer:
 
     def create_graphviz_visualization(self, proof: Proof, proof_id: str) -> None:
         """
-        Create a Graphviz visualization with variable substitutions and constraint status.
+        Create a Graphviz visualization using HTML-like labels for clarity.
 
-        Generates a directed graph showing the proof tree structure with:
-        - Color-coded nodes (green for base facts, blue for derived, red for constraint violations)
-        - Variable substitutions displayed in each node
-        - Premise patterns shown on edges
-        - Recursion tracking information
-        - Constraint validation status
+        This visualization organizes the node content into tables, separating
+        the Fact, the Logic (Rule), and the Variable Substitutions.
+        It uses a Bottom-Up layout (Leaves -> Root) to visualize the derivation flow.
 
         Args:
             proof (Proof): The proof tree to visualize.
             proof_id (str): Identifier for this proof (used in filename).
         """
+        if "graphviz" not in sys.modules:
+            print("Warning: graphviz module not found. Skipping graph generation.")
+            return
+
         # Reset node tracking for new graph
         self.node_counter = 0
         self.node_ids = {}
 
-        # Get validation status for title
+        # Get validation status
         is_valid = self.constraint_validation.get(proof, True)
-        status = "VALID" if is_valid else "INVALID (Constraint Violation)"
+        status_label = "VALID" if is_valid else "INVALID"
+        title_color = "darkgreen" if is_valid else "red"
 
-        # Create graph with sensible defaults
-        dot = graphviz.Digraph(comment=f"Proof Tree: {proof_id}")
-        dot.attr(rankdir="TB")  # Top to bottom layout
-        dot.attr("node", shape="box", style="rounded,filled")
-        dot.attr("graph", fontname="Courier", fontsize="10")
-        dot.attr("node", fontname="Courier", fontsize="9")
-        dot.attr("edge", fontname="Courier", fontsize="8")
+        # Create graph with clearer settings
+        dot = graphviz.Digraph(comment=f"Proof: {proof_id}")
 
-        # Add title with validation status
-        dot.attr(label=f"Proof Tree: {proof_id}\\nStatus: {status}", labelloc="t")
+        # Use Bottom-Top layout: Premises support Conclusions
+        dot.attr(rankdir="BT")
+        dot.attr(splines="ortho")  # Cleaner lines
+        dot.attr(nodesep="0.6", ranksep="0.8")
+        dot.attr("node", shape="plain", fontname="Helvetica")  # plain shape for HTML
+
+        # Title
+        dot.attr(
+            label=f"Proof Tree: {proof_id}\nStatus: {status_label}",
+            labelloc="t",
+            fontcolor=title_color,
+            fontsize="14",
+            fontname="Helvetica-Bold",
+        )
 
         # Build the graph recursively
         self._add_proof_to_graph(proof, dot, None)
@@ -466,27 +465,23 @@ class ProofTreeVisualizer:
             print(f"✓ Saved detailed graph to: {output_path}.pdf")
         except Exception as e:
             print(f"✗ Failed to create graph: {e}")
-            # Save .dot file as fallback
             dot.save(output_path + ".dot")
             print(f"  Saved .dot file to: {output_path}.dot")
 
     def _add_proof_to_graph(
-        self, proof: Proof, dot: graphviz.Digraph, parent_id: Optional[str]
+        self, proof: Proof, dot: Any, parent_id: Optional[str]
     ) -> str:
         """
-        Recursively add proof nodes with substitution info to graphviz graph.
-
-        Creates a node for this proof and recursively adds nodes for all
-        sub-proofs, connecting them with labeled edges. Nodes are color-coded
-        based on constraint validation status.
+        Recursively add proof nodes using HTML table labels.
 
         Args:
             proof (Proof): Current proof node to add.
             dot (graphviz.Digraph): Graphviz graph object to add nodes to.
-            parent_id (Optional[str]): ID of parent node (None for root).
+            parent_id (Optional[str]): ID of parent node (unused in recursive return,
+                                      but kept for interface consistency if needed).
 
         Returns:
-            str: Node ID for this proof (for parent to reference).
+            str: Node ID for this proof.
         """
         # Reuse node if already created (DAG structure)
         if proof in self.node_ids:
@@ -497,59 +492,104 @@ class ProofTreeVisualizer:
         self.node_counter += 1
         self.node_ids[proof] = node_id
 
-        # Get substitutions for this proof
+        # Data for Label
         subs = self.substitution_history.get(proof, {})
-
-        # Get validation status
         is_valid = self.constraint_validation.get(proof, True)
+        ground_fact_html = self._format_atom_html(proof.goal)
 
-        # Format node label
-        goal_str = self._format_atom(proof.goal)
-
+        # Styles
         if proof.rule is None:
-            # Base fact - simple green box (or red if invalid)
-            color = "lightgreen" if is_valid else "lightcoral"
-            label = f"BASE FACT\\n{goal_str}"
-            if not is_valid:
-                label += "\\n✗ INVALID"
-            dot.node(node_id, label, fillcolor=color)
+            # BASE FACT STYLE
+            header_color = "#E8F5E9"  # Light Green
+            border_color = "#2E7D32"  # Dark Green
+            type_label = "BASE FACT"
         else:
-            # Derived fact - blue box with detailed info (or red if invalid)
-            color = "lightblue" if is_valid else "lightcoral"
-            # Use \\l for left-aligned text in graphviz
-            # Use \\n for new lines
-            label = f"DERIVE\\n{goal_str}\\n\\l"
-            if not is_valid:
-                label = f"DERIVE (✗ INVALID)\\n{goal_str}\\n\\l"
-            label += f"Rule: {proof.rule.name}\\l"
-            label += f"Pattern: {self._format_atom(proof.rule.conclusion)}\\l"
+            # DERIVED FACT STYLE
+            header_color = "#E3F2FD"  # Light Blue
+            border_color = "#1565C0"  # Dark Blue
+            type_label = f"Rule: {proof.rule.name}"
 
-            # Add substitutions to label
-            if subs:
-                label += "\\lSubstitutions:\\l"
-                for var, value in sorted(subs.items(), key=lambda x: x[0].name):
-                    label += f"  {var.name} → {value}\\l"
+        if not is_valid:
+            header_color = "#FFEBEE"  # Light Red
+            border_color = "#C62828"  # Dark Red
+            type_label = "INVALID (Constraint)"
 
-            # Add recursion info if present
-            if proof.recursive_use_counts:
-                rec_info = ", ".join(
-                    [f"{name}:{count}" for name, count in proof.recursive_use_counts]
-                )
-                label += f"\\lRecursion: {rec_info}\\l"
+        # HTML Label Construction
+        # Graphviz requires the string to be wrapped in < ... >
+        label = (
+            f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="{border_color}">'
+            f'<TR><TD BGCOLOR="{border_color}"><FONT COLOR="white"><B>{type_label}</B></FONT></TD></TR>'
+            f'<TR><TD BGCOLOR="{header_color}">{ground_fact_html}</TD></TR>'
+        )
 
-            dot.node(node_id, label, fillcolor=color)
+        # Add Variable Substitutions Section if they exist
+        if subs:
+            label += '<TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#555555"><I>Substitutions:</I><BR/>'
+            sub_rows = [f"{k.name} &rarr; <B>{v}</B>" for k, v in subs.items()]
 
-            # Add edges to sub-proofs with premise patterns as labels
-            for i, (premise_pattern, sub_proof) in enumerate(
-                zip(proof.rule.premises, proof.sub_proofs)
-            ):
-                sub_id = self._add_proof_to_graph(sub_proof, dot, node_id)
+            # Split into 2 columns if many substitutions to keep box wider/shorter
+            if len(sub_rows) > 3:
+                mid = len(sub_rows) // 2 + 1
+                col1 = "<BR/>".join(sub_rows[:mid])
+                col2 = "<BR/>".join(sub_rows[mid:])
+                label += f'<TABLE BORDER="0" CELLSPACING="5"><TR><TD>{col1}</TD><TD>{col2}</TD></TR></TABLE>'
+            else:
+                label += "<BR/>".join(sub_rows)
+            label += "</FONT></TD></TR>"
 
-                # Edge label shows which premise this sub-proof satisfies
-                edge_label = f"premise {i + 1}:\\n{self._format_atom(premise_pattern)}"
-                dot.edge(node_id, sub_id, label=edge_label)
+        # Add Recursion info if present
+        if proof.recursive_use_counts:
+            rec_info = ", ".join(
+                [f"{name}:{count}" for name, count in proof.recursive_use_counts]
+            )
+            label += f'<TR><TD BGCOLOR="#FFF3E0"><FONT POINT-SIZE="8">Recursion: {rec_info}</FONT></TD></TR>'
+
+        label += "</TABLE>>"
+
+        # Add Node
+        dot.node(node_id, label=label)
+
+        # Recursively process sub-proofs (Premises)
+        for i, (premise_pattern, sub_proof) in enumerate(
+            zip(proof.rule.premises if proof.rule else [], proof.sub_proofs)
+        ):
+            sub_id = self._add_proof_to_graph(sub_proof, dot, node_id)
+
+            # Edge Label (Premise Pattern)
+            # In BT layout, edges go from Premise (sub_id) to Conclusion (node_id)
+            edge_label = f"premise {i + 1}:\n{self._format_atom(premise_pattern)}"
+
+            dot.edge(
+                sub_id,
+                node_id,
+                label=edge_label,
+                fontsize="9",
+                fontcolor="#666666",
+                style="dashed",
+            )
 
         return node_id
+
+    def _format_atom_html(self, atom: Atom) -> str:
+        """
+        Formats an atom with HTML tags for bold Subject/Object.
+        Used inside Graphviz HTML-like labels.
+
+        Args:
+            atom (Atom): The atom to format.
+
+        Returns:
+            str: HTML string representation.
+        """
+        s = self._format_term(atom.subject)
+        p = self._format_term(atom.predicate)
+        o = self._format_term(atom.object)
+
+        # Beautify RDF Type for display
+        if p == "rdf:type":
+            p = '<FONT COLOR="#666666">rdf:type</FONT>'
+
+        return f"<B>{s}</B> {p} <B>{o}</B>"
 
     def _format_atom(self, atom: Atom) -> str:
         """
@@ -708,7 +748,6 @@ def main():
     # ==================== RUN VISUALIZATION PIPELINE ==================== #
 
     try:
-        # REFACTORED: Use KGenerator instead of creating parser/chainer directly
         print(f"Initializing KGenerator from: {args.ontology_path}")
         generator = KGenerator(
             ontology_file=args.ontology_path,
@@ -730,7 +769,7 @@ def main():
         )
 
         print(f"\n{'=' * 80}")
-        print(f"VISUALIZATION COMPLETE")
+        print("VISUALIZATION COMPLETE")
         print(f"Output saved to: {args.output_dir}")
         print(f"{'=' * 80}\n")
 
