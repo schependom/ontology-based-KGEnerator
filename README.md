@@ -34,3 +34,13 @@ python src/create_data.py --ontology-path data/family.ttl --output data/out
 For more details on the available options, run with `--help`.
 
 Work in progress as of 20/11/2025.
+
+```bash
+# Generate and visualize ALL proofs for a small toy ontology
+python src/generate.py \
+    --ontology-path data/toy.ttl \
+    --max-proofs-per-rule 5 \
+    --export-proofs \
+    --visualize-kg \
+    --verbose
+```
