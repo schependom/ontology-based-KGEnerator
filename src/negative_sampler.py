@@ -53,6 +53,9 @@ class NegativeSampler:
         # Optimization: Sets for fast lookup of existing facts
         self.existing_triples: Set[str] = set()
         self.existing_memberships: Set[str] = set()
+        
+        # Track strategy usage
+        self.strategy_usage: Dict[str, int] = defaultdict(int)
 
     def _index_existing_facts(self, kg: KnowledgeGraph):
         """Build sets of existing facts for O(1) lookup."""
@@ -102,16 +105,30 @@ class NegativeSampler:
         # Index existing facts for fast lookup
         self._index_existing_facts(kg)
         
+        if strategy != "mixed":
+            # For single strategies, we can just count the number of negatives added
+            # But we need to know how many were actually added. 
+            # The methods return the KG, so we can check the difference in length.
+            initial_len = len(kg.triples)
+        
         if strategy == "random":
-            return self._random_corruption(kg, ratio)
+            kg = self._random_corruption(kg, ratio)
+            self.strategy_usage["random"] += len(kg.triples) - initial_len
+            return kg
         elif strategy == "constrained":
-            return self._constrained_corruption(kg, ratio)
+            kg = self._constrained_corruption(kg, ratio)
+            self.strategy_usage["constrained"] += len(kg.triples) - initial_len
+            return kg
         elif strategy == "proof_based":
-            return self._proof_based_corruption(
+            kg = self._proof_based_corruption(
                 kg, ratio, corrupt_base_facts, export_proofs, output_dir
             )
+            self.strategy_usage["proof_based"] += len(kg.triples) - initial_len
+            return kg
         elif strategy == "type_aware":
-            return self._type_aware_corruption(kg, ratio)
+            kg = self._type_aware_corruption(kg, ratio)
+            self.strategy_usage["type_aware"] += len(kg.triples) - initial_len
+            return kg
         elif strategy == "mixed":
             return self._mixed_corruption(
                 kg, ratio, corrupt_base_facts, export_proofs, output_dir
@@ -561,6 +578,7 @@ class NegativeSampler:
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)
+                self.strategy_usage[strategy] += 1
                 
         kg.triples.extend(negative_triples)
         

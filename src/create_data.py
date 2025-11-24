@@ -494,6 +494,17 @@ class KGEDatasetGenerator:
                 else:
                     reason = "Failed to Generate"
                 print(f"{rule_name:<40} | {reason:<20} | {attempts:<10}")
+                
+        # Negative Strategy Usage
+        strategy_usage = self.negative_sampler.strategy_usage
+        if strategy_usage:
+            print(f"\n--- Negative Strategy Usage ---")
+            print(f"{'Strategy':<20} | {'Count':<10} | {'Percentage':<10}")
+            print("-" * 50)
+            total_negatives = sum(strategy_usage.values())
+            for strategy, count in sorted(strategy_usage.items(), key=lambda x: x[1], reverse=True):
+                percentage = (count / total_negatives) * 100 if total_negatives > 0 else 0
+                print(f"{strategy:<20} | {count:<10} | {percentage:.1f}%")
 
         print("\nTRAINING SET:")
         print(f"  Samples:           {train_stats.get('n_samples', 0)}")
