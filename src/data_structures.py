@@ -137,6 +137,9 @@ class Membership:
 
     # Keep track of all proofs leading to this membership fact
     proofs: List["Proof"] = field(default_factory=list)
+    
+    # Metadata for tracking origin (e.g., negative sampling source)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_inferred(self) -> bool:
@@ -180,6 +183,9 @@ class Triple:
 
     # Keep track of all proofs leading to this triple fact
     proofs: List["Proof"] = field(default_factory=list)
+
+    # Metadata for tracking origin (e.g., negative sampling source)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_inferred(self) -> bool:
@@ -936,7 +942,11 @@ class Proof:
         return self
 
     def save_visualization(
-        self, filepath: str, format: str = "pdf", title: Optional[str] = None
+        self,
+        filepath: str,
+        format: str = "pdf",
+        title: Optional[str] = None,
+        root_label: Optional[str] = None,
     ) -> None:
         """
         Save proof tree visualization to file.
@@ -945,9 +955,10 @@ class Proof:
             filepath: Output file path (without extension)
             format: Output format ("pdf", "png", "svg")
             title: Optional title for the graph
+            root_label: Optional custom label for the root node
         """
 
-        dot = self._create_graphviz()
+        dot = self._create_graphviz(root_label=root_label)
 
         if title:
             dot.attr(
@@ -956,14 +967,14 @@ class Proof:
 
         try:
             dot.render(filepath, format=format, cleanup=True)
-            print(f"✓ Saved proof visualization to: {filepath}.{format}")
+            # print(f"✓ Saved proof visualization to: {filepath}.{format}")
         except Exception as e:
             print(f"✗ Failed to render graph: {e}")
             # Save .dot file as fallback
             dot.save(filepath + ".dot")
             print(f"  Saved .dot file to: {filepath}.dot")
 
-    def _create_graphviz(self) -> Any:
+    def _create_graphviz(self, root_label: Optional[str] = None) -> Any:
         """
         Create a Graphviz graph object for this proof tree.
 
@@ -1001,11 +1012,22 @@ class Proof:
                 border_color = "#C62828"  # Dark red
                 type_label = "CORRUPTED FACT"
             elif not proof.is_valid:
-                header_color = "#FFEBEE"  # Light red
-                border_color = "#EF9A9A"  # Lighter red for propagation
-                if proof.is_base_fact():
+                # Custom label for root node if provided
+                if proof == self and root_label == "DERIVED NEGATIVE FACT":
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#C62828"  # Dark red
+                    type_label = root_label
+                elif proof == self and root_label:
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
+                    type_label = root_label
+                elif proof.is_base_fact():
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
                     type_label = "BASE FACT"
                 else:
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
                     type_label = f"Rule: {proof.rule.name} (INVALID)"
             elif proof.is_base_fact():
                 header_color = "#E8F5E9"  # Light green
@@ -1019,9 +1041,16 @@ class Proof:
             # Format goal atom
             goal_html = proof.goal.__repr__()
             if not proof.is_valid and not proof.is_corrupted_leaf:
-                goal_html = (
-                    f"<S>{goal_html}</S> <B><FONT COLOR='#C62828'>[INVALID]</FONT></B>"
-                )
+                # If this is a derived negative fact (propagated), don't cross out
+                if proof == self and root_label == "DERIVED NEGATIVE FACT":
+                    pass # Keep goal_html as is
+                # If this is the root and we have a custom label, don't append [INVALID]
+                elif proof == self and root_label:
+                    goal_html = f"<S>{goal_html}</S>"
+                else:
+                    goal_html = (
+                        f"<S>{goal_html}</S> <B><FONT COLOR='#C62828'>[INVALID]</FONT></B>"
+                    )
 
             # Build HTML label
             label = (

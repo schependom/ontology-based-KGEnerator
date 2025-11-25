@@ -19,7 +19,7 @@ import random
 from typing import List, Set, Dict, Optional
 from data_structures import *
 from collections import defaultdict
-
+from datetime import datetime
 
 class NegativeSampler:
     """
@@ -151,7 +151,7 @@ class NegativeSampler:
                 break
 
             pos_triple = random.choice(positive_triples)
-            neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+            neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)
@@ -169,7 +169,7 @@ class NegativeSampler:
 
             pos_mem = random.choice(positive_memberships)
             neg_mem = self._corrupt_membership_random(
-                pos_mem, list(self.schema_classes.values())
+                pos_mem, list(self.schema_classes.values()), original_membership=pos_mem
             )
 
             if neg_mem and not self._is_positive_membership(neg_mem, kg):
@@ -216,6 +216,7 @@ class NegativeSampler:
                         pos_triple.object,
                         positive=False,
                         proofs=[],
+                        metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"}
                     )
                 else:
                     continue
@@ -233,6 +234,7 @@ class NegativeSampler:
                         new_obj,
                         positive=False,
                         proofs=[],
+                        metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"}
                     )
                 else:
                     continue
@@ -267,7 +269,8 @@ class NegativeSampler:
             if candidate_classes:
                 neg_cls = random.choice(candidate_classes)
                 neg_mem = Membership(
-                    pos_mem.individual, neg_cls, is_member=False, proofs=[]
+                    pos_mem.individual, neg_cls, is_member=False, proofs=[],
+                    metadata={"source_type": "base" if pos_mem.is_base_fact else "inferred"}
                 )
                 negative_memberships.append(neg_mem)
 
@@ -305,7 +308,8 @@ class NegativeSampler:
             return self._random_corruption(kg, ratio)
 
         # Limit exported visualizations to prevent freezing
-        exported_count = 0
+        exported_corrupted_count = 0
+        exported_propagated_count = 0
         MAX_EXPORTS = 5
 
         attempts = 0
@@ -315,12 +319,14 @@ class NegativeSampler:
             attempts += 1
 
             if not triples_with_proofs:
+                print("No triples with proofs found")
                 break
 
             # Pick a triple with proofs
             pos_triple, proofs = random.choice(triples_with_proofs)
 
             if not proofs:
+                print("No proofs found for triple: ", pos_triple)
                 continue
 
             # Pick a random proof
@@ -337,7 +343,9 @@ class NegativeSampler:
 
             if not base_facts or not corrupt_base_facts:
                 # Corrupt the goal instead
-                neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+                neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
+                if neg_triple:
+                    neg_triple.metadata["source_type"] = "inferred" # Explicitly inferred since we target goal
             else:
                 # Corrupt a base fact from the proof
                 # This creates a negative that would break the inference chain
@@ -358,15 +366,17 @@ class NegativeSampler:
                 if matching_triples:
                     base_triple = matching_triples[0]
                     neg_triple = self._corrupt_triple_random(
-                        base_triple, kg.individuals
+                        base_triple, kg.individuals, original_triple=base_triple
                     )
+                    if neg_triple:
+                        neg_triple.metadata["source_type"] = "base" # Explicitly base since we target base fact
 
                     # If we have a negative triple and we want to export proofs
                     if (
                         neg_triple
-                        # and export_proofs
+                        and export_proofs
                         and output_dir
-                        and exported_count < MAX_EXPORTS
+                        and exported_corrupted_count < MAX_EXPORTS
                     ):
                         # Create atom from negative triple
                         new_atom = Atom(
@@ -378,13 +388,107 @@ class NegativeSampler:
                         # Create corrupted proof
                         corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
 
+                        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+
                         # Save visualization
                         filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
                         full_path = os.path.join(output_dir, filename)
-                        corrupted_proof.save_visualization(full_path, format="png")
-                        exported_count += 1
+                        corrupted_proof.save_visualization(full_path, format="png", root_label="REMOVED INFERRED FACT")
+                        exported_corrupted_count += 1
                         if self.verbose:
                             print(f"Exported corrupted proof visualization: {filename}")
+
+                    # PROPAGATION: Try to derive the falsified goal
+                    # We corrupted base_fact -> neg_triple
+                    # We need to update the substitution to reflect this change
+                    # and check if the rule conclusion (goal) changes to a valid negative.
+                    
+                    if proof.rule:
+                        # Find which variable mapped to the original object/subject that we changed
+                        new_subst = proof.substitutions.copy()
+                        
+                        # Check if we changed subject or object
+                        changed_term = None
+                        new_term = None
+                        
+                        if neg_triple.subject != base_triple.subject:
+                            changed_term = base_triple.subject
+                            new_term = neg_triple.subject
+                        elif neg_triple.object != base_triple.object:
+                            changed_term = base_triple.object
+                            new_term = neg_triple.object
+                            
+                        if changed_term and new_term:
+                            # Update substitution for all variables that mapped to the changed term
+                            for var, term in proof.substitutions.items():
+                                if term == changed_term:
+                                    new_subst[var] = new_term
+                                    
+                            # Instantiate conclusion with new substitution
+                            # PROBLEM: proof.substitutions has renamed vars (e.g. X_13), but proof.rule has original vars (e.g. X)
+                            # SOLUTION: Create a normalized substitution mapping original vars to values
+                            
+                            normalized_subst = {}
+                            for var, term in new_subst.items():
+                                # Extract base name (e.g. "X_13" -> "X")
+                                # Assuming format Name_ID
+                                base_name = var.name.split('_')[0]
+                                
+                                # Find corresponding variable in original rule
+                                for rule_var in proof.rule.conclusion.get_variables():
+                                    if rule_var.name == base_name:
+                                        normalized_subst[rule_var] = term
+                            
+                            new_goal_atom = proof.rule.conclusion.substitute(normalized_subst)
+                            
+                            if new_goal_atom.is_ground():
+                                # Create Triple from Atom
+                                # Note: Atom terms might be strings or objects, need to be careful
+                                # But in our system, substitute returns terms from the substitution values (Individuals)
+                                
+                                # Check if it's a valid Triple structure
+                                if isinstance(new_goal_atom.predicate, Relation):
+                                    neg_goal = Triple(
+                                        subject=new_goal_atom.subject,
+                                        predicate=new_goal_atom.predicate,
+                                        object=new_goal_atom.object,
+                                        positive=False,
+                                        proofs=[],
+                                        metadata={"source_type": "propagated_inferred"}
+                                    )
+                                    
+                                    # Check if this new goal contradicts existing facts
+                                    if not self._is_positive_fact(neg_goal, kg):
+                                        negative_triples.append(neg_goal)
+                                        
+                                        # VISUALIZATION: Export the propagated proof
+                                        if export_proofs and output_dir and exported_propagated_count < MAX_EXPORTS:
+                                            # Create atom from negative goal
+                                            neg_goal_atom = Atom(
+                                                predicate=neg_goal.predicate,
+                                                subject=neg_goal.subject,
+                                                object=neg_goal.object
+                                            )
+                                            
+                                            # Create atom from corrupted base fact
+                                            neg_base_atom = Atom(
+                                                predicate=neg_triple.predicate,
+                                                subject=neg_triple.subject,
+                                                object=neg_triple.object
+                                            )
+                                            
+                                            # Reconstruct the proof tree with corrupted values
+                                            propagated_proof = self._create_propagated_proof(
+                                                proof, base_fact, neg_base_atom, neg_goal_atom, normalized_subst, is_root=True
+                                            )
+                                            
+                                            if propagated_proof:
+                                                filename = f"propagated_proof_{len(negative_triples)}_{neg_goal.subject.name}_{neg_goal.predicate.name}_{neg_goal.object.name}"
+                                                full_path = os.path.join(output_dir, filename)
+                                                propagated_proof.save_visualization(full_path, format="png", title="Propagated Corruption", root_label="DERIVED NEGATIVE FACT")
+                                                exported_propagated_count += 1
+                                                if self.verbose:
+                                                    print(f"Exported propagated proof visualization: {filename}")
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)
@@ -438,6 +542,7 @@ class NegativeSampler:
                         pos_triple.object,
                         positive=False,
                         proofs=[],
+                        metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"}
                     )
                 else:
                     continue
@@ -456,6 +561,7 @@ class NegativeSampler:
                         new_obj,
                         positive=False,
                         proofs=[],
+                        metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"}
                     )
                 else:
                     continue
@@ -510,7 +616,7 @@ class NegativeSampler:
             
             if strategy == "random":
                 pos_triple = random.choice(positive_triples)
-                neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+                neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
                 
             elif strategy == "constrained":
                 pos_triple = random.choice(positive_triples)
@@ -522,7 +628,10 @@ class NegativeSampler:
                     candidates = [c for c in candidates if c != pos_triple.subject]
                     if candidates:
                         new_subj = random.choice(candidates)
-                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[])
+                    if candidates:
+                        new_subj = random.choice(candidates)
+                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[],
+                                          metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"})
                 else:
                     # Corrupt object
                     candidates = self._get_range_candidates(
@@ -531,7 +640,10 @@ class NegativeSampler:
                     candidates = [c for c in candidates if c != pos_triple.object]
                     if candidates:
                         new_obj = random.choice(candidates)
-                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[])
+                    if candidates:
+                        new_obj = random.choice(candidates)
+                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[],
+                                          metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"})
                         
             elif strategy == "type_aware":
                 pos_triple = random.choice(positive_triples)
@@ -541,14 +653,20 @@ class NegativeSampler:
                     candidates = [c for c in class_groups[subj_classes] if c != pos_triple.subject]
                     if candidates:
                         new_subj = random.choice(candidates)
-                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[])
+                    if candidates:
+                        new_subj = random.choice(candidates)
+                        neg_triple = Triple(new_subj, pos_triple.predicate, pos_triple.object, positive=False, proofs=[],
+                                          metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"})
                 else:
                     # Corrupt object
                     obj_classes = frozenset(ind_classes.get(pos_triple.object, set()))
                     candidates = [c for c in class_groups[obj_classes] if c != pos_triple.object]
                     if candidates:
                         new_obj = random.choice(candidates)
-                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[])
+                    if candidates:
+                        new_obj = random.choice(candidates)
+                        neg_triple = Triple(pos_triple.subject, pos_triple.predicate, new_obj, positive=False, proofs=[],
+                                          metadata={"source_type": "base" if pos_triple.is_base_fact else "inferred"})
                         
             elif strategy == "proof_based":
                 # Simplified proof based logic for single sample
@@ -562,7 +680,8 @@ class NegativeSampler:
                             base_facts = {bf for bf in base_facts if bf.predicate != RDF.type}
                             
                         if not base_facts or not corrupt_base_facts:
-                            neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals)
+                            neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
+                            if neg_triple: neg_triple.metadata["source_type"] = "inferred"
                         else:
                             base_fact = random.choice(list(base_facts))
                             # Find matching triple
@@ -574,7 +693,8 @@ class NegativeSampler:
                                 t.object.name == base_fact.object.name
                             ]
                             if matching_triples:
-                                neg_triple = self._corrupt_triple_random(matching_triples[0], kg.individuals)
+                                neg_triple = self._corrupt_triple_random(matching_triples[0], kg.individuals, original_triple=matching_triples[0])
+                                if neg_triple: neg_triple.metadata["source_type"] = "base"
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)
@@ -593,7 +713,7 @@ class NegativeSampler:
             if not positive_memberships:
                 break
             pos_mem = random.choice(positive_memberships)
-            neg_mem = self._corrupt_membership_random(pos_mem, list(self.schema_classes.values()))
+            neg_mem = self._corrupt_membership_random(pos_mem, list(self.schema_classes.values()), original_membership=pos_mem)
             if neg_mem and not self._is_positive_membership(neg_mem, kg):
                 negative_memberships.append(neg_mem)
                 
@@ -603,7 +723,7 @@ class NegativeSampler:
     # ==================== HELPER METHODS ==================== #
 
     def _corrupt_triple_random(
-        self, triple: Triple, individuals: List[Individual]
+        self, triple: Triple, individuals: List[Individual], original_triple: Triple = None
     ) -> Optional[Triple]:
         """Randomly corrupt subject or object of a triple."""
         if not individuals:
@@ -615,8 +735,11 @@ class NegativeSampler:
             if not candidates:
                 return None
             new_subj = random.choice(candidates)
+            metadata = {}
+            if original_triple:
+                metadata["source_type"] = "base" if original_triple.is_base_fact else "inferred"
             return Triple(
-                new_subj, triple.predicate, triple.object, positive=False, proofs=[]
+                new_subj, triple.predicate, triple.object, positive=False, proofs=[], metadata=metadata
             )
         else:
             # Corrupt object
@@ -624,12 +747,15 @@ class NegativeSampler:
             if not candidates:
                 return None
             new_obj = random.choice(candidates)
+            metadata = {}
+            if original_triple:
+                metadata["source_type"] = "base" if original_triple.is_base_fact else "inferred"
             return Triple(
-                triple.subject, triple.predicate, new_obj, positive=False, proofs=[]
+                triple.subject, triple.predicate, new_obj, positive=False, proofs=[], metadata=metadata
             )
 
     def _corrupt_membership_random(
-        self, membership: Membership, classes: List[Class]
+        self, membership: Membership, classes: List[Class], original_membership: Membership = None
     ) -> Optional[Membership]:
         """Randomly corrupt class membership."""
         if not classes:
@@ -638,7 +764,96 @@ class NegativeSampler:
         if not candidates:
             return None
         new_cls = random.choice(candidates)
-        return Membership(membership.individual, new_cls, is_member=False, proofs=[])
+        metadata = {}
+        if original_membership:
+            metadata["source_type"] = "base" if original_membership.is_base_fact else "inferred"
+        return Membership(membership.individual, new_cls, is_member=False, proofs=[], metadata=metadata)
+
+    def _create_propagated_proof(
+        self,
+        original_proof: Proof,
+        original_base_fact: Atom,
+        corrupted_base_fact: Atom,
+        new_goal: Atom,
+        new_subst: Dict[Var, Term],
+        is_root: bool = False,
+    ) -> Optional[Proof]:
+        """
+        Recursively reconstructs a proof tree with corrupted values.
+        """
+        # Base case: this is the leaf we want to corrupt
+        if original_proof.is_base_fact():
+            if original_proof.goal == original_base_fact:
+                return Proof(
+                    goal=corrupted_base_fact,
+                    rule=None,
+                    sub_proofs=tuple(),
+                    recursive_use_counts=original_proof.recursive_use_counts,
+                    substitutions=original_proof.substitutions,
+                    is_valid=False,
+                    is_corrupted_leaf=True,
+                )
+            # Other base facts remain unchanged
+            return original_proof
+
+        # Recursive step
+        if original_proof.rule:
+            new_sub_proofs = []
+            changed = False
+            
+            # We need to determine the goal for each sub-proof
+            # Since we don't have the full substitution for every intermediate node easily available without re-running unification,
+            # we will try to propagate the change recursively.
+            
+            # However, a simpler approach for visualization is to just use the corrupt_leaf method 
+            # if we can ensure the goal updates correctly.
+            # But corrupt_leaf keeps the original goal (marked invalid).
+            # Here we WANT the NEW goal (the falsified one).
+            
+            for sp in original_proof.sub_proofs:
+                # Recursively reconstruct sub-proofs
+                # Note: We pass new_goal only to the top level. For sub-proofs, we might need to re-calculate their goals if they depend on the changed variable.
+                # But calculating intermediate goals is complex.
+                # Simplification: We only update the top-level goal and the corrupted leaf. 
+                # Intermediate nodes will keep their original goals but be marked invalid.
+                # This is "good enough" for visualization to show the path.
+                
+                # Actually, if we want to show the propagation, we should ideally update intermediate goals.
+                # But let's start with updating the leaf and the root.
+                
+                new_sp = self._create_propagated_proof(
+                    sp, original_base_fact, corrupted_base_fact, new_goal, new_subst, is_root=False
+                )
+                new_sub_proofs.append(new_sp)
+                if new_sp is not sp:
+                    changed = True
+
+            if changed:
+                # If this is the root node (matches original proof), use the new_goal
+                # Otherwise, keep original goal (simplification)
+                # Ideally we would re-instantiate the rule with new_subst, but new_subst is only for the top level rule?
+                # No, we normalized it to be for the rule variables.
+                
+                # If we are at the top level (original_proof is the root passed in), we use new_goal.
+                # But this method is recursive.
+                
+                # Let's assume we only update the goal if this node's rule matches the substitution scope.
+                # For now, let's just update the goal if it's the root call.
+                # But we don't know if we are at root.
+                
+                # Better approach: Just use the new_goal for the returned proof if it's the root.
+                # The recursive calls return proofs.
+                
+                return Proof(
+                    goal=new_goal if is_root else original_proof.goal,
+                    rule=original_proof.rule,
+                    sub_proofs=tuple(new_sub_proofs),
+                    recursive_use_counts=original_proof.recursive_use_counts,
+                    substitutions=original_proof.substitutions, # Keep original substs for intermediate nodes
+                    is_valid=False,
+                )
+
+        return original_proof
 
     def _build_individual_classes_map(
         self, kg: KnowledgeGraph

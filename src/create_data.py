@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional
 import networkx as nx
+from tqdm import tqdm
 
 from data_structures import KnowledgeGraph
 from generate import KGenerator, extract_proof_map, atoms_to_knowledge_graph
@@ -128,6 +129,7 @@ class KGEDatasetGenerator:
         
         # Validation stats
         self.validation_errors: Dict[str, List[str]] = defaultdict(list)
+        self.discarded_samples: Dict[str, List[str]] = defaultdict(list)
         
         # Detailed tracking for debugging
         self.rule_selection_count: Dict[str, int] = defaultdict(int)
@@ -148,7 +150,7 @@ class KGEDatasetGenerator:
         min_individuals: int = 5,
         max_individuals: int = 30,
         min_rules_per_sample: int = 1,
-        max_rules_per_sample: int = 7,
+        max_rules_per_sample: int = 20,
     ) -> tuple[List[KnowledgeGraph], List[KnowledgeGraph]]:
         """
         Generate complete training and testing datasets.
@@ -226,6 +228,8 @@ class KGEDatasetGenerator:
         failed_attempts = 0
         max_failed_attempts = n_samples * 10
 
+        pbar = tqdm(total=n_samples, desc=f"Generating {sample_type} samples")
+        
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
             # Reset individual pool for each sample
             self.generator.chainer.reset_individual_pool()
@@ -244,15 +248,20 @@ class KGEDatasetGenerator:
                 if not val_result["valid"]:
                     if self.verbose:
                         print(f"  [WARN] Sample validation failed: {val_result['errors']}")
-                    # Store errors for summary (keyed by sample index)
-                    sample_idx = len(samples)
-                    self.validation_errors[f"{sample_type}_{sample_idx}"] = val_result["errors"]
-                
-                samples.append(sample)
-                if len(samples) % 100 == 0 or len(samples) == n_samples:
-                    print(f"  [{sample_type}] Generated {len(samples)}/{n_samples}")
+                    
+                    # DISCARD SAMPLE
+                    # Store errors for summary (keyed by unique ID)
+                    discard_id = f"{sample_type}_discarded_{failed_attempts}"
+                    self.discarded_samples[discard_id] = val_result["errors"]
+                    failed_attempts += 1
+                    # Do not add to samples, do not update pbar
+                else:
+                    samples.append(sample)
+                    pbar.update(1)
             else:
                 failed_attempts += 1
+
+        pbar.close()
 
         if len(samples) < n_samples:
             print(
@@ -322,7 +331,7 @@ class KGEDatasetGenerator:
 
             # Select random subset of proofs
             n_select = random.randint(
-                1, min(len(proofs), 10000)
+                min(len(proofs), 5), min(len(proofs), 10000)
             )  # TODO: adjust max as needed
             selected = random.sample(proofs, n_select)
 
@@ -494,37 +503,69 @@ class KGEDatasetGenerator:
     ) -> None:
         """Print summary statistics for generated datasets."""
 
-        def compute_stats(samples: List[KnowledgeGraph]) -> Dict:
-            if not samples:
-                return {}
-
-            return {
+        # Calculate stats
+        def get_stats(samples):
+            stats = {
                 "n_samples": len(samples),
-                "avg_individuals": sum(len(s.individuals) for s in samples)
-                / len(samples),
-                "avg_triples": sum(len(s.triples) for s in samples) / len(samples),
-                "avg_pos_triples": sum(
-                    sum(1 for t in s.triples if t.positive) for s in samples
-                )
-                / len(samples),
-                "avg_neg_triples": sum(
-                    sum(1 for t in s.triples if not t.positive) for s in samples
-                )
-                / len(samples),
-                "avg_memberships": sum(len(s.memberships) for s in samples)
-                / len(samples),
-                "avg_pos_memberships": sum(
-                    sum(1 for m in s.memberships if m.is_member) for s in samples
-                )
-                / len(samples),
-                "avg_neg_memberships": sum(
-                    sum(1 for m in s.memberships if not m.is_member) for s in samples
-                )
-                / len(samples),
+                "n_individuals": 0,
+                "n_triples": 0,
+                "n_pos_triples": 0,
+                "n_neg_triples": 0,
+                "n_memberships": 0,
+                "n_pos_mems": 0,
+                "n_neg_mems": 0,
+                "n_base_facts": 0,
+                "n_inferred_facts": 0,
+                "n_neg_base_facts": 0,
+                "n_neg_inferred_facts": 0,
+                "n_neg_propagated_facts": 0,
             }
+            for kg in samples:
+                stats["n_individuals"] += len(kg.individuals)
+                stats["n_triples"] += len(kg.triples)
+                stats["n_memberships"] += len(kg.memberships)
+                
+                for t in kg.triples:
+                    if t.positive:
+                        stats["n_pos_triples"] += 1
+                        if t.is_base_fact:
+                            stats["n_base_facts"] += 1
+                        else:
+                            stats["n_inferred_facts"] += 1
+                    else:
+                        stats["n_neg_triples"] += 1
+                        source = t.metadata.get("source_type", "unknown")
+                        if source == "base":
+                            stats["n_neg_base_facts"] += 1
+                        elif source == "inferred":
+                            stats["n_neg_inferred_facts"] += 1
+                        elif source == "propagated_inferred":
+                            stats["n_neg_propagated_facts"] += 1
+                        
+                for m in kg.memberships:
+                    if m.is_member:
+                        stats["n_pos_mems"] += 1
+                        if m.is_base_fact:
+                            stats["n_base_facts"] += 1
+                        else:
+                            stats["n_inferred_facts"] += 1
+                    else:
+                        stats["n_neg_mems"] += 1
+                        source = m.metadata.get("source_type", "unknown")
+                        if source == "base":
+                            stats["n_neg_base_facts"] += 1
+                        elif source == "inferred":
+                            stats["n_neg_inferred_facts"] += 1
+                        
+            # Averages
+            if stats["n_samples"] > 0:
+                for key in list(stats.keys()):
+                    if key != "n_samples":
+                        stats[f"avg_{key[2:]}"] = stats[key] / stats["n_samples"]
+            return stats
 
-        train_stats = compute_stats(train_samples)
-        test_stats = compute_stats(test_samples)
+        train_stats = get_stats(train_samples)
+        test_stats = get_stats(test_samples)
 
         print(f"\n{'=' * 80}")
         print("DATASET GENERATION COMPLETE")
@@ -548,8 +589,20 @@ class KGEDatasetGenerator:
 
         # Rule coverage
         print(f"\n--- Rule Coverage ---")
-        print(f"Train: {len(self.train_rule_usage)}/{len(self.rules)} rules used")
-        print(f"Test:  {len(self.test_rule_usage)}/{len(self.rules)} rules used")
+        
+        def print_rule_usage(title, usage_dict, total_selections):
+            print(f"\n{title}:")
+            print(f"{'Rule Name':<40} | {'Count':<10} | {'Percentage':<10}")
+            print("-" * 70)
+            for rule_name, count in sorted(usage_dict.items(), key=lambda x: x[1], reverse=True):
+                percentage = (count / total_selections) * 100 if total_selections > 0 else 0
+                print(f"{rule_name:<40} | {count:<10} | {percentage:.1f}%")
+
+        total_train_selections = sum(self.train_rule_usage.values())
+        print_rule_usage("Train Rule Usage", self.train_rule_usage, total_train_selections)
+        
+        total_test_selections = sum(self.test_rule_usage.values())
+        print_rule_usage("Test Rule Usage", self.test_rule_usage, total_test_selections)
 
         unused_in_train = set(r.name for r in self.rules) - set(
             self.train_rule_usage.keys()
@@ -559,7 +612,7 @@ class KGEDatasetGenerator:
         )
 
         if unused_in_train:
-            print(f"Warning: {len(unused_in_train)} rules unused in training")
+            print(f"\nWarning: {len(unused_in_train)} rules unused in training")
         if unused_in_test:
             print(f"Warning: {len(unused_in_test)} rules unused in testing")
             
@@ -590,16 +643,28 @@ class KGEDatasetGenerator:
 
         # Validation Report
         print(f"\n--- Validation Report ---")
-        if not self.validation_errors:
-            print("All samples passed validation checks.")
+        if not self.discarded_samples:
+            print("All generated samples passed validation checks (0 discarded).")
         else:
-            print(f"Found validation errors in {len(self.validation_errors)} samples:")
-            for sample_id, errors in self.validation_errors.items():
-                print(f"  Sample {sample_id}:")
-                for err in errors[:5]: # Limit to 5 errors per sample
-                    print(f"    - {err}")
-                if len(errors) > 5:
-                    print(f"    - ... and {len(errors) - 5} more")
+            print(f"Discarded {len(self.discarded_samples)} samples due to validation errors:")
+            
+            # Group errors by type for cleaner reporting
+            error_counts = defaultdict(int)
+            for errors in self.discarded_samples.values():
+                for err in errors:
+                    # Simplify error message to group similar ones
+                    # e.g., "Constraint Violation: Ind_5 ..." -> "Constraint Violation"
+                    base_err = err.split(":")[0] if ":" in err else err
+                    error_counts[base_err] += 1
+            
+            for err_type, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+                print(f"  - {err_type}: {count}")
+
+            if self.verbose:
+                print("\nDetailed Discard Reasons (First 5):")
+                for i, (sample_id, errors) in enumerate(self.discarded_samples.items()):
+                    if i >= 5: break
+                    print(f"  {sample_id}: {errors}")
 
         print("\nTRAINING SET:")
         print(f"  Samples:           {train_stats.get('n_samples', 0)}")
@@ -608,8 +673,15 @@ class KGEDatasetGenerator:
         print(f"    - Positive:      {train_stats.get('avg_pos_triples', 0):.1f}")
         print(f"    - Negative:      {train_stats.get('avg_neg_triples', 0):.1f}")
         print(f"  Avg memberships:   {train_stats.get('avg_memberships', 0):.1f}")
-        print(f"    - Positive:      {train_stats.get('avg_pos_memberships', 0):.1f}")
-        print(f"    - Negative:      {train_stats.get('avg_neg_memberships', 0):.1f}")
+        print(f"    - Positive:      {train_stats.get('avg_pos_mems', 0):.1f}")
+        print(f"    - Negative:      {train_stats.get('avg_neg_mems', 0):.1f}")
+        print(f"  Fact Types (Pos):")
+        print(f"    - Base Facts:    {train_stats.get('avg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {train_stats.get('avg_inferred_facts', 0):.1f}")
+        print(f"  Fact Types (Neg):")
+        print(f"    - Base Facts:    {train_stats.get('avg_neg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {train_stats.get('avg_neg_inferred_facts', 0):.1f}")
+        print(f"    - Propagated:    {train_stats.get('avg_neg_propagated_facts', 0):.1f}")
 
         print("\nTEST SET:")
         print(f"  Samples:           {test_stats.get('n_samples', 0)}")
@@ -618,8 +690,15 @@ class KGEDatasetGenerator:
         print(f"    - Positive:      {test_stats.get('avg_pos_triples', 0):.1f}")
         print(f"    - Negative:      {test_stats.get('avg_neg_triples', 0):.1f}")
         print(f"  Avg memberships:   {test_stats.get('avg_memberships', 0):.1f}")
-        print(f"    - Positive:      {test_stats.get('avg_pos_memberships', 0):.1f}")
-        print(f"    - Negative:      {test_stats.get('avg_neg_memberships', 0):.1f}")
+        print(f"    - Positive:      {test_stats.get('avg_pos_mems', 0):.1f}")
+        print(f"    - Negative:      {test_stats.get('avg_neg_mems', 0):.1f}")
+        print(f"  Fact Types (Pos):")
+        print(f"    - Base Facts:    {test_stats.get('avg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {test_stats.get('avg_inferred_facts', 0):.1f}")
+        print(f"  Fact Types (Neg):")
+        print(f"    - Base Facts:    {test_stats.get('avg_neg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {test_stats.get('avg_neg_inferred_facts', 0):.1f}")
+        print(f"    - Propagated:    {test_stats.get('avg_neg_propagated_facts', 0):.1f}")
 
         print(f"{'=' * 80}\n")
 
@@ -720,11 +799,11 @@ def main():
         "--n-train", type=int, default=5, help="Number of training samples"
     )
     parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
-    parser.add_argument("--min-individuals", type=int, default=5)
+    parser.add_argument("--min-individuals", type=int, default=1)
     parser.add_argument("--max-individuals", type=int, default=1000)
     parser.add_argument("--max-recursion", type=int, default=10)
     parser.add_argument("--global-max-depth", type=int, default=10)
-    parser.add_argument("--max-proofs-per-atom", type=int, default=20)
+    parser.add_argument("--max-proofs-per-atom", type=int, default=30)
     parser.add_argument(
         "--individual-pool-size", type=int, default=1000, help="Size of individual pool"
     )

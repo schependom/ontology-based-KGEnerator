@@ -662,13 +662,13 @@ class BackwardChainer:
             if self._check_constraints(complete_proof, all_atoms):
                 valid_proof_count += 1
 
-                if self.export_proof_visualizations:
-                    # write out the valid proof
-                    complete_proof.save_visualization(
-                        f"proof-trees/{start_rule_name}_{valid_proof_count}",
-                        "pdf",
-                        f"proof_{start_rule_name}_{valid_proof_count}",
-                    )
+                # if self.export_proof_visualizations:
+                #     # write out the valid proof
+                #     complete_proof.save_visualization(
+                #         f"proof-trees/{start_rule_name}_{valid_proof_count}",
+                #         "pdf",
+                #         f"proof_{start_rule_name}_{valid_proof_count}",
+                #     )
 
                 yield complete_proof
             elif self.verbose:
