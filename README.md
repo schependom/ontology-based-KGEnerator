@@ -38,11 +38,11 @@ The generation process $\mathcal{G}(\Sigma) \to \mathcal{K}$ follows these steps
 3. **Proof-based Corruption**: 
     - Corrupts valid triples based on the proof tree.
     - If a base fact in a proof tree is corrupted, the corruption propagates up the tree, creating "hard" negative inferred facts that look structurally valid but are false.
-    - Note that this new negative fact can cause inconsistencies in the graph. If this is the case, ... TODO ...
+    - Note that this new negative fact can cause inconsistencies in the graph. If this is the case (i.e., the derived negative fact turns out to be a valid positive fact in the KG), the propagation is considered a failure and the sample is discarded. The generator then attempts to find a different corruption.
     - E.g. $(X, \mathrm{hasFather}, Y) \land (Y, \mathrm{hasFather}, Z) \implies (X, \mathrm{hasGrandfather}, Z)$
-        - Corrupt base fact $(X, \mathrm{hasFather}, Y)$
-        - The corruption propagates up the tree, creating $(X, \lnot\mathrm{hasGrandfather}, Z)$.
-        - If an inconsistency is detected, ... TODO ...
+        - Corrupt base fact $(X, \mathrm{hasFather}, Y)$ to $(X, \mathrm{hasFather}, W)$
+        - The corruption propagates up the tree, creating $(X, \lnot\mathrm{hasGrandfather}, Z)$ (or rather, a new relation that *should* be false).
+        - If the new inferred fact is actually true in the graph, it is discarded.
 
 
 ## Installation
@@ -93,7 +93,18 @@ python src/create_data.py \
 In order to manually (and visually) verify that the proofs, facts and negative examples are correct, we can generate a single Knowledge Graph that attempts to contain **all possible facts** and **all possible proofs** derivable from a toy ontology (within finite bounds).
 
 ```bash
-python ... TODO ... --ontology-path data/toy.ttl ... TODO ...
+
+python src/generate.py \
+    --ontology-path data/toy.ttl \
+    --neg-strategy proof_based \
+    --neg-ratio 1.0 \
+    --corrupt-base-facts \
+    --export-proofs \
+    --verbose
 ```
 
-TODO
+This will:
+1.  Generate all possible facts from `data/toy.ttl`.
+2.  Add negative samples using proof-based corruption (corrupting base facts and propagating).
+3.  Export visualizations of the proof trees (both valid and corrupted) to `proof-trees/`.
+

@@ -332,7 +332,7 @@ class NegativeSampler:
         # Limit exported visualizations to prevent freezing
         exported_corrupted_count = 0
         exported_propagated_count = 0
-        MAX_EXPORTS = 5
+        MAX_EXPORTS = 200
 
         attempts = 0
         max_attempts = n_negatives * 10  # Safety limit to prevent infinite loops
@@ -445,7 +445,7 @@ class NegativeSampler:
                                 # Create Triple from Atom
                                 # Note: Atom terms might be strings or objects, need to be careful
                                 # But in our system, substitute returns terms from the substitution values (Individuals)
-                                
+
                                 # Check if it's a valid Triple structure
                                 if isinstance(new_goal_atom.predicate, Relation):
                                     neg_goal = Triple(
@@ -463,6 +463,7 @@ class NegativeSampler:
                                         
                                         # VISUALIZATION: Export the propagated proof
                                         if export_proofs and output_dir and exported_propagated_count < MAX_EXPORTS:
+
                                             # Create atom from negative goal
                                             neg_goal_atom = Atom(
                                                 predicate=neg_goal.predicate,
@@ -500,8 +501,12 @@ class NegativeSampler:
                         else:
                             if self.verbose:
                                 print("Propagation failed: Could not determine changed term.")
+                    else:
+                        # This happens if proof.rule is None.
+                        # If we are corrupting a base fact that has no rule (i.e. it's a root fact itself),
+                        # then there is no propagation to do. This is normal for base facts.
                         if self.verbose:
-                            print("Propagation failed: No rule found for proof (base fact?).")
+                            print(f"  [INFO] No propagation: Proof for {pos_triple} has no rule (likely a base fact).")
 
                     # If we have a negative triple and we want to export proofs
                     # Only export corrupted proof if we didn't export a propagated one (avoid redundancy)
@@ -525,7 +530,7 @@ class NegativeSampler:
                         # Save visualization
                         filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
                         full_path = os.path.join(output_dir, filename)
-                        corrupted_proof.save_visualization(full_path, format="png", root_label="REMOVED INFERRED FACT")
+                        corrupted_proof.save_visualization(full_path, format="png", root_label="INVALID FACT IF NEGATED")
                         exported_corrupted_count += 1
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):

@@ -1039,7 +1039,14 @@ class Proof:
                 type_label = f"Rule: {proof.rule.name}"
 
             # Format goal atom
-            goal_html = proof.goal.__repr__()
+            goal_html = self._format_atom_html(proof.goal)
+            
+            # Add "NOT" prefix for negative facts
+            if proof.is_corrupted_leaf:
+                goal_html = f"<B>NOT</B> {goal_html}"
+            elif proof == self and root_label == "DERIVED NEGATIVE FACT":
+                goal_html = f"<B>NOT</B> {goal_html}"
+
             if not proof.is_valid and not proof.is_corrupted_leaf:
                 # If this is a derived negative fact (propagated), don't cross out
                 if proof == self and root_label == "DERIVED NEGATIVE FACT":

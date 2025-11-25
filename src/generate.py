@@ -33,6 +33,7 @@ from data_structures import (
 )
 from parser import OntologyParser
 from chainer import BackwardChainer
+from negative_sampler import NegativeSampler
 
 
 # ============================================================================ #
@@ -497,7 +498,7 @@ def main():
     parser.add_argument(
         "--individual-reuse-prob",
         type=float,
-        default=0.7,
+        default=0,
         help="Probability of reusing individuals",
     )
     parser.add_argument(
@@ -509,6 +510,24 @@ def main():
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
+    )
+    parser.add_argument(
+        "--neg-strategy",
+        type=str,
+        default=None,
+        choices=["random", "constrained", "proof_based", "type_aware", "mixed"],
+        help="Negative sampling strategy (optional)",
+    )
+    parser.add_argument(
+        "--neg-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of negative to positive samples",
+    )
+    parser.add_argument(
+        "--corrupt-base-facts",
+        action="store_true",
+        help="Corrupt base facts for proof-based strategy",
     )
     args = parser.parse_args()
 
@@ -528,13 +547,37 @@ def main():
         # Generate full graph
         kg = generator.generate_full_graph()
 
+        # Add negative samples if requested
+        if args.neg_strategy and args.neg_ratio > 0:
+            print(f"\nAdding negative samples (Strategy: {args.neg_strategy}, Ratio: {args.neg_ratio})...")
+            
+            # Initialize NegativeSampler
+            # We need schema info which is in the generator
+            sampler = NegativeSampler(
+                schema_classes=generator.schema_classes,
+                schema_relations=generator.schema_relations,
+                domains=generator.parser.domains,
+                ranges=generator.parser.ranges,
+                verbose=args.verbose,
+            )
+            
+            kg = sampler.add_negative_samples(
+                kg,
+                strategy=args.neg_strategy,
+                ratio=args.neg_ratio,
+                corrupt_base_facts=args.corrupt_base_facts,
+                export_proofs=args.export_proofs,
+                output_dir="proof-trees" if args.export_proofs else None,
+            )
+
         # check if the kg is not too big
         if len(kg.triples) + len(kg.memberships) > 100:
             print("Warning: Generated knowledge graph is very large (>10,000 facts).")
             print("Not saving visualization to avoid performance issues.")
         else:
             kg.save_visualization(
-                output_path="full_knowledge_graph",
+                output_path=".",
+                output_name="full_knowledge_graph",
                 title="Complete Knowledge Graph",
             )
 
