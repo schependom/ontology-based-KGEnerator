@@ -24,6 +24,7 @@ from data_structures import KnowledgeGraph
 from generate import KGenerator, extract_proof_map, atoms_to_knowledge_graph
 from graph_visualizer import GraphVisualizer
 from negative_sampler import NegativeSampler
+from validator import Validator
 
 
 class KGEDatasetGenerator:
@@ -107,6 +108,14 @@ class KGEDatasetGenerator:
             ranges=self.generator.parser.ranges,
             verbose=verbose,
         )
+        
+        # Initialize Validator
+        self.validator = Validator(
+            constraints=self.generator.parser.constraints,
+            domains=self.generator.parser.domains,
+            ranges=self.generator.parser.ranges,
+            verbose=verbose,
+        )
 
         # Negative sampling config
         self.neg_strategy = neg_strategy
@@ -116,6 +125,9 @@ class KGEDatasetGenerator:
         # Track rule usage for coverage analysis
         self.train_rule_usage: Dict[str, int] = defaultdict(int)
         self.test_rule_usage: Dict[str, int] = defaultdict(int)
+        
+        # Validation stats
+        self.validation_errors: Dict[str, List[str]] = defaultdict(list)
         
         # Detailed tracking for debugging
         self.rule_selection_count: Dict[str, int] = defaultdict(int)
@@ -227,6 +239,15 @@ class KGEDatasetGenerator:
             )
 
             if sample is not None:
+                # Validate sample
+                val_result = self.validator.validate(sample)
+                if not val_result["valid"]:
+                    if self.verbose:
+                        print(f"  [WARN] Sample validation failed: {val_result['errors']}")
+                    # Store errors for summary (keyed by sample index)
+                    sample_idx = len(samples)
+                    self.validation_errors[f"{sample_type}_{sample_idx}"] = val_result["errors"]
+                
                 samples.append(sample)
                 if len(samples) % 100 == 0 or len(samples) == n_samples:
                     print(f"  [{sample_type}] Generated {len(samples)}/{n_samples}")
@@ -335,6 +356,9 @@ class KGEDatasetGenerator:
                 )
             return None
 
+        # Complete schema (apply domain/range rules)
+        self._complete_schema(kg)
+
         # Add negatives via NegativeSampler
         kg = self.negative_sampler.add_negative_samples(
             kg,
@@ -346,6 +370,64 @@ class KGEDatasetGenerator:
         )
 
         return kg
+
+    def _complete_schema(self, kg: KnowledgeGraph) -> None:
+        """
+        Deterministically apply schema rules (domain/range) to ensure consistency.
+        
+        This fixes "Schema Violation" errors where a triple exists but the 
+        implied class memberships for subject/object are missing.
+        """
+        from data_structures import Membership
+        
+        # We need to look up Class objects by name
+        class_map = self.schema_classes
+        
+        # Helper to add membership if missing
+        def add_membership(ind, cls_name):
+            if cls_name not in class_map:
+                return # Should not happen if schema is consistent
+            
+            cls = class_map[cls_name]
+            
+            # Check if already exists
+            for m in kg.memberships:
+                if m.individual == ind and m.cls == cls and m.is_member:
+                    return
+            
+            # Add new membership
+            # Note: We treat this as an inferred fact (no specific proof stored here for simplicity, 
+            # or we could create a dummy proof)
+            new_mem = Membership(
+                individual=ind,
+                cls=cls,
+                is_member=True,
+                proofs=[] 
+            )
+            kg.memberships.append(new_mem)
+
+        # Iteratively apply rules until fixpoint
+        # (Simple version: just one pass is enough for domain/range 
+        # unless we have complex chains which we don't handle here yet)
+        
+        domains = self.generator.parser.domains
+        ranges = self.generator.parser.ranges
+        
+        for t in kg.triples:
+            if not t.positive:
+                continue
+                
+            prop_name = t.predicate.name
+            
+            # Apply Domain
+            if prop_name in domains:
+                for domain_cls in domains[prop_name]:
+                    add_membership(t.subject, domain_cls)
+                    
+            # Apply Range
+            if prop_name in ranges:
+                for range_cls in ranges[prop_name]:
+                    add_membership(t.object, range_cls)
 
     @staticmethod
     def check_structural_isomorphism(kg1: KnowledgeGraph, kg2: KnowledgeGraph) -> bool:
@@ -505,6 +587,19 @@ class KGEDatasetGenerator:
             for strategy, count in sorted(strategy_usage.items(), key=lambda x: x[1], reverse=True):
                 percentage = (count / total_negatives) * 100 if total_negatives > 0 else 0
                 print(f"{strategy:<20} | {count:<10} | {percentage:.1f}%")
+
+        # Validation Report
+        print(f"\n--- Validation Report ---")
+        if not self.validation_errors:
+            print("All samples passed validation checks.")
+        else:
+            print(f"Found validation errors in {len(self.validation_errors)} samples:")
+            for sample_id, errors in self.validation_errors.items():
+                print(f"  Sample {sample_id}:")
+                for err in errors[:5]: # Limit to 5 errors per sample
+                    print(f"    - {err}")
+                if len(errors) > 5:
+                    print(f"    - ... and {len(errors) - 5} more")
 
         print("\nTRAINING SET:")
         print(f"  Samples:           {train_stats.get('n_samples', 0)}")

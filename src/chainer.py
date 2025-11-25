@@ -281,7 +281,6 @@ class BackwardChainer:
             and self.individual_pool
             and random.random() < self.individual_reuse_prob
         ):
-            print("Reusing individual from pool.")
             return random.choice(self.individual_pool)
 
         # Create new individual
