@@ -145,13 +145,14 @@ class KGEDatasetGenerator:
 
     def generate_dataset(
         self,
-        n_train: int = 5,
-        n_test: int = 2,
-        min_individuals: int = 5,
-        max_individuals: int = 30,
-        min_rules_per_sample: int = 1,
-        max_rules_per_sample: int = 20,
-    ) -> tuple[List[KnowledgeGraph], List[KnowledgeGraph]]:
+        n_train: int,
+        n_test: int,
+        min_individuals: int,
+        max_individuals: int,
+        min_rules: int = 1,
+        max_rules: int = 5,
+        min_proofs_per_rule: int = 5,
+    ) -> Tuple[List[KnowledgeGraph], List[KnowledgeGraph]]:
         """
         Generate complete training and testing datasets.
 
@@ -160,8 +161,9 @@ class KGEDatasetGenerator:
             n_test: Number of test samples
             min_individuals: Minimum individuals per sample
             max_individuals: Maximum individuals per sample
-            min_rules_per_sample: Min rules to trigger per sample
-            max_rules_per_sample: Max rules to trigger per sample
+            min_rules: Min rules to trigger per sample
+            max_rules: Max rules to trigger per sample
+            min_proofs_per_rule: Minimum proofs to select per rule
 
         Returns:
             Tuple of (train_samples, test_samples)
@@ -171,7 +173,8 @@ class KGEDatasetGenerator:
         print(f"{'=' * 80}")
         print(f"Target: {n_train} train samples, {n_test} test samples")
         print(f"Individual range: {min_individuals}-{max_individuals}")
-        print(f"Rules per sample: {min_rules_per_sample}-{max_rules_per_sample}")
+        print(f"Rules per sample: {min_rules}-{max_rules}")
+        print(f"Min proofs per rule: {min_proofs_per_rule}")
         print(f"{'=' * 80}\n")
 
         # Generate training samples
@@ -180,8 +183,9 @@ class KGEDatasetGenerator:
             n_samples=n_train,
             min_individuals=min_individuals,
             max_individuals=max_individuals,
-            min_rules=min_rules_per_sample,
-            max_rules=max_rules_per_sample,
+            min_rules=min_rules,
+            max_rules=max_rules,
+            min_proofs_per_rule=min_proofs_per_rule,
             sample_type="TRAIN",
         )
 
@@ -191,8 +195,9 @@ class KGEDatasetGenerator:
             n_samples=n_test,
             min_individuals=min_individuals,
             max_individuals=max_individuals,
-            min_rules=min_rules_per_sample,
-            max_rules=max_rules_per_sample,
+            min_rules=min_rules,
+            max_rules=max_rules,
+            min_proofs_per_rule=min_proofs_per_rule,
             sample_type="TEST",
         )
 
@@ -208,6 +213,7 @@ class KGEDatasetGenerator:
         max_individuals: int,
         min_rules: int,
         max_rules: int,
+        min_proofs_per_rule: int,
         sample_type: str,
     ) -> List[KnowledgeGraph]:
         """
@@ -219,6 +225,8 @@ class KGEDatasetGenerator:
             max_individuals: Max individuals per sample
             min_rules: Min rules to trigger per sample
             max_rules: Max rules to trigger per sample
+            min_proofs_per_rule: Minimum proofs to select per rule
+            stratified_selection: Whether to use stratified rule selection
             sample_type: "TRAIN" or "TEST" (for logging)
 
         Returns:
@@ -239,6 +247,7 @@ class KGEDatasetGenerator:
                 max_individuals=max_individuals,
                 min_rules=min_rules,
                 max_rules=max_rules,
+                min_proofs_per_rule=min_proofs_per_rule,
                 sample_type=sample_type,
             )
 
@@ -277,6 +286,7 @@ class KGEDatasetGenerator:
         max_individuals: int,
         min_rules: int,
         max_rules: int,
+        min_proofs_per_rule: int,
         sample_type: str,
     ) -> Optional[KnowledgeGraph]:
         """
@@ -306,7 +316,7 @@ class KGEDatasetGenerator:
         current_recursion = random.randint(1, self.max_recursion_cap)
         self.generator.chainer.max_recursion_depth = current_recursion
 
-        # VARIANCE STRATEGY 2: Random rule selection
+        # VARIANCE STRATEGY 2: Rule selection
         n_rules = random.randint(min_rules, min(max_rules, len(self.rules)))
         selected_rules = random.sample(self.rules, n_rules)
 
@@ -331,7 +341,7 @@ class KGEDatasetGenerator:
 
             # Select random subset of proofs
             n_select = random.randint(
-                min(len(proofs), 5), min(len(proofs), 10000)
+                min(len(proofs), min_proofs_per_rule), min(len(proofs), 10000)
             )  # TODO: adjust max as needed
             selected = random.sample(proofs, n_select)
 
@@ -613,8 +623,12 @@ class KGEDatasetGenerator:
 
         if unused_in_train:
             print(f"\nWarning: {len(unused_in_train)} rules unused in training")
+            for r in sorted(unused_in_train):
+                print(f"  - {r}")
         if unused_in_test:
             print(f"Warning: {len(unused_in_test)} rules unused in testing")
+            for r in sorted(unused_in_test):
+                print(f"  - {r}")
             
         # Detailed breakdown of unused rules
         all_unused = unused_in_train.intersection(unused_in_test)
@@ -801,6 +815,7 @@ def main():
     parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
     parser.add_argument("--min-individuals", type=int, default=1)
     parser.add_argument("--max-individuals", type=int, default=1000)
+    parser.add_argument("--min-proofs-per-rule", type=int, default=5, help="Minimum number of proofs to select per rule per sample")
     parser.add_argument("--max-recursion", type=int, default=10)
     parser.add_argument("--global-max-depth", type=int, default=10)
     parser.add_argument("--max-proofs-per-atom", type=int, default=30)

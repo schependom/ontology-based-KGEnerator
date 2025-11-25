@@ -301,9 +301,31 @@ class NegativeSampler:
         negative_triples = []
 
         # Collect triples with proofs
-        triples_with_proofs = [(t, t.proofs) for t in positive_triples if t.proofs]
+        # Prioritize inferred facts (those with non-trivial proofs)
+        inferred_triples_with_proofs = []
+        base_triples_with_proofs = []
+        
+        for t in positive_triples:
+            if t.proofs:
+                # Check if any proof is non-trivial (has a rule)
+                inferred_proofs = [p for p in t.proofs if p.rule is not None]
+                if inferred_proofs:
+                    inferred_triples_with_proofs.append((t, inferred_proofs))
+                else:
+                    base_triples_with_proofs.append((t, t.proofs))
+        
+        # Use inferred triples if available, otherwise fallback to base
+        # We want to prioritize breaking reasoning chains
+        if inferred_triples_with_proofs:
+            candidate_pool = inferred_triples_with_proofs
+            if self.verbose:
+                print(f"Prioritizing {len(candidate_pool)} inferred facts for corruption")
+        else:
+            candidate_pool = base_triples_with_proofs
+            if self.verbose:
+                print(f"No inferred facts found, falling back to {len(candidate_pool)} base facts")
 
-        if not triples_with_proofs:
+        if not candidate_pool:
             # Fallback to random if no proofs available
             return self._random_corruption(kg, ratio)
 
@@ -318,12 +340,12 @@ class NegativeSampler:
         while len(negative_triples) < n_negatives and attempts < max_attempts:
             attempts += 1
 
-            if not triples_with_proofs:
+            if not candidate_pool:
                 print("No triples with proofs found")
                 break
 
             # Pick a triple with proofs
-            pos_triple, proofs = random.choice(triples_with_proofs)
+            pos_triple, proofs = random.choice(candidate_pool)
 
             if not proofs:
                 print("No proofs found for triple: ", pos_triple)
@@ -371,32 +393,7 @@ class NegativeSampler:
                     if neg_triple:
                         neg_triple.metadata["source_type"] = "base" # Explicitly base since we target base fact
 
-                    # If we have a negative triple and we want to export proofs
-                    if (
-                        neg_triple
-                        and export_proofs
-                        and output_dir
-                        and exported_corrupted_count < MAX_EXPORTS
-                    ):
-                        # Create atom from negative triple
-                        new_atom = Atom(
-                            predicate=neg_triple.predicate,
-                            subject=neg_triple.subject,
-                            object=neg_triple.object,
-                        )
-
-                        # Create corrupted proof
-                        corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
-
-                        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-                        # Save visualization
-                        filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
-                        full_path = os.path.join(output_dir, filename)
-                        corrupted_proof.save_visualization(full_path, format="png", root_label="REMOVED INFERRED FACT")
-                        exported_corrupted_count += 1
-                        if self.verbose:
-                            print(f"Exported corrupted proof visualization: {filename}")
+                    propagated_exported = False
 
                     # PROPAGATION: Try to derive the falsified goal
                     # We corrupted base_fact -> neg_triple
@@ -417,6 +414,9 @@ class NegativeSampler:
                         elif neg_triple.object != base_triple.object:
                             changed_term = base_triple.object
                             new_term = neg_triple.object
+                        else:
+                            if self.verbose:
+                                print(f"Propagation failed: Corruption did not change subject or object? {base_triple} -> {neg_triple}")
                             
                         if changed_term and new_term:
                             # Update substitution for all variables that mapped to the changed term
@@ -487,8 +487,46 @@ class NegativeSampler:
                                                 full_path = os.path.join(output_dir, filename)
                                                 propagated_proof.save_visualization(full_path, format="png", title="Propagated Corruption", root_label="DERIVED NEGATIVE FACT")
                                                 exported_propagated_count += 1
-                                                if self.verbose:
-                                                    print(f"Exported propagated proof visualization: {filename}")
+                                                propagated_exported = True
+                                    else:
+                                        if self.verbose:
+                                            print(f"Propagation failed: Derived goal {neg_goal} contradicts existing positive fact.")
+                                else:
+                                    if self.verbose:
+                                        print(f"Propagation failed: Derived goal predicate {new_goal_atom.predicate} is not a Relation.")
+                            else:
+                                if self.verbose:
+                                    print(f"Propagation failed: New goal atom is not ground: {new_goal_atom}")
+                        else:
+                            if self.verbose:
+                                print("Propagation failed: Could not determine changed term.")
+                        if self.verbose:
+                            print("Propagation failed: No rule found for proof (base fact?).")
+
+                    # If we have a negative triple and we want to export proofs
+                    # Only export corrupted proof if we didn't export a propagated one (avoid redundancy)
+                    if (
+                        neg_triple
+                        and export_proofs
+                        and output_dir
+                        and exported_corrupted_count < MAX_EXPORTS
+                        and not propagated_exported
+                    ):
+                        # Create atom from negative triple
+                        new_atom = Atom(
+                            predicate=neg_triple.predicate,
+                            subject=neg_triple.subject,
+                            object=neg_triple.object,
+                        )
+
+                        # Create corrupted proof
+                        corrupted_proof = proof.corrupt_leaf(base_fact, new_atom)
+
+                        # Save visualization
+                        filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
+                        full_path = os.path.join(output_dir, filename)
+                        corrupted_proof.save_visualization(full_path, format="png", root_label="REMOVED INFERRED FACT")
+                        exported_corrupted_count += 1
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):
                 negative_triples.append(neg_triple)
