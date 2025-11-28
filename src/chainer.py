@@ -666,14 +666,14 @@ class BackwardChainer:
                     # write out the valid proof
                     complete_proof.save_visualization(
                         f"proof-trees/{start_rule_name}_{valid_proof_count}",
-                        "png",
-                        f"proof_{start_rule_name}_{valid_proof_count}",
+                        "pdf",
+                        f"Proof #{valid_proof_count} for {ground_goal}",
                     )
 
                 yield complete_proof
             elif self.verbose:
                 print(
-                    f"  ✗ Proof {proof_count} for {start_rule_name} rejected due to constraint violation"
+                    f"  ✗ Proof {proof_count} for {ground_goal} rejected due to constraint violation"
                 )
 
     def _find_proofs_recursive(

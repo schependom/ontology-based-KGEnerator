@@ -163,10 +163,11 @@ class Membership:
         return Atom(self.individual, RDF.type, self.cls)
 
     def __repr__(self) -> str:
+        status = "Inferred" if self.is_inferred else "Base"
         if self.is_member:
-            return f"<{self.individual}, memberOf, {self.cls}>"
+            return f"<{self.individual}, memberOf, {self.cls}> [{status}]"
         else:
-            return f"<{self.individual}, ~memberOf, {self.cls}>"
+            return f"<{self.individual}, ~memberOf, {self.cls}> [{status}]"
 
 
 @dataclass
@@ -208,10 +209,11 @@ class Triple:
         return Atom(self.subject, self.predicate, self.object)
 
     def __repr__(self) -> str:
+        status = "Inferred" if self.is_inferred else "Base"
         if self.positive:
-            return f"<{self.subject}, {self.predicate}, {self.object}>"
+            return f"<{self.subject}, {self.predicate}, {self.object}> [{status}]"
         else:
-            return f"<{self.subject}, ~{self.predicate}, {self.object}>"
+            return f"<{self.subject}, ~{self.predicate}, {self.object}> [{status}]"
 
 
 @dataclass
@@ -249,7 +251,8 @@ class AttributeTriple:
         return Atom(self.subject, self.predicate, self.value)
 
     def __repr__(self) -> str:
-        return f"<{self.subject}, {self.predicate}, {self.value}>"
+        status = "Inferred" if self.is_inferred else "Base"
+        return f"<{self.subject}, {self.predicate}, {self.value}> [{status}]"
 
 
 @dataclass
@@ -689,13 +692,18 @@ class Atom:
 
     def __repr__(self):
         s = self.subject.name if hasattr(self.subject, "name") else str(self.subject)
-        p = (
-            self.predicate.name
-            if hasattr(self.predicate, "name")
-            else str(self.predicate)
-        )
+        
+        if self.predicate == RDF.type:
+            p = "rdf:type"
+        else:
+            p = (
+                self.predicate.name
+                if hasattr(self.predicate, "name")
+                else str(self.predicate)
+            )
+            
         o = self.object.name if hasattr(self.object, "name") else str(self.object)
-        return f"({s}, {p}, {o})"
+        return f"<{s}, {p}, {o}>"
 
 
 @dataclass
@@ -714,7 +722,7 @@ class ExecutableRule:
 
     def __repr__(self):
         prem_str = ", ".join(map(str, self.premises))
-        return f"{prem_str} -> {self.conclusion}  ({self.name})"
+        return f"{prem_str} ⇒ {self.conclusion}  ({self.name})"
 
     def __hash__(self):
         return hash(self.name)
@@ -962,12 +970,14 @@ class Proof:
 
         if title:
             dot.attr(
-                label=title, labelloc="t", fontsize="16", fontname="Helvetica-Bold"
+                label=title, labelloc="t", fontsize="16", fontname="FiraCode-Bold"
             )
 
         try:
             dot.render(filepath, format=format, cleanup=True)
             # print(f"✓ Saved proof visualization to: {filepath}.{format}")
+            # Save .dot file for verification
+            # dot.save(filepath + ".dot")
         except Exception as e:
             print(f"✗ Failed to render graph: {e}")
             # Save .dot file as fallback
@@ -989,7 +999,7 @@ class Proof:
         dot.attr(rankdir="BT")  # Bottom to top (premises support conclusions)
         dot.attr(splines="ortho")
         dot.attr(nodesep="0.6", ranksep="0.8")
-        dot.attr("node", shape="plain", fontname="Helvetica")
+        dot.attr("node", shape="plain", fontname="FiraCode")
 
         # Track node IDs
         node_counter = [0]  # Use list for mutable counter in closure
@@ -1036,7 +1046,15 @@ class Proof:
             else:
                 header_color = "#E3F2FD"  # Light blue
                 border_color = "#1565C0"  # Dark blue
-                type_label = f"Rule: {proof.rule.name}"
+                # Format rule as: premise1, premise2 -> conclusion
+                if proof.rule:
+                    premises_str = ", ".join([str(p) for p in proof.rule.premises])
+                    conclusion_str = str(proof.rule.conclusion)
+                    type_label = f"{premises_str} ⇒ {conclusion_str}"
+                    # Escape HTML characters for Graphviz label
+                    type_label = type_label.replace("<", "&lt;").replace(">", "&gt;")
+                else:
+                    type_label = "Derived Fact"
 
             # Format goal atom
             goal_html = self._format_atom_html(proof.goal)
@@ -1105,6 +1123,7 @@ class Proof:
 
                     # Edge label
                     edge_label = f"premise {i + 1}:\n{premise_pattern}"
+                    edge_label = edge_label.replace("<", "&lt;").replace(">", "&gt;")
 
                     # Edge from premise to conclusion (BT layout)
                     dot.edge(

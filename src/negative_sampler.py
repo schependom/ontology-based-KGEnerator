@@ -416,7 +416,7 @@ class NegativeSampler:
                             new_term = neg_triple.object
                         else:
                             if self.verbose:
-                                print(f"Propagation failed: Corruption did not change subject or object? {base_triple} -> {neg_triple}")
+                                print(f"Propagation failed: Corruption did not change subject or object? {base_triple} => {neg_triple}")
                             
                         if changed_term and new_term:
                             # Update substitution for all variables that mapped to the changed term
@@ -486,7 +486,7 @@ class NegativeSampler:
                                             if propagated_proof:
                                                 filename = f"propagated_proof_{len(negative_triples)}_{neg_goal.subject.name}_{neg_goal.predicate.name}_{neg_goal.object.name}"
                                                 full_path = os.path.join(output_dir, filename)
-                                                propagated_proof.save_visualization(full_path, format="png", title="Propagated Corruption", root_label="DERIVED NEGATIVE FACT")
+                                                propagated_proof.save_visualization(full_path, format="pdf", title="Propagated Corruption", root_label="DERIVED NEGATIVE FACT")
                                                 exported_propagated_count += 1
                                                 propagated_exported = True
                                     else:
@@ -530,7 +530,7 @@ class NegativeSampler:
                         # Save visualization
                         filename = f"corrupted_proof_{len(negative_triples)}_{pos_triple.subject.name}_{pos_triple.predicate.name}_{pos_triple.object.name}"
                         full_path = os.path.join(output_dir, filename)
-                        corrupted_proof.save_visualization(full_path, format="png", root_label="INVALID FACT IF NEGATED")
+                        corrupted_proof.save_visualization(full_path, format="pdf", root_label="INVALID FACT IF NEGATED")
                         exported_corrupted_count += 1
 
             if neg_triple and not self._is_positive_fact(neg_triple, kg):

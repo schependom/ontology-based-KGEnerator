@@ -153,7 +153,7 @@ class GraphVisualizer:
         # Render
         output_path = os.path.join(self.output_dir, name_no_ext)
         try:
-            dot.render(output_path, format="png", cleanup=True)
-            print(f"Graph Saved: {output_path}.png")
+            dot.render(output_path, format="pdf", cleanup=True)
+            print(f"Graph Saved: {output_path}.pdf")
         except Exception as e:
             print(f"GraphViz Error: {e}")
