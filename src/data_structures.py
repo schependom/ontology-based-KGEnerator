@@ -137,6 +137,9 @@ class Membership:
 
     # Keep track of all proofs leading to this membership fact
     proofs: List["Proof"] = field(default_factory=list)
+    
+    # Metadata for tracking origin (e.g., negative sampling source)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_inferred(self) -> bool:
@@ -160,10 +163,11 @@ class Membership:
         return Atom(self.individual, RDF.type, self.cls)
 
     def __repr__(self) -> str:
+        status = "Inferred" if self.is_inferred else "Base"
         if self.is_member:
-            return f"<{self.individual}, memberOf, {self.cls}>"
+            return f"<{self.individual}, memberOf, {self.cls}> [{status}]"
         else:
-            return f"<{self.individual}, ~memberOf, {self.cls}>"
+            return f"<{self.individual}, ~memberOf, {self.cls}> [{status}]"
 
 
 @dataclass
@@ -180,6 +184,9 @@ class Triple:
 
     # Keep track of all proofs leading to this triple fact
     proofs: List["Proof"] = field(default_factory=list)
+
+    # Metadata for tracking origin (e.g., negative sampling source)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_inferred(self) -> bool:
@@ -202,10 +209,11 @@ class Triple:
         return Atom(self.subject, self.predicate, self.object)
 
     def __repr__(self) -> str:
+        status = "Inferred" if self.is_inferred else "Base"
         if self.positive:
-            return f"<{self.subject}, {self.predicate}, {self.object}>"
+            return f"<{self.subject}, {self.predicate}, {self.object}> [{status}]"
         else:
-            return f"<{self.subject}, ~{self.predicate}, {self.object}>"
+            return f"<{self.subject}, ~{self.predicate}, {self.object}> [{status}]"
 
 
 @dataclass
@@ -243,7 +251,8 @@ class AttributeTriple:
         return Atom(self.subject, self.predicate, self.value)
 
     def __repr__(self) -> str:
-        return f"<{self.subject}, {self.predicate}, {self.value}>"
+        status = "Inferred" if self.is_inferred else "Base"
+        return f"<{self.subject}, {self.predicate}, {self.value}> [{status}]"
 
 
 @dataclass
@@ -312,6 +321,7 @@ class KnowledgeGraph:
                     "object": membership.cls.name,
                     "label": "1" if membership.is_member else "0",
                     "fact_type": "membership",
+                    "is_inferred": "1" if membership.is_inferred else "0",
                 }
             )
 
@@ -324,6 +334,7 @@ class KnowledgeGraph:
                     "object": triple.object.name,
                     "label": "1" if triple.positive else "0",
                     "fact_type": "triple",
+                    "is_inferred": "1" if triple.is_inferred else "0",
                 }
             )
 
@@ -336,13 +347,14 @@ class KnowledgeGraph:
                     "object": str(attr_triple.value),  # Convert literal to string
                     "label": "1",  # Attributes are always positive
                     "fact_type": "attribute",
+                    "is_inferred": "1" if attr_triple.is_inferred else "0",
                 }
             )
 
         # Write to CSV
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             if rows:
-                fieldnames = ["subject", "predicate", "object", "label", "fact_type"]
+                fieldnames = ["subject", "predicate", "object", "label", "fact_type", "is_inferred"]
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
@@ -426,18 +438,32 @@ class KnowledgeGraph:
                 object_name = row["object"]
                 label = row["label"] == "1"  # Convert to boolean
                 fact_type = row["fact_type"]
+                is_inferred = row.get("is_inferred", "0") == "1"
+
+                # Helper to create dummy proof if inferred
+                proofs = []
+                if is_inferred:
+                    # Create a dummy proof so that .is_inferred property returns True
+                    # We need a dummy rule and goal
+                    dummy_rule = ExecutableRule(name="LOADED_FROM_CSV", conclusion=None, premises=[])
+                    # Goal is not strictly needed for is_inferred check, but good for completeness
+                    # We'll just leave it None or minimal for now as we don't have the Atom easily available here without reconstruction
+                    # The property only checks: any(p.rule is not None for p in self.proofs)
+                    dummy_atom = Atom("dummy_s", "dummy_p", "dummy_o")
+                    dummy_proof = Proof(goal=dummy_atom, rule=dummy_rule, sub_proofs=[]) 
+                    proofs.append(dummy_proof)
 
                 # Reconstruct based on fact type
                 if fact_type == "membership":
                     # Class membership: (Individual, rdf:type, Class)
                     individual = get_or_create_individual(subject_name)
-                    cls = get_or_create_class(object_name)
+                    cls_obj = get_or_create_class(object_name)
 
                     membership = Membership(
                         individual=individual,
-                        cls=cls,
+                        cls=cls_obj,
                         is_member=label,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     memberships.append(membership)
 
@@ -452,7 +478,7 @@ class KnowledgeGraph:
                         predicate=predicate,
                         object=obj,
                         positive=label,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     triples.append(triple)
 
@@ -468,7 +494,7 @@ class KnowledgeGraph:
                         subject=subject,
                         predicate=predicate,
                         value=value,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     attribute_triples.append(attr_triple)
 
@@ -571,6 +597,32 @@ class KnowledgeGraph:
 
         return samples
 
+    def save_visualization(
+        self,
+        output_path: str,
+        output_name: str,
+        format: str = "pdf",
+        title: Optional[str] = None,
+    ) -> None:
+        """
+        Save knowledge graph visualization to file.
+
+        Args:
+            output_path: Output file path (without extension)
+            format: Output format ("pdf", "png", "svg")
+            title: Optional title for the graph
+        """
+        from graph_visualizer import GraphVisualizer
+
+        if len(self.individuals) > 100:
+            print(
+                f"Graph too large to visualize ({len(self.individuals)} individuals). Skipping visualization."
+            )
+            return
+
+        visualizer = GraphVisualizer(output_dir=output_path)
+        visualizer.visualize(self, filename=output_name, title=title)
+
 
 @dataclass
 class DataType(Enum):
@@ -655,6 +707,21 @@ class Atom:
                 vars.add(term)
         return vars
 
+    def __repr__(self):
+        s = self.subject.name if hasattr(self.subject, "name") else str(self.subject)
+        
+        if self.predicate == RDF.type:
+            p = "rdf:type"
+        else:
+            p = (
+                self.predicate.name
+                if hasattr(self.predicate, "name")
+                else str(self.predicate)
+            )
+            
+        o = self.object.name if hasattr(self.object, "name") else str(self.object)
+        return f"<{s}, {p}, {o}>"
+
 
 @dataclass
 class ExecutableRule:
@@ -672,7 +739,7 @@ class ExecutableRule:
 
     def __repr__(self):
         prem_str = ", ".join(map(str, self.premises))
-        return f"{prem_str} -> {self.conclusion}  ({self.name})"
+        return f"{prem_str} ⇒ {self.conclusion}  ({self.name})"
 
     def __hash__(self):
         return hash(self.name)
@@ -762,6 +829,12 @@ class Proof:
         default_factory=dict, hash=False, compare=False
     )
 
+    # Validity flag (for negative sampling visualization)
+    is_valid: bool = field(default=True, compare=False)
+
+    # Flag if this specific node is the corrupted leaf
+    is_corrupted_leaf: bool = field(default=False, compare=False)
+
     def __post_init__(self):
         # A base fact proof cannot have sub-proofs
         if self.rule is None and self.sub_proofs:
@@ -847,8 +920,58 @@ class Proof:
             ),
         }
 
+    def corrupt_leaf(self, original_atom: Atom, corrupted_atom: Atom) -> "Proof":
+        """
+        Creates a new Proof tree where the leaf matching original_atom is replaced
+        by a corrupted leaf (corrupted_atom), and the path is marked invalid.
+        """
+        # Base case: this is the leaf we want to corrupt
+        if self.is_base_fact():
+            if self.goal == original_atom:
+                return Proof(
+                    goal=corrupted_atom,
+                    rule=None,
+                    sub_proofs=tuple(),
+                    recursive_use_counts=self.recursive_use_counts,
+                    substitutions=self.substitutions,
+                    is_valid=False,
+                    is_corrupted_leaf=True,
+                )
+            return self
+
+        # Recursive step
+        if self.rule:
+            new_sub_proofs = []
+            changed = False
+            for sp in self.sub_proofs:
+                # Recursively try to corrupt the leaf in sub-proofs
+                new_sp = sp.corrupt_leaf(original_atom, corrupted_atom)
+                new_sub_proofs.append(new_sp)
+
+                # If the sub-proof changed (i.e., it contained the target leaf),
+                # then this node also changes
+                if new_sp is not sp:
+                    changed = True
+
+            if changed:
+                return Proof(
+                    goal=self.goal,  # Goal remains same (but is now invalidly derived)
+                    rule=self.rule,
+                    sub_proofs=tuple(new_sub_proofs),
+                    recursive_use_counts=self.recursive_use_counts,
+                    substitutions=self.substitutions,
+                    is_valid=False,  # Invalid because a child is invalid
+                )
+
+        # If not found or not changed, return self
+        return self
+
     def save_visualization(
-        self, filepath: str, format: str = "pdf", title: Optional[str] = None
+        self,
+        filepath: str,
+        format: str = "pdf",
+        title: Optional[str] = None,
+        root_label: Optional[str] = None,
     ) -> None:
         """
         Save proof tree visualization to file.
@@ -857,25 +980,28 @@ class Proof:
             filepath: Output file path (without extension)
             format: Output format ("pdf", "png", "svg")
             title: Optional title for the graph
+            root_label: Optional custom label for the root node
         """
 
-        dot = self._create_graphviz()
+        dot = self._create_graphviz(root_label=root_label)
 
         if title:
             dot.attr(
-                label=title, labelloc="t", fontsize="16", fontname="Helvetica-Bold"
+                label=title, labelloc="t", fontsize="16", fontname="FiraCode-Bold"
             )
 
         try:
             dot.render(filepath, format=format, cleanup=True)
-            print(f"✓ Saved proof visualization to: {filepath}.{format}")
+            # print(f"✓ Saved proof visualization to: {filepath}.{format}")
+            # Save .dot file for verification
+            # dot.save(filepath + ".dot")
         except Exception as e:
             print(f"✗ Failed to render graph: {e}")
             # Save .dot file as fallback
             dot.save(filepath + ".dot")
             print(f"  Saved .dot file to: {filepath}.dot")
 
-    def _create_graphviz(self) -> Any:
+    def _create_graphviz(self, root_label: Optional[str] = None) -> Any:
         """
         Create a Graphviz graph object for this proof tree.
 
@@ -890,7 +1016,7 @@ class Proof:
         dot.attr(rankdir="BT")  # Bottom to top (premises support conclusions)
         dot.attr(splines="ortho")
         dot.attr(nodesep="0.6", ranksep="0.8")
-        dot.attr("node", shape="plain", fontname="Helvetica")
+        dot.attr("node", shape="plain", fontname="FiraCode")
 
         # Track node IDs
         node_counter = [0]  # Use list for mutable counter in closure
@@ -908,17 +1034,65 @@ class Proof:
             node_ids[proof] = node_id
 
             # Determine node styling
-            if proof.is_base_fact():
+            if proof.is_corrupted_leaf:
+                header_color = "#FFEBEE"  # Light red
+                border_color = "#C62828"  # Dark red
+                type_label = "CORRUPTED FACT"
+            elif not proof.is_valid:
+                # Custom label for root node if provided
+                if proof == self and root_label == "DERIVED NEGATIVE FACT":
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#C62828"  # Dark red
+                    type_label = root_label
+                elif proof == self and root_label:
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
+                    type_label = root_label
+                elif proof.is_base_fact():
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
+                    type_label = "BASE FACT"
+                else:
+                    header_color = "#FFEBEE"  # Light red
+                    border_color = "#EF9A9A"  # Lighter red
+                    type_label = f"Rule: {proof.rule.name} (INVALID)"
+            elif proof.is_base_fact():
                 header_color = "#E8F5E9"  # Light green
                 border_color = "#2E7D32"  # Dark green
                 type_label = "BASE FACT"
             else:
                 header_color = "#E3F2FD"  # Light blue
                 border_color = "#1565C0"  # Dark blue
-                type_label = f"Rule: {proof.rule.name}"
+                # Format rule as: premise1, premise2 -> conclusion
+                if proof.rule:
+                    premises_str = ", ".join([str(p) for p in proof.rule.premises])
+                    conclusion_str = str(proof.rule.conclusion)
+                    type_label = f"{premises_str} ⇒ {conclusion_str}"
+                    # Escape HTML characters for Graphviz label
+                    type_label = type_label.replace("<", "&lt;").replace(">", "&gt;")
+                else:
+                    type_label = "Derived Fact"
 
             # Format goal atom
             goal_html = self._format_atom_html(proof.goal)
+            
+            # Add "NOT" prefix for negative facts
+            if proof.is_corrupted_leaf:
+                goal_html = f"<B>NOT</B> {goal_html}"
+            elif proof == self and root_label == "DERIVED NEGATIVE FACT":
+                goal_html = f"<B>NOT</B> {goal_html}"
+
+            if not proof.is_valid and not proof.is_corrupted_leaf:
+                # If this is a derived negative fact (propagated), don't cross out
+                if proof == self and root_label == "DERIVED NEGATIVE FACT":
+                    pass # Keep goal_html as is
+                # If this is the root and we have a custom label, don't append [INVALID]
+                elif proof == self and root_label:
+                    goal_html = f"<S>{goal_html}</S>"
+                else:
+                    goal_html = (
+                        f"<S>{goal_html}</S> <B><FONT COLOR='#C62828'>[INVALID]</FONT></B>"
+                    )
 
             # Build HTML label
             label = (
@@ -965,15 +1139,14 @@ class Proof:
                     sub_id = add_proof_node(sub_proof, node_id)
 
                     # Edge label
-                    edge_label = (
-                        f"premise {i + 1}:\n{self._format_atom(premise_pattern)}"
-                    )
+                    edge_label = f"premise {i + 1}:\n{premise_pattern}"
+                    edge_label = edge_label.replace("<", "&lt;").replace(">", "&gt;")
 
                     # Edge from premise to conclusion (BT layout)
                     dot.edge(
                         sub_id,
                         node_id,
-                        label=edge_label,
+                        xlabel=edge_label,
                         fontsize="9",
                         fontcolor="#666666",
                         style="dashed",
@@ -1029,14 +1202,7 @@ class Proof:
             f.write("Proof Tree:\n")
             f.write(self.format_tree())
 
-        print(f"✓ Saved proof tree to: {filepath}")
-
-    def _format_atom(self, atom: Atom) -> str:
-        """Helper to format an atom."""
-        s = self._format_term(atom.subject)
-        p = self._format_term(atom.predicate)
-        o = self._format_term(atom.object)
-        return f"({s}, {p}, {o})"
+        print(f"Saved proof tree to: {filepath}")
 
     def _format_term(self, term: Term) -> str:
         """Helper to format a term."""

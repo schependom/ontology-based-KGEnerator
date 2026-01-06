@@ -7,7 +7,10 @@ DESCRIPTION:
 
 import os
 import sys
-import graphviz
+try:
+    import graphviz
+except ImportError:
+    graphviz = None
 from collections import defaultdict
 from typing import Optional
 from data_structures import KnowledgeGraph
@@ -16,6 +19,7 @@ from data_structures import KnowledgeGraph
 class GraphVisualizer:
     def __init__(self, output_dir: str = "output_graphs"):
         self.output_dir = output_dir
+        print(f"Graph Visualizations will be saved to: {self.output_dir}")
         os.makedirs(output_dir, exist_ok=True)
 
     def visualize(
@@ -24,7 +28,8 @@ class GraphVisualizer:
         """
         Visualizes a KnowledgeGraph instance.
         """
-        if "graphviz" not in sys.modules:
+        if graphviz is None:
+            print("Warning: Graphviz not installed. Skipping visualization.")
             return
 
         name_no_ext = os.path.splitext(filename)[0]
@@ -112,7 +117,7 @@ class GraphVisualizer:
         for triple in kg.triples:
             # --- COLOR LOGIC (Polarity) ---
             if not triple.positive:
-                # break
+                break
                 color = "#D32F2F"  # Red for negative
                 fontcolor = "#D32F2F"
                 label_prefix = "¬ "  # Logical NOT symbol
@@ -148,7 +153,7 @@ class GraphVisualizer:
         # Render
         output_path = os.path.join(self.output_dir, name_no_ext)
         try:
-            dot.render(output_path, format="png", cleanup=True)
-            print(f"Graph Saved: {output_path}.png")
+            dot.render(output_path, format="pdf", cleanup=True)
+            print(f"Graph Saved: {output_path}.pdf")
         except Exception as e:
             print(f"GraphViz Error: {e}")

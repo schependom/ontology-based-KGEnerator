@@ -1,14 +1,11 @@
 """
 DESCRIPTION
 
-    KGE model Train/Test Data Generator
+    KGE Model Train/Test Data Generator
 
-    This script generates independent knowledge graph samples suitable for
-    training KGE models. Each sample is a complete knowledge graph with:
-        - Unique individuals (different per sample)
-        - Base facts and derived inferences
-        - Positive and negative triples
-        - All ground atoms (no variables)
+    Generates independent knowledge graph samples for KGE model training.
+    Each sample is a complete KG with unique individuals, base facts,
+    derived inferences, and balanced positive/negative examples.
 
 AUTHOR
 
@@ -18,28 +15,28 @@ AUTHOR
 from collections import defaultdict
 import random
 import argparse
+import os
 from pathlib import Path
-from typing import List, Set, Tuple, Optional, Dict
+from typing import List, Dict, Optional
 import networkx as nx
+from tqdm import tqdm
 
-# Custom imports
-from data_structures import (
-    KnowledgeGraph,
-    Atom,
-)
-from generate import (
-    KGenerator,
-    extract_all_atoms_from_proof,
-    atoms_to_knowledge_graph,
-    extract_proof_map,
-)
+from data_structures import KnowledgeGraph
+from generate import KGenerator, extract_proof_map, atoms_to_knowledge_graph
 from graph_visualizer import GraphVisualizer
 from negative_sampler import NegativeSampler
+from validator import Validator
 
 
 class KGEDatasetGenerator:
     """
     Generates training and testing datasets for KGE models.
+
+    Orchestrates:
+    - Sample generation via KGenerator
+    - Negative sampling via NegativeSampler
+    - Train/test splitting
+    - Validation and export
     """
 
     def __init__(
@@ -55,40 +52,40 @@ class KGEDatasetGenerator:
         neg_corrupt_base_facts: bool,
         verbose: bool,
         seed: Optional[int] = None,
+        use_signature_sampling: bool = True,
+        export_proofs: bool = False,
+        output_dir: str = None,
     ):
         """
-        Initializes the dataset generator.
+        Initialize dataset generator.
 
         Args:
-            ontology_file:              Path to the .ttl ontology file.
-            max_recursion:              Maximum depth for recursive rules.
-            global_max_depth:           Hard limit on total proof tree depth.
-            max_proofs_per_atom:        Max number of proofs to generate for any single atom.
-            individual_pool_size:       Size of the individual pool for sampling.
-            individual_reuse_prob:      Probability of reusing existing individuals.
-            neg_strategy:               Negative sampling strategy ("random", "constrained", "proof_based", "type_aware").
-            neg_ratio:                  Ratio of negative to positive samples.
-            neg_corrupt_base_facts:     Whether to corrupt base facts during negative sampling.
-            verbose:                    Enable detailed logging.
+            ontology_file: Path to .ttl ontology file
+            max_recursion: Maximum depth for recursive rules
+            global_max_depth: Hard limit on proof tree depth
+            max_proofs_per_atom: Max proofs per atom
+            individual_pool_size: Size of individual reuse pool
+            individual_reuse_prob: Probability of reusing individuals
+            neg_strategy: Negative sampling strategy
+            neg_ratio: Ratio of negative to positive samples
+            neg_corrupt_base_facts: Whether to corrupt base facts
+            verbose: Enable detailed logging
+            seed: Random seed for reproducibility
+            use_signature_sampling: Enable signature sampling in chainer
+            export_proofs: Whether to export proof visualizations
+            output_dir: Directory to save visualizations
         """
         if seed is not None:
             random.seed(seed)
 
         self.verbose = verbose
-        self.ontology_file = ontology_file
-        self.neg_strategy = neg_strategy
-        self.neg_ratio = neg_ratio
-        self.neg_corrupt_base_facts = neg_corrupt_base_facts
         self.max_recursion_cap = max_recursion
         self.individual_pool_size = individual_pool_size
         self.individual_reuse_prob = individual_reuse_prob
+        self.export_proofs = export_proofs
+        self.output_dir = output_dir
 
-        if self.verbose:
-            print(f"Initializing KGenerator from: {ontology_file}")
-            print(f"Individual pool size: {individual_pool_size}")
-            print(f"Individual reuse probability: {individual_reuse_prob}")
-            print(f"Negative sampling: {neg_strategy} (ratio: {neg_ratio})")
-
+        # Initialize KGenerator
         self.generator = KGenerator(
             ontology_file=ontology_file,
             max_recursion=max_recursion,
@@ -96,69 +93,91 @@ class KGEDatasetGenerator:
             max_proofs_per_atom=max_proofs_per_atom,
             individual_pool_size=individual_pool_size,
             individual_reuse_prob=individual_reuse_prob,
-            neg_strategy=neg_strategy,
-            verbose=True,  # Keep generator quiet during batch generation
+            use_signature_sampling=use_signature_sampling,
+            verbose=False,  # Keep generator quiet during batch generation
+            export_proof_visualizations=export_proofs,
         )
 
-        # Store references for convenience
-        self.chainer = self.generator.chainer
-        self.parser = self.generator.parser
+        # Store schema references
         self.schema_classes = self.generator.schema_classes
         self.schema_relations = self.generator.schema_relations
         self.schema_attributes = self.generator.schema_attributes
-        self.rules = self.parser.rules
+        self.rules = self.generator.parser.rules
 
+        # Initialize NegativeSampler
         self.negative_sampler = NegativeSampler(
             schema_classes=self.schema_classes,
             schema_relations=self.schema_relations,
-            domains=self.parser.domains,
-            ranges=self.parser.ranges,
+            domains=self.generator.parser.domains,
+            ranges=self.generator.parser.ranges,
+            verbose=verbose,
+        )
+        
+        # Initialize Validator
+        self.validator = Validator(
+            constraints=self.generator.parser.constraints,
+            domains=self.generator.parser.domains,
+            ranges=self.generator.parser.ranges,
             verbose=verbose,
         )
 
-        if self.verbose:
-            print(f"Loaded {len(self.rules)} rules from ontology")
-            print(
-                f"Schema: {len(self.schema_classes)} classes, "
-                f"{len(self.schema_relations)} relations, "
-                f"{len(self.schema_attributes)} attributes"
-            )
-            print(f"Constraints: {len(self.parser.constraints)}")
+        # Negative sampling config
+        self.neg_strategy = neg_strategy
+        self.neg_ratio = neg_ratio
+        self.neg_corrupt_base_facts = neg_corrupt_base_facts
 
         # Track rule usage for coverage analysis
         self.train_rule_usage: Dict[str, int] = defaultdict(int)
         self.test_rule_usage: Dict[str, int] = defaultdict(int)
+        
+        # Validation stats
+        self.validation_errors: Dict[str, List[str]] = defaultdict(list)
+        self.discarded_samples: Dict[str, List[str]] = defaultdict(list)
+        
+        # Detailed tracking for debugging
+        self.rule_selection_count: Dict[str, int] = defaultdict(int)
+        self.rule_success_count: Dict[str, int] = defaultdict(int)
+
+        print(f"Loaded {len(self.rules)} rules from ontology")
+        print(
+            f"Schema: {len(self.schema_classes)} classes, "
+            f"{len(self.schema_relations)} relations, "
+            f"{len(self.schema_attributes)} attributes"
+        )
+        print(f"Constraints: {len(self.generator.parser.constraints)}")
 
     def generate_dataset(
         self,
-        n_train: int = 5,
-        n_test: int = 2,
-        min_individuals: int = 5,
-        max_individuals: int = 30,
-        min_rules_per_sample: int = 1,
-        max_rules_per_sample: int = 7,
+        n_train: int,
+        n_test: int,
+        min_individuals: int,
+        max_individuals: int,
+        min_rules: int = 1,
+        max_rules: int = 5,
+        min_proofs_per_rule: int = 5,
     ) -> Tuple[List[KnowledgeGraph], List[KnowledgeGraph]]:
         """
-        Generates complete training and testing datasets.
+        Generate complete training and testing datasets.
 
         Args:
-            n_train (int):                  Number of training samples.
-            n_test (int):                   Number of test samples.
-            min_individuals (int):          Minimum individuals per sample.
-            max_individuals (int):          Maximum individuals per sample.
-            min_rules_per_sample (int):     Min rules to trigger per sample.
-            max_rules_per_sample (int):     Max rules to trigger per sample.
+            n_train: Number of training samples
+            n_test: Number of test samples
+            min_individuals: Minimum individuals per sample
+            max_individuals: Maximum individuals per sample
+            min_rules: Min rules to trigger per sample
+            max_rules: Max rules to trigger per sample
+            min_proofs_per_rule: Minimum proofs to select per rule
 
         Returns:
-            Tuple[List[KG], List[KG]]: Training and testing samples.
+            Tuple of (train_samples, test_samples)
         """
         print(f"\n{'=' * 80}")
         print("GENERATING KGE DATASET")
         print(f"{'=' * 80}")
         print(f"Target: {n_train} train samples, {n_test} test samples")
-        print(f"Individual range: {min_individuals}-{max_individuals} per sample")
-        print(f"Rules per sample: {min_rules_per_sample}-{max_rules_per_sample}")
-        print(f"Constraints: {len(self.parser.constraints)} active")
+        print(f"Individual range: {min_individuals}-{max_individuals}")
+        print(f"Rules per sample: {min_rules}-{max_rules}")
+        print(f"Min proofs per rule: {min_proofs_per_rule}")
         print(f"{'=' * 80}\n")
 
         # Generate training samples
@@ -167,23 +186,25 @@ class KGEDatasetGenerator:
             n_samples=n_train,
             min_individuals=min_individuals,
             max_individuals=max_individuals,
-            min_rules=min_rules_per_sample,
-            max_rules=max_rules_per_sample,
+            min_rules=min_rules,
+            max_rules=max_rules,
+            min_proofs_per_rule=min_proofs_per_rule,
             sample_type="TRAIN",
         )
 
-        # Generate test samples (completely independent)
+        # Generate test samples (independent)
         print("\nGenerating test samples...")
         test_samples = self._generate_samples(
             n_samples=n_test,
             min_individuals=min_individuals,
             max_individuals=max_individuals,
-            min_rules=min_rules_per_sample,
-            max_rules=max_rules_per_sample,
+            min_rules=min_rules,
+            max_rules=max_rules,
+            min_proofs_per_rule=min_proofs_per_rule,
             sample_type="TEST",
         )
 
-        # Print summary statistics
+        # Print summary
         self._print_dataset_summary(train_samples, test_samples)
 
         return train_samples, test_samples
@@ -195,45 +216,64 @@ class KGEDatasetGenerator:
         max_individuals: int,
         min_rules: int,
         max_rules: int,
+        min_proofs_per_rule: int,
         sample_type: str,
     ) -> List[KnowledgeGraph]:
         """
-        Generates a list of independent knowledge graph samples.
+        Generate a list of independent knowledge graph samples.
 
         Args:
-            n_samples (int):        Number of samples to generate.
-            min_individuals (int):  Min individuals per sample.
-            max_individuals (int):  Max individuals per sample.
-            min_rules (int):        Min rules per sample.
-            max_rules (int):        Max rules per sample.
-            sample_type (str):      "TRAIN" or "TEST" (for logging).
+            n_samples: Number of samples to generate
+            min_individuals: Min individuals per sample
+            max_individuals: Max individuals per sample
+            min_rules: Min rules to trigger per sample
+            max_rules: Max rules to trigger per sample
+            min_proofs_per_rule: Minimum proofs to select per rule
+            stratified_selection: Whether to use stratified rule selection
+            sample_type: "TRAIN" or "TEST" (for logging)
 
         Returns:
-            List[KnowledgeGraph]: Generated samples.
+            List of generated KG samples
         """
         samples = []
         failed_attempts = 0
-        max_failed_attempts = n_samples * 10  # Safety limit
+        max_failed_attempts = n_samples * 10
 
+        pbar = tqdm(total=n_samples, desc=f"Generating {sample_type} samples")
+        
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
-            self.chainer.reset_individual_pool()
+            # Reset individual pool for each sample
+            self.generator.chainer.reset_individual_pool()
 
             sample = self._generate_one_sample(
                 min_individuals=min_individuals,
                 max_individuals=max_individuals,
                 min_rules=min_rules,
                 max_rules=max_rules,
+                min_proofs_per_rule=min_proofs_per_rule,
                 sample_type=sample_type,
             )
 
             if sample is not None:
-                samples.append(sample)
-                if len(samples) % 100 == 0 or len(samples) == n_samples:
-                    print(
-                        f"  [{sample_type}] Generated {len(samples)}/{n_samples} samples"
-                    )
+                # Validate sample
+                val_result = self.validator.validate(sample)
+                if not val_result["valid"]:
+                    if self.verbose:
+                        print(f"  [WARN] Sample validation failed: {val_result['errors']}")
+                    
+                    # DISCARD SAMPLE
+                    # Store errors for summary (keyed by unique ID)
+                    discard_id = f"{sample_type}_discarded_{failed_attempts}"
+                    self.discarded_samples[discard_id] = val_result["errors"]
+                    failed_attempts += 1
+                    # Do not add to samples, do not update pbar
+                else:
+                    samples.append(sample)
+                    pbar.update(1)
             else:
                 failed_attempts += 1
+
+        pbar.close()
 
         if len(samples) < n_samples:
             print(
@@ -249,41 +289,38 @@ class KGEDatasetGenerator:
         max_individuals: int,
         min_rules: int,
         max_rules: int,
+        min_proofs_per_rule: int,
         sample_type: str,
     ) -> Optional[KnowledgeGraph]:
         """
-        Generates one complete, independent knowledge graph sample.
+        Generate one complete, independent knowledge graph sample.
+
+        Strategy:
+        1. Randomly vary recursion depth (structural diversity)
+        2. Randomly select subset of rules (content diversity)
+        3. Generate proofs for selected rules
+        4. Convert to KG
+        5. Add negative samples via NegativeSampler
 
         Args:
-            min_individuals (int):  Minimum individuals required.
-            max_individuals (int):  Maximum individuals allowed.
-            min_rules (int):        Minimum rules to trigger.
-            max_rules (int):        Maximum rules to trigger.
-            sample_type (str):      "TRAIN" or "TEST" (for logging).
+            min_individuals: Minimum individuals required
+            max_individuals: Maximum individuals allowed
+            min_rules: Minimum rules to trigger
+            max_rules: Maximum rules to trigger
+            sample_type: "TRAIN" or "TEST"
 
         Returns:
-            Optional[KnowledgeGraph]: Generated sample, or None if generation failed.
+            Generated KG sample, or None if generation failed
         """
         if not self.rules:
-            if self.verbose:
-                print("Warning: No rules available for generation")
             return None
 
-        # ----------------------------------------------------------------
-        # VARIANCE STRATEGY 1: VARY RECURSION DEPTH
-        # ----------------------------------------------------------------
-        # Randomly pick a max recursion depth for this specific sample
-        # This ensures some samples are "deep" and others are "shallow"
-        # providing structural diversity.
+        # VARIANCE STRATEGY 1: Vary recursion depth
         current_recursion = random.randint(1, self.max_recursion_cap)
         self.generator.chainer.max_recursion_depth = current_recursion
 
-        # ----------------------------------------------------------------
-        # VARIANCE STRATEGY 2: RANDOM RULE SELECTION
-        # ----------------------------------------------------------------
-        # Randomly determine how many rules to trigger
+        # VARIANCE STRATEGY 2: Rule selection
         n_rules = random.randint(min_rules, min(max_rules, len(self.rules)))
-        # Randomly select the specific rules
         selected_rules = random.sample(self.rules, n_rules)
 
         # Track rule usage
@@ -292,38 +329,50 @@ class KGEDatasetGenerator:
         )
         for rule in selected_rules:
             rule_usage[rule.name] += 1
+            self.rule_selection_count[rule.name] += 1
 
-        # Dictionary to store Atoms AND their Proofs
-        # Dict[Atom, List[Proof]]
+        # Generate proofs and build proof map
         sample_proof_map = defaultdict(list)
         atoms_found = False
 
         for rule in selected_rules:
-            proofs = self.generator.generate_proofs_for_rule(rule.name, max_proofs=None)
+            # Generate proofs with Instance Looping for volume
+            # Randomly decide how many "instances" (chains) to generate for this rule
+            # e.g., generate 5-15 diverse root facts (Fathers) for this rule
+            n_instances_for_rule = random.randint(5, 15)  # Make configurable?
+            
+            proofs = self.generator.generate_proofs_for_rule(
+                rule.name, 
+                n_instances=n_instances_for_rule,
+                max_proofs=None
+            )
+            
             if not proofs:
                 continue
+                
+            self.rule_success_count[rule.name] += 1
 
-            # Select random subset of proofs
-            max_proofs_to_merge = (
-                3  # Keep this small to ensure graph stays within size limits
-            )
-            n_select = random.randint(1, min(len(proofs), max_proofs_to_merge))
+            # Select random subset of proofs if still too many
+            # But now we rely on n_instances to control volume mostly
+            n_select = random.randint(
+                min(len(proofs), min_proofs_per_rule), min(len(proofs), 10000)
+            )  # TODO: adjust max as needed
             selected = random.sample(proofs, n_select)
 
             for proof in selected:
-                # This extracts {Atom: [Proof, ...]}
                 extracted_map = extract_proof_map(proof)
-
-                # Merge into main map
                 for atom, proof_list in extracted_map.items():
                     sample_proof_map[atom].extend(proof_list)
-
                 atoms_found = True
 
         if not atoms_found:
+            if self.verbose:
+                print(
+                    f"  [DEBUG] Sample rejected: No atoms found for rules {[r.name for r in selected_rules]}"
+                )
             return None
 
-        # Convert atoms to KG, PASSING THE PROOF MAP
+        # Convert to KG
         kg = atoms_to_knowledge_graph(
             atoms=set(sample_proof_map.keys()),
             schema_classes=self.schema_classes,
@@ -334,36 +383,108 @@ class KGEDatasetGenerator:
 
         # Validate size
         if not (min_individuals <= len(kg.individuals) <= max_individuals):
+            if self.verbose:
+                print(
+                    f"  [DEBUG] Sample rejected: Size mismatch. Got {len(kg.individuals)} individuals (min: {min_individuals}, max: {max_individuals})"
+                )
             return None
 
-        # Add negatives using the configured strategy
+        # Complete schema (apply domain/range rules)
+        self._complete_schema(kg)
+
+        # Add negatives via NegativeSampler
         kg = self.negative_sampler.add_negative_samples(
             kg,
             strategy=self.neg_strategy,
             ratio=self.neg_ratio,
             corrupt_base_facts=self.neg_corrupt_base_facts,
+            export_proofs=self.export_proofs,
+            output_dir=self.output_dir,
         )
 
         return kg
 
+    def _complete_schema(self, kg: KnowledgeGraph) -> None:
+        """
+        Deterministically apply schema rules (domain/range) to ensure consistency.
+        
+        This fixes "Schema Violation" errors where a triple exists but the 
+        implied class memberships for subject/object are missing.
+        """
+        from data_structures import Membership
+        
+        # We need to look up Class objects by name
+        class_map = self.schema_classes
+        
+        # Helper to add membership if missing
+        def add_membership(ind, cls_name):
+            if cls_name not in class_map:
+                return # Should not happen if schema is consistent
+            
+            cls = class_map[cls_name]
+            
+            # Check if already exists
+            for m in kg.memberships:
+                if m.individual == ind and m.cls == cls and m.is_member:
+                    return
+            
+            # Add new membership
+            # Note: We treat this as an inferred fact (no specific proof stored here for simplicity, 
+            # or we could create a dummy proof)
+            new_mem = Membership(
+                individual=ind,
+                cls=cls,
+                is_member=True,
+                proofs=[] 
+            )
+            kg.memberships.append(new_mem)
+
+        # Iteratively apply rules until fixpoint
+        # (Simple version: just one pass is enough for domain/range 
+        # unless we have complex chains which we don't handle here yet)
+        
+        domains = self.generator.parser.domains
+        ranges = self.generator.parser.ranges
+        
+        for t in kg.triples:
+            if not t.positive:
+                continue
+                
+            prop_name = t.predicate.name
+            
+            # Apply Domain
+            if prop_name in domains:
+                for domain_cls in domains[prop_name]:
+                    add_membership(t.subject, domain_cls)
+                    
+            # Apply Range
+            if prop_name in ranges:
+                for range_cls in ranges[prop_name]:
+                    add_membership(t.object, range_cls)
+
     @staticmethod
     def check_structural_isomorphism(kg1: KnowledgeGraph, kg2: KnowledgeGraph) -> bool:
         """
-        Checks if two Knowledge Graphs are structurally isomorphic.
+        Check if two KGs are structurally isomorphic.
 
-        Ignores Individual names but preserves:
-        - Graph topology (Relations)
-        - Class memberships (as node attributes)
-        - Attribute values (as node attributes)
+        Ignores individual names but preserves:
+        - Graph topology (relations)
+        - Class memberships (node attributes)
+        - Attribute values (node attributes)
 
-        Requires networkx.
+        Args:
+            kg1: First knowledge graph
+            kg2: Second knowledge graph
+
+        Returns:
+            True if structurally isomorphic, False otherwise
         """
 
         def to_nx(kg):
             G = nx.MultiDiGraph()
-            # Nodes with attributes (Classes + Data Attributes)
+
+            # Nodes with attributes
             for ind in kg.individuals:
-                # Classes as frozenset for hashable comparison
                 clss = frozenset(
                     [
                         m.cls.name
@@ -371,29 +492,30 @@ class KGEDatasetGenerator:
                         if m.individual == ind and m.is_member
                     ]
                 )
-                # Attributes as sorted tuple
-                attrs = []
-                for at in kg.attribute_triples:
-                    if at.subject == ind:
-                        attrs.append((at.predicate.name, str(at.value)))
-                attrs = tuple(sorted(attrs))
-
+                attrs = tuple(
+                    sorted(
+                        [
+                            (at.predicate.name, str(at.value))
+                            for at in kg.attribute_triples
+                            if at.subject == ind
+                        ]
+                    )
+                )
                 G.add_node(ind.name, classes=clss, attrs=attrs)
 
-            # Edges (Relations)
+            # Edges (relations)
             for t in kg.triples:
                 if t.positive:
                     G.add_edge(t.subject.name, t.object.name, label=t.predicate.name)
+
             return G
 
         G1 = to_nx(kg1)
         G2 = to_nx(kg2)
 
-        # Node matcher checks classes and attributes
         nm = nx.algorithms.isomorphism.categorical_node_match(
             ["classes", "attrs"], [frozenset(), tuple()]
         )
-        # Edge matcher checks relation type
         em = nx.algorithms.isomorphism.categorical_edge_match("label", None)
 
         return nx.is_isomorphic(G1, G2, node_match=nm, edge_match=em)
@@ -405,38 +527,69 @@ class KGEDatasetGenerator:
     ) -> None:
         """Print summary statistics for generated datasets."""
 
-        def compute_stats(samples: List[KnowledgeGraph]) -> Dict:
-            if not samples:
-                return {}
-
+        # Calculate stats
+        def get_stats(samples):
             stats = {
                 "n_samples": len(samples),
-                "avg_individuals": sum(len(s.individuals) for s in samples)
-                / len(samples),
-                "avg_triples": sum(len(s.triples) for s in samples) / len(samples),
-                "avg_pos_triples": sum(
-                    sum(1 for t in s.triples if t.positive) for s in samples
-                )
-                / len(samples),
-                "avg_neg_triples": sum(
-                    sum(1 for t in s.triples if not t.positive) for s in samples
-                )
-                / len(samples),
-                "avg_memberships": sum(len(s.memberships) for s in samples)
-                / len(samples),
-                "avg_pos_memberships": sum(
-                    sum(1 for m in s.memberships if m.is_member) for s in samples
-                )
-                / len(samples),
-                "avg_neg_memberships": sum(
-                    sum(1 for m in s.memberships if not m.is_member) for s in samples
-                )
-                / len(samples),
+                "n_individuals": 0,
+                "n_triples": 0,
+                "n_pos_triples": 0,
+                "n_neg_triples": 0,
+                "n_memberships": 0,
+                "n_pos_mems": 0,
+                "n_neg_mems": 0,
+                "n_base_facts": 0,
+                "n_inferred_facts": 0,
+                "n_neg_base_facts": 0,
+                "n_neg_inferred_facts": 0,
+                "n_neg_propagated_facts": 0,
             }
+            for kg in samples:
+                stats["n_individuals"] += len(kg.individuals)
+                stats["n_triples"] += len(kg.triples)
+                stats["n_memberships"] += len(kg.memberships)
+                
+                for t in kg.triples:
+                    if t.positive:
+                        stats["n_pos_triples"] += 1
+                        if t.is_base_fact:
+                            stats["n_base_facts"] += 1
+                        else:
+                            stats["n_inferred_facts"] += 1
+                    else:
+                        stats["n_neg_triples"] += 1
+                        source = t.metadata.get("source_type", "unknown")
+                        if source == "base":
+                            stats["n_neg_base_facts"] += 1
+                        elif source == "inferred":
+                            stats["n_neg_inferred_facts"] += 1
+                        elif source == "propagated_inferred":
+                            stats["n_neg_propagated_facts"] += 1
+                        
+                for m in kg.memberships:
+                    if m.is_member:
+                        stats["n_pos_mems"] += 1
+                        if m.is_base_fact:
+                            stats["n_base_facts"] += 1
+                        else:
+                            stats["n_inferred_facts"] += 1
+                    else:
+                        stats["n_neg_mems"] += 1
+                        source = m.metadata.get("source_type", "unknown")
+                        if source == "base":
+                            stats["n_neg_base_facts"] += 1
+                        elif source == "inferred":
+                            stats["n_neg_inferred_facts"] += 1
+                        
+            # Averages
+            if stats["n_samples"] > 0:
+                for key in list(stats.keys()):
+                    if key != "n_samples":
+                        stats[f"avg_{key[2:]}"] = stats[key] / stats["n_samples"]
             return stats
 
-        train_stats = compute_stats(train_samples)
-        test_stats = compute_stats(test_samples)
+        train_stats = get_stats(train_samples)
+        test_stats = get_stats(test_samples)
 
         print(f"\n{'=' * 80}")
         print("DATASET GENERATION COMPLETE")
@@ -456,12 +609,24 @@ class KGEDatasetGenerator:
                 f"Warning: Found {isomorphic_count} isomorphic samples between train/test"
             )
         else:
-            print("✓ No structural isomorphism between train and test")
+            print("No structural isomorphism between train and test")
 
-        # Rule coverage analysis
-        print(f"\n--- Rule Coverage Analysis ---")
-        print(f"Train set uses {len(self.train_rule_usage)}/{len(self.rules)} rules")
-        print(f"Test set uses {len(self.test_rule_usage)}/{len(self.rules)} rules")
+        # Rule coverage
+        print(f"\n--- Rule Coverage ---")
+        
+        def print_rule_usage(title, usage_dict, total_selections):
+            print(f"\n{title}:")
+            print(f"{'Rule Name':<40} | {'Count':<10} | {'Percentage':<10}")
+            print("-" * 70)
+            for rule_name, count in sorted(usage_dict.items(), key=lambda x: x[1], reverse=True):
+                percentage = (count / total_selections) * 100 if total_selections > 0 else 0
+                print(f"{rule_name:<40} | {count:<10} | {percentage:.1f}%")
+
+        total_train_selections = sum(self.train_rule_usage.values())
+        print_rule_usage("Train Rule Usage", self.train_rule_usage, total_train_selections)
+        
+        total_test_selections = sum(self.test_rule_usage.values())
+        print_rule_usage("Test Rule Usage", self.test_rule_usage, total_test_selections)
 
         unused_in_train = set(r.name for r in self.rules) - set(
             self.train_rule_usage.keys()
@@ -471,33 +636,97 @@ class KGEDatasetGenerator:
         )
 
         if unused_in_train:
-            print(f"Warning: {len(unused_in_train)} rules unused in training")
+            print(f"\nWarning: {len(unused_in_train)} rules unused in training")
+            for r in sorted(unused_in_train):
+                print(f"  - {r}")
         if unused_in_test:
             print(f"Warning: {len(unused_in_test)} rules unused in testing")
+            for r in sorted(unused_in_test):
+                print(f"  - {r}")
+            
+        # Detailed breakdown of unused rules
+        all_unused = unused_in_train.intersection(unused_in_test)
+        if all_unused:
+            print(f"\n--- Unused Rules Analysis ---")
+            print(f"{'Rule Name':<40} | {'Reason':<20} | {'Attempts':<10}")
+            print("-" * 80)
+            for rule_name in sorted(all_unused):
+                attempts = self.rule_selection_count[rule_name]
+                if attempts == 0:
+                    reason = "Never Selected"
+                else:
+                    reason = "Failed to Generate"
+                print(f"{rule_name:<40} | {reason:<20} | {attempts:<10}")
+                
+        # Negative Strategy Usage
+        strategy_usage = self.negative_sampler.strategy_usage
+        if strategy_usage:
+            print(f"\n--- Negative Strategy Usage ---")
+            print(f"{'Strategy':<20} | {'Count':<10} | {'Percentage':<10}")
+            print("-" * 50)
+            total_negatives = sum(strategy_usage.values())
+            for strategy, count in sorted(strategy_usage.items(), key=lambda x: x[1], reverse=True):
+                percentage = (count / total_negatives) * 100 if total_negatives > 0 else 0
+                print(f"{strategy:<20} | {count:<10} | {percentage:.1f}%")
+
+        # Validation Report
+        print(f"\n--- Validation Report ---")
+        if not self.discarded_samples:
+            print("All generated samples passed validation checks (0 discarded).")
+        else:
+            print(f"Discarded {len(self.discarded_samples)} samples due to validation errors:")
+            
+            # Group errors by type for cleaner reporting
+            error_counts = defaultdict(int)
+            for errors in self.discarded_samples.values():
+                for err in errors:
+                    # Simplify error message to group similar ones
+                    # e.g., "Constraint Violation: Ind_5 ..." -> "Constraint Violation"
+                    base_err = err.split(":")[0] if ":" in err else err
+                    error_counts[base_err] += 1
+            
+            for err_type, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+                print(f"  - {err_type}: {count}")
+
+            if self.verbose:
+                print("\nDetailed Discard Reasons (First 5):")
+                for i, (sample_id, errors) in enumerate(self.discarded_samples.items()):
+                    if i >= 5: break
+                    print(f"  {sample_id}: {errors}")
 
         print("\nTRAINING SET:")
-        print(f"  Samples:              {train_stats.get('n_samples', 0)}")
-        print(f"  Avg individuals:      {train_stats.get('avg_individuals', 0):.1f}")
-        print(f"  Avg total triples:    {train_stats.get('avg_triples', 0):.1f}")
-        print(f"    - Positive:         {train_stats.get('avg_pos_triples', 0):.1f}")
-        print(f"    - Negative:         {train_stats.get('avg_neg_triples', 0):.1f}")
-        print(f"  Avg memberships:      {train_stats.get('avg_memberships', 0):.1f}")
-        print(
-            f"    - Positive:         {train_stats.get('avg_pos_memberships', 0):.1f}"
-        )
-        print(
-            f"    - Negative:         {train_stats.get('avg_neg_memberships', 0):.1f}"
-        )
+        print(f"  Samples:           {train_stats.get('n_samples', 0)}")
+        print(f"  Avg individuals:   {train_stats.get('avg_individuals', 0):.1f}")
+        print(f"  Avg triples:       {train_stats.get('avg_triples', 0):.1f}")
+        print(f"    - Positive:      {train_stats.get('avg_pos_triples', 0):.1f}")
+        print(f"    - Negative:      {train_stats.get('avg_neg_triples', 0):.1f}")
+        print(f"  Avg memberships:   {train_stats.get('avg_memberships', 0):.1f}")
+        print(f"    - Positive:      {train_stats.get('avg_pos_mems', 0):.1f}")
+        print(f"    - Negative:      {train_stats.get('avg_neg_mems', 0):.1f}")
+        print(f"  Fact Types (Pos):")
+        print(f"    - Base Facts:    {train_stats.get('avg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {train_stats.get('avg_inferred_facts', 0):.1f}")
+        print(f"  Fact Types (Neg):")
+        print(f"    - Base Facts:    {train_stats.get('avg_neg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {train_stats.get('avg_neg_inferred_facts', 0):.1f}")
+        print(f"    - Propagated:    {train_stats.get('avg_neg_propagated_facts', 0):.1f}")
 
         print("\nTEST SET:")
-        print(f"  Samples:              {test_stats.get('n_samples', 0)}")
-        print(f"  Avg individuals:      {test_stats.get('avg_individuals', 0):.1f}")
-        print(f"  Avg total triples:    {test_stats.get('avg_triples', 0):.1f}")
-        print(f"    - Positive:         {test_stats.get('avg_pos_triples', 0):.1f}")
-        print(f"    - Negative:         {test_stats.get('avg_neg_triples', 0):.1f}")
-        print(f"  Avg memberships:      {test_stats.get('avg_memberships', 0):.1f}")
-        print(f"    - Positive:         {test_stats.get('avg_pos_memberships', 0):.1f}")
-        print(f"    - Negative:         {test_stats.get('avg_neg_memberships', 0):.1f}")
+        print(f"  Samples:           {test_stats.get('n_samples', 0)}")
+        print(f"  Avg individuals:   {test_stats.get('avg_individuals', 0):.1f}")
+        print(f"  Avg triples:       {test_stats.get('avg_triples', 0):.1f}")
+        print(f"    - Positive:      {test_stats.get('avg_pos_triples', 0):.1f}")
+        print(f"    - Negative:      {test_stats.get('avg_neg_triples', 0):.1f}")
+        print(f"  Avg memberships:   {test_stats.get('avg_memberships', 0):.1f}")
+        print(f"    - Positive:      {test_stats.get('avg_pos_mems', 0):.1f}")
+        print(f"    - Negative:      {test_stats.get('avg_neg_mems', 0):.1f}")
+        print(f"  Fact Types (Pos):")
+        print(f"    - Base Facts:    {test_stats.get('avg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {test_stats.get('avg_inferred_facts', 0):.1f}")
+        print(f"  Fact Types (Neg):")
+        print(f"    - Base Facts:    {test_stats.get('avg_neg_base_facts', 0):.1f}")
+        print(f"    - Inferred:      {test_stats.get('avg_neg_inferred_facts', 0):.1f}")
+        print(f"    - Propagated:    {test_stats.get('avg_neg_propagated_facts', 0):.1f}")
 
         print(f"{'=' * 80}\n")
 
@@ -513,25 +742,15 @@ def save_dataset_to_csv(
     prefix: str = "sample",
 ) -> None:
     """
-    Saves a dataset (list of KG samples) to CSV files.
+    Save dataset to CSV files.
 
-    Each sample is saved as a separate CSV file with format:
-        {output_dir}/{prefix}_{index}.csv
-
-    Each row represents one fact with columns:
+    Each sample saved as separate CSV with format:
         subject, predicate, object, label, fact_type
 
-    Where:
-        - subject: Individual name (e.g., "Ind_0")
-        - predicate: Relation/Attribute name or "rdf:type"
-        - object: Individual name, Class name, or literal value
-        - label: "1" for positive, "0" for negative
-        - fact_type: "triple", "membership", or "attribute"
-
     Args:
-        samples (List[KnowledgeGraph]): List of KG samples to save.
-        output_dir (str): Directory to save CSV files.
-        prefix (str): Prefix for file names.
+        samples: List of KG samples
+        output_dir: Directory to save files
+        prefix: Prefix for file names
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -543,9 +762,9 @@ def save_dataset_to_csv(
         kg.to_csv(str(file_path))
 
         if (idx + 1) % 100 == 0 or (idx + 1) == len(samples):
-            print(f"  Saved {idx + 1}/{len(samples)} samples")
+            print(f"  Saved {idx + 1}/{len(samples)}")
 
-    print(f"Dataset saved successfully to {output_dir}/")
+    print(f"Dataset saved to {output_dir}/")
 
 
 def load_dataset_from_csv(
@@ -554,29 +773,23 @@ def load_dataset_from_csv(
     n_samples: Optional[int] = None,
 ) -> List[KnowledgeGraph]:
     """
-    Loads a dataset from CSV files.
-
-    Reads all CSV files matching pattern:
-        {input_dir}/{prefix}_*.csv
+    Load dataset from CSV files.
 
     Args:
-        input_dir (str): Directory containing CSV files.
-        prefix (str): Prefix of file names to load.
-        n_samples (Optional[int]): Max number of samples to load (None = all).
+        input_dir: Directory containing CSV files
+        prefix: Prefix of files to load
+        n_samples: Max samples to load (None = all)
 
     Returns:
-        List[KnowledgeGraph]: Loaded KG samples.
+        List of loaded KG samples
     """
     input_path = Path(input_dir)
-
-    # Find all matching CSV files
     pattern = f"{prefix}_*.csv"
     csv_files = sorted(input_path.glob(pattern))
 
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found matching {input_dir}/{pattern}")
 
-    # Limit to n_samples if specified
     if n_samples is not None:
         csv_files = csv_files[:n_samples]
 
@@ -588,9 +801,9 @@ def load_dataset_from_csv(
         samples.append(kg)
 
         if (idx + 1) % 100 == 0 or (idx + 1) == len(csv_files):
-            print(f"  Loaded {idx + 1}/{len(csv_files)} samples")
+            print(f"  Loaded {idx + 1}/{len(csv_files)}")
 
-    print(f"Dataset loaded successfully from {input_dir}/")
+    print(f"Dataset loaded from {input_dir}/")
     return samples
 
 
@@ -600,11 +813,9 @@ def load_dataset_from_csv(
 
 
 def main():
-    """
-    Main entry point for dataset generation.
-    """
+    """Main entry point for dataset generation."""
     parser = argparse.ArgumentParser(
-        description="Generate RRN training/testing datasets from an ontology with constraint checking"
+        description="Generate KGE training/testing datasets from ontology"
     )
     parser.add_argument(
         "--ontology-path", type=str, required=True, help="Path to ontology file (.ttl)"
@@ -618,30 +829,24 @@ def main():
     parser.add_argument("--n-test", type=int, default=2, help="Number of test samples")
     parser.add_argument("--min-individuals", type=int, default=1)
     parser.add_argument("--max-individuals", type=int, default=1000)
+    parser.add_argument("--min-proofs-per-rule", type=int, default=5, help="Minimum number of proofs to select per rule per sample")
     parser.add_argument("--max-recursion", type=int, default=10)
     parser.add_argument("--global-max-depth", type=int, default=10)
-    parser.add_argument("--max-proofs-per-atom", type=int, default=10)
-
-    # Individual pooling arguments
+    parser.add_argument("--max-proofs-per-atom", type=int, default=30)
     parser.add_argument(
-        "--individual-pool-size",
-        type=int,
-        default=50,
-        help="Size of individual pool for reuse",
+        "--individual-pool-size", type=int, default=1000, help="Size of individual pool"
     )
     parser.add_argument(
         "--individual-reuse-prob",
         type=float,
-        default=0,
-        help="Probability of reusing vs creating new individual (0.0-1.0)",
+        default=0.2,
+        help="Probability of reusing individuals (0.0-1.0)",
     )
-
-    # Negative sampling arguments
     parser.add_argument(
         "--neg-strategy",
         type=str,
-        default="constrained",
-        choices=["random", "constrained", "proof_based", "type_aware"],
+        default="mixed",
+        choices=["random", "constrained", "proof_based", "type_aware", "mixed"],
         help="Negative sampling strategy",
     )
     parser.add_argument(
@@ -655,9 +860,18 @@ def main():
         action="store_true",
         help="For proof_based: corrupt base facts in proof trees",
     )
-
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--export-proofs",
+        action="store_true",
+        help="Export proof trees for all samples",
+    )
+    parser.add_argument(
+        "--export-graphs",
+        action="store_true",
+        help="Export graph visualizations for all samples",
+    )
 
     args = parser.parse_args()
 
@@ -674,6 +888,8 @@ def main():
         neg_corrupt_base_facts=args.neg_corrupt_base_facts,
         seed=args.seed,
         verbose=args.verbose,
+        export_proofs=args.export_proofs,
+        output_dir=args.output,
     )
 
     # Generate datasets
@@ -690,20 +906,32 @@ def main():
 
     print("\nDataset generation complete!")
 
-    print("\nVisualizing samples...")
-    visualizer = GraphVisualizer("train-test-graphs")
+    # Export Graphs (a few samples)
+    if args.export_graphs:
+        print("\nExporting all graph visualizations...")
+        graph_dir = os.path.join(args.output, "graphs")
+        os.makedirs(graph_dir, exist_ok=True)
 
-    for i, sample in enumerate(train_samples):
-        # Visualize Graph
-        visualizer.visualize(
-            sample, f"train_sample_{i + 1}.png", title=f"TRAIN Sample {i + 1}"
-        )
+        # Limit the number of visualizations to avoid excessive output
+        max_visualizations_train = min(3, len(train_samples))
+        max_visualizations_test = min(3, len(test_samples))
 
-    for i, sample in enumerate(test_samples):
-        # Visualize Graph
-        visualizer.visualize(
-            sample, f"test_sample_{i + 1}.png", title=f"TEST Sample {i + 1}"
-        )
+        subset_train_samples = random.sample(train_samples, max_visualizations_train)
+        subset_test_samples = random.sample(test_samples, max_visualizations_test)
+
+        for i, sample in enumerate(subset_train_samples):
+            sample.save_visualization(
+                output_path=graph_dir,
+                output_name=f"train_sample_{i}",
+                title=f"Train Sample {i}",
+            )
+
+        for i, sample in enumerate(subset_test_samples):
+            sample.save_visualization(
+                output_path=graph_dir,
+                output_name=f"test_sample_{i}",
+                title=f"Test Sample {i}",
+            )
 
 
 if __name__ == "__main__":

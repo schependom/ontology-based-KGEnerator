@@ -68,6 +68,8 @@ class OntologyParser:
         # Storage for parsed rules and constraints
         self.rules: List[ExecutableRule] = []  # Inference rules
         self.constraints: List[Constraint] = []  # Integrity constraints
+        # Storage for inverse property pairs (for loop detection in chainer)
+        self.inverse_properties: Dict[str, Set[str]] = defaultdict(set)
 
         # Storage for domain and range constraints (for negative sampling)
         self.domains: Dict[str, Set[str]] = defaultdict(
@@ -450,6 +452,10 @@ class OntologyParser:
         if isinstance(s, URIRef) and isinstance(o, URIRef):
             p1 = self._get_relation(s)
             p2 = self._get_relation(o)
+
+            # Store inverse relationship
+            self.inverse_properties[p1.name].add(p2.name)
+            self.inverse_properties[p2.name].add(p1.name)
 
             # Forward direction: P1 → P2
             rule1 = ExecutableRule(
