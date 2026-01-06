@@ -209,7 +209,8 @@ __marimo__/
 /ignore
 /proof-trees
 /output
-/data/out
+# ignore all subfolders of data
+/data/*
 
 .DS_Store
 .agent
