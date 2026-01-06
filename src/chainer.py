@@ -40,11 +40,13 @@ class BackwardChainer:
         self,
         all_rules: List[ExecutableRule],
         constraints: List[Constraint] = None,
+        inverse_properties: Dict[str, Set[str]] = None,
         max_recursion_depth: int = 2,
         global_max_depth: int = 5,
         max_proofs_per_atom: int = None,
         individual_pool_size: int = 50,
         individual_reuse_prob: float = 0.7,
+        use_signature_sampling: bool = True,
         verbose: bool = False,
         export_proof_visualizations: bool = False,
     ):
@@ -54,21 +56,25 @@ class BackwardChainer:
         Args:
             all_rules (List[ExecutableRule]):   All rules from the ontology parser.
             constraints (List[Constraint]):     All constraints from the ontology parser.
+            inverse_properties (Dict[str, Set[str]]): Mapping of inverse properties.
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
             global_max_depth (int):             Hard limit on total proof tree depth.
             max_proofs_per_atom (int):          Max number of proofs to generate for any single atom.
             individual_pool_size (int):         Number of individuals to keep in the pool for reuse.
             individual_reuse_prob (float):      Probability of reusing an existing individual from the pool.
+            use_signature_sampling (bool):      Whether to sample one proof per unique rule signature.
             verbose (bool):                     Enable detailed debug output.
             export_proof_visualizations (bool): Whether to export proof visualizations.
         """
         # Store rules as dict {rule_name: ExecutableRule} for fast lookup
         self.all_rules = {rule.name: rule for rule in all_rules}
         self.constraints = constraints if constraints else []
+        self.inverse_properties = inverse_properties if inverse_properties else {}
         self.max_recursion_depth = max_recursion_depth
         self.global_max_depth = global_max_depth
         self.max_proofs_per_atom = max_proofs_per_atom
+        self.use_signature_sampling = use_signature_sampling
         self.verbose = verbose
         self.export_proof_visualizations = export_proof_visualizations
 
@@ -625,7 +631,7 @@ class BackwardChainer:
         for premise in ground_premises:
             proof_list = list(
                 self._find_proofs_recursive(
-                    premise, recursive_use_counts, atoms_in_path, depth=1
+                    premise, recursive_use_counts, atoms_in_path, depth=1, parent_predicate=ground_goal.predicate
                 )
             )
 
@@ -682,6 +688,7 @@ class BackwardChainer:
         recursive_use_counts: frozenset[Tuple[str, int]],
         atoms_in_path: frozenset[Atom],
         depth: int = 0,
+        parent_predicate: Optional[Term] = None,
     ) -> Iterator[Proof]:
         """
         Recursively finds all possible proof trees for a given ground atom.
@@ -777,6 +784,20 @@ class BackwardChainer:
                 # Non-recursive rule - no change to counter
                 new_recursive_use_counts = recursive_use_counts
 
+            # INVERSE LOOP CHECK
+            # If the rule's conclusion predicate is the inverse of the parent goal's predicate,
+            # this is likely a trivial inverse loop step (e.g. hasParent -> hasChild -> hasParent).
+            # We prune this branch to avoid redundant proofs.
+            if parent_predicate and hasattr(original_rule.conclusion.predicate, "name"):
+                rule_pred_name = original_rule.conclusion.predicate.name
+                parent_pred_name = parent_predicate.name if hasattr(parent_predicate, "name") else str(parent_predicate)
+                
+                # Check if rule_pred is inverse of parent_pred
+                if parent_pred_name in self.inverse_properties.get(rule_pred_name, set()):
+                    if self.verbose:
+                        print(f"Skipping {original_rule.name} (inverse loop: {rule_pred_name} is inverse of {parent_pred_name})")
+                    continue
+
             # Rename rule variables to avoid collisions
             rule = self._rename_rule_vars(original_rule)
 
@@ -866,6 +887,7 @@ class BackwardChainer:
                         new_recursive_use_counts,
                         new_atoms_in_path,
                         depth=depth + 1,
+                        parent_predicate=goal_atom.predicate,
                     )
                 )
 
@@ -880,23 +902,68 @@ class BackwardChainer:
                 continue  # Try next rule
 
             # Yield all combinations of sub-proofs (Cartesian product)
-            for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
-                yield Proof.create_derived_proof(
-                    goal=goal_atom,
-                    rule=original_rule,  # Use unrenamed rule
-                    sub_proofs=list(sub_proof_combination),
-                    substitutions=rule_subst,
-                )
-                yielded_count += 1
-                if (
-                    self.max_proofs_per_atom
-                    and yielded_count >= self.max_proofs_per_atom
-                ):
-                    if self.verbose:
-                        print(
-                            f"Max proofs per atom reached ({self.max_proofs_per_atom}) for goal: {goal_atom}"
-                        )
-                    return
+            # WITH PATH SIGNATURE SAMPLING (OPTIONAL)
+            
+            if self.use_signature_sampling:
+                generated_proofs = []
+                # BUFFER LIMIT: Prevent OOM if millions of combinations exist
+                MAX_BUFFER_SIZE = 1000 
+                
+                for idx, sub_proof_combination in enumerate(itertools.product(*premise_sub_proof_iters)):
+                    if idx >= MAX_BUFFER_SIZE:
+                        if self.verbose:
+                            print(f"  [WARN] Hit buffer limit ({MAX_BUFFER_SIZE}) for rule {original_rule.name}")
+                        break
+                        
+                    new_proof = Proof.create_derived_proof(
+                        goal=goal_atom,
+                        rule=original_rule,  # Use unrenamed rule
+                        sub_proofs=list(sub_proof_combination),
+                        substitutions=rule_subst,
+                    )
+                    generated_proofs.append(new_proof)
+
+                # Group by signature
+                signature_groups = defaultdict(list)
+                for p in generated_proofs:
+                    sig = self._get_proof_signature(p)
+                    signature_groups[sig].append(p)
+                
+                # Sample one from each group
+                for sig, proofs_in_group in signature_groups.items():
+                    selected_proof = random.choice(proofs_in_group)
+                    yield selected_proof
+                    yielded_count += 1
+                    
+                    if (
+                        self.max_proofs_per_atom
+                        and yielded_count >= self.max_proofs_per_atom
+                    ):
+                        if self.verbose:
+                            print(
+                                f"Max proofs per atom reached ({self.max_proofs_per_atom}) for goal: {goal_atom}"
+                            )
+                        return
+            else:
+                # STANDARD GENERATION (No grouping, direct yield)
+                for sub_proof_combination in itertools.product(*premise_sub_proof_iters):
+                    yield Proof.create_derived_proof(
+                        goal=goal_atom,
+                        rule=original_rule,  # Use unrenamed rule
+                        sub_proofs=list(sub_proof_combination),
+                        substitutions=rule_subst,
+                    )
+                    yielded_count += 1
+                    
+                    if (
+                        self.max_proofs_per_atom
+                        and yielded_count >= self.max_proofs_per_atom
+                    ):
+                        if self.verbose:
+                            print(
+                                f"Max proofs per atom reached ({self.max_proofs_per_atom}) for goal: {goal_atom}"
+                            )
+                        return
 
     def _is_substitution_valid(
         self, subst: Dict[Var, Term], rule: ExecutableRule
@@ -970,6 +1037,21 @@ class BackwardChainer:
         # A new individual is unlikely to violate constraints with existing ones
         return self._get_individual(reuse=False)
 
+    def _get_proof_signature(self, proof: Proof) -> Tuple[str, ...]:
+        """
+        Generates a signature for a proof based on the sequence of rules used.
+        The signature is a sorted tuple of rule names involved in the proof.
+        This ignores specific variable bindings, grouping structurally identical proofs.
+        """
+        rules = []
+        if proof.rule:
+            rules.append(proof.rule.name)
+        
+        for sub_proof in proof.sub_proofs:
+            rules.extend(self._get_proof_signature(sub_proof))
+            
+        return tuple(sorted(rules))
+        
     # def _format_atom(self, atom: Atom) -> str:
     #     """
     #     Helper to format atom for debug output.

@@ -93,7 +93,6 @@ python src/create_data.py \
 In order to manually (and visually) verify that the proofs, facts and negative examples are correct, we can generate a single Knowledge Graph that attempts to contain **all possible facts** and **all possible proofs** derivable from a toy ontology (within finite bounds).
 
 ```bash
-
 python src/generate.py \
     --ontology-path data/toy.ttl \
     --neg-strategy proof_based \

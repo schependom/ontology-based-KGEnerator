@@ -321,6 +321,7 @@ class KnowledgeGraph:
                     "object": membership.cls.name,
                     "label": "1" if membership.is_member else "0",
                     "fact_type": "membership",
+                    "is_inferred": "1" if membership.is_inferred else "0",
                 }
             )
 
@@ -333,6 +334,7 @@ class KnowledgeGraph:
                     "object": triple.object.name,
                     "label": "1" if triple.positive else "0",
                     "fact_type": "triple",
+                    "is_inferred": "1" if triple.is_inferred else "0",
                 }
             )
 
@@ -345,13 +347,14 @@ class KnowledgeGraph:
                     "object": str(attr_triple.value),  # Convert literal to string
                     "label": "1",  # Attributes are always positive
                     "fact_type": "attribute",
+                    "is_inferred": "1" if attr_triple.is_inferred else "0",
                 }
             )
 
         # Write to CSV
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             if rows:
-                fieldnames = ["subject", "predicate", "object", "label", "fact_type"]
+                fieldnames = ["subject", "predicate", "object", "label", "fact_type", "is_inferred"]
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
@@ -435,18 +438,32 @@ class KnowledgeGraph:
                 object_name = row["object"]
                 label = row["label"] == "1"  # Convert to boolean
                 fact_type = row["fact_type"]
+                is_inferred = row.get("is_inferred", "0") == "1"
+
+                # Helper to create dummy proof if inferred
+                proofs = []
+                if is_inferred:
+                    # Create a dummy proof so that .is_inferred property returns True
+                    # We need a dummy rule and goal
+                    dummy_rule = ExecutableRule(name="LOADED_FROM_CSV", conclusion=None, premises=[])
+                    # Goal is not strictly needed for is_inferred check, but good for completeness
+                    # We'll just leave it None or minimal for now as we don't have the Atom easily available here without reconstruction
+                    # The property only checks: any(p.rule is not None for p in self.proofs)
+                    dummy_atom = Atom("dummy_s", "dummy_p", "dummy_o")
+                    dummy_proof = Proof(goal=dummy_atom, rule=dummy_rule, sub_proofs=[]) 
+                    proofs.append(dummy_proof)
 
                 # Reconstruct based on fact type
                 if fact_type == "membership":
                     # Class membership: (Individual, rdf:type, Class)
                     individual = get_or_create_individual(subject_name)
-                    cls = get_or_create_class(object_name)
+                    cls_obj = get_or_create_class(object_name)
 
                     membership = Membership(
                         individual=individual,
-                        cls=cls,
+                        cls=cls_obj,
                         is_member=label,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     memberships.append(membership)
 
@@ -461,7 +478,7 @@ class KnowledgeGraph:
                         predicate=predicate,
                         object=obj,
                         positive=label,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     triples.append(triple)
 
@@ -477,7 +494,7 @@ class KnowledgeGraph:
                         subject=subject,
                         predicate=predicate,
                         value=value,
-                        proofs=[],
+                        proofs=list(proofs),
                     )
                     attribute_triples.append(attr_triple)
 

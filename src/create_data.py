@@ -52,6 +52,7 @@ class KGEDatasetGenerator:
         neg_corrupt_base_facts: bool,
         verbose: bool,
         seed: Optional[int] = None,
+        use_signature_sampling: bool = True,
         export_proofs: bool = False,
         output_dir: str = None,
     ):
@@ -70,6 +71,7 @@ class KGEDatasetGenerator:
             neg_corrupt_base_facts: Whether to corrupt base facts
             verbose: Enable detailed logging
             seed: Random seed for reproducibility
+            use_signature_sampling: Enable signature sampling in chainer
             export_proofs: Whether to export proof visualizations
             output_dir: Directory to save visualizations
         """
@@ -91,6 +93,7 @@ class KGEDatasetGenerator:
             max_proofs_per_atom=max_proofs_per_atom,
             individual_pool_size=individual_pool_size,
             individual_reuse_prob=individual_reuse_prob,
+            use_signature_sampling=use_signature_sampling,
             verbose=False,  # Keep generator quiet during batch generation
             export_proof_visualizations=export_proofs,
         )
@@ -333,13 +336,24 @@ class KGEDatasetGenerator:
         atoms_found = False
 
         for rule in selected_rules:
-            proofs = self.generator.generate_proofs_for_rule(rule.name, max_proofs=None)
+            # Generate proofs with Instance Looping for volume
+            # Randomly decide how many "instances" (chains) to generate for this rule
+            # e.g., generate 5-15 diverse root facts (Fathers) for this rule
+            n_instances_for_rule = random.randint(5, 15)  # Make configurable?
+            
+            proofs = self.generator.generate_proofs_for_rule(
+                rule.name, 
+                n_instances=n_instances_for_rule,
+                max_proofs=None
+            )
+            
             if not proofs:
                 continue
                 
             self.rule_success_count[rule.name] += 1
 
-            # Select random subset of proofs
+            # Select random subset of proofs if still too many
+            # But now we rely on n_instances to control volume mostly
             n_select = random.randint(
                 min(len(proofs), min_proofs_per_rule), min(len(proofs), 10000)
             )  # TODO: adjust max as needed

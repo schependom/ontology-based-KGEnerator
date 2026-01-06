@@ -199,22 +199,24 @@ class KGenerator:
         global_max_depth: int,
         max_proofs_per_atom: int,
         individual_pool_size: int,
-        individual_reuse_prob: float,
-        verbose: bool = False,
+        individual_reuse_prob: float = 0.7,
+        use_signature_sampling: bool = True,
+        verbose: bool = True,
         export_proof_visualizations: bool = False,
     ):
         """
-        Initialize generator with ontology and generation parameters.
+        Initializes the Knowledge Graph Generator.
 
         Args:
-            ontology_file: Path to .ttl ontology file
-            max_recursion: Maximum depth for recursive rules
-            global_max_depth: Hard limit on total proof tree depth
-            max_proofs_per_atom: Max proofs per atom (None = unlimited)
-            individual_pool_size: Size of individual reuse pool
-            individual_reuse_prob: Probability of reusing vs creating individuals
-            verbose: Enable detailed logging
-            export_proof_visualizations: Export proof trees for verification
+            ontology_file (str): Path to the OWL ontology file (.ttl).
+            max_recursion (int): Maximum recursion depth for rules.
+            global_max_depth (int): Hard limit on proof tree depth effectively.
+            max_proofs_per_atom (int): Max proofs to generate *per recursive step*.
+            individual_pool_size (int): Size of individual pool.
+            individual_reuse_prob (float): Probability of reuse.
+            use_signature_sampling (bool): Enable signature-based sampling in Chainer.
+            verbose (bool): Print debug info.
+            export_proof_visualizations (bool): Export GraphViz images.
         """
         self.verbose = verbose
         self.export_proof_visualizations = export_proof_visualizations
@@ -226,11 +228,13 @@ class KGenerator:
         self.chainer = BackwardChainer(
             all_rules=self.parser.rules,
             constraints=self.parser.constraints,
+            inverse_properties=self.parser.inverse_properties,
             max_recursion_depth=max_recursion,
             global_max_depth=global_max_depth,
             max_proofs_per_atom=max_proofs_per_atom,
             individual_pool_size=individual_pool_size,
             individual_reuse_prob=individual_reuse_prob,
+            use_signature_sampling=use_signature_sampling,
             verbose=verbose,
             export_proof_visualizations=export_proof_visualizations,
         )
@@ -243,35 +247,26 @@ class KGenerator:
     def generate_proofs_for_rule(
         self,
         rule_name: str,
-        max_proofs: Optional[int] = None,
+        n_instances: int = 1,
+        max_proofs: int = None,
     ) -> List[Proof]:
         """
-        Generate proof trees for a specific rule.
-
-        This is the main method called by create_data.py for sample generation.
+        Generates proofs for a specific rule by name.
 
         Args:
-            rule_name: Name of the rule to generate proofs for
-            max_proofs: Maximum number of proofs to generate (None = unlimited)
+            rule_name (str): The name of the rule to generate proofs for.
+            n_instances (int): Number of independent generation cycles (loops) to run for this rule.
+                               Higher values create more distinct facts (volume).
+            max_proofs (int): Maximum number of total proofs to return.
 
         Returns:
-            List of valid, constraint-checked proof trees
+            List[Proof]: A list of generated proof trees.
         """
         if rule_name not in self.chainer.all_rules:
             if self.verbose:
-                print(f"Warning: Rule '{rule_name}' not found")
+                print(f"Rule '{rule_name}' not found.")
             return []
 
-        proofs = []
-        proof_generator = self.chainer.generate_proof_trees(rule_name)
-
-        try:
-            for i, proof in enumerate(proof_generator):
-                if max_proofs is not None and i >= max_proofs:
-                    break
-                proofs.append(proof)
-
-        except Exception as e:
             print(f"Error generating proofs for {rule_name}: {e}")
             if self.verbose:
                 traceback.print_exc()
