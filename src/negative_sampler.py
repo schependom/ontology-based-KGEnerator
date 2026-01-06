@@ -153,7 +153,7 @@ class NegativeSampler:
             pos_triple = random.choice(positive_triples)
             neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
 
-            if neg_triple and not self._is_positive_fact(neg_triple, kg):
+            if neg_triple and self.is_valid_negative(neg_triple):
                 negative_triples.append(neg_triple)
 
         kg.triples.extend(negative_triples)
@@ -239,7 +239,7 @@ class NegativeSampler:
                 else:
                     continue
 
-            if not self._is_positive_fact(neg_triple, kg):
+            if self.is_valid_negative(neg_triple):
                 negative_triples.append(neg_triple)
 
         kg.triples.extend(negative_triples)
@@ -458,7 +458,7 @@ class NegativeSampler:
                                     )
                                     
                                     # Check if this new goal contradicts existing facts
-                                    if not self._is_positive_fact(neg_goal, kg):
+                                    if self.is_valid_negative(neg_goal):
                                         negative_triples.append(neg_goal)
                                         
                                         # VISUALIZATION: Export the propagated proof
@@ -533,7 +533,7 @@ class NegativeSampler:
                         corrupted_proof.save_visualization(full_path, format="pdf", root_label="INVALID FACT IF NEGATED")
                         exported_corrupted_count += 1
 
-            if neg_triple and not self._is_positive_fact(neg_triple, kg):
+            if neg_triple and self.is_valid_negative(neg_triple):
                 negative_triples.append(neg_triple)
 
         kg.triples.extend(negative_triples)
@@ -609,7 +609,7 @@ class NegativeSampler:
                 else:
                     continue
 
-            if not self._is_positive_fact(neg_triple, kg):
+            if self.is_valid_negative(neg_triple):
                 negative_triples.append(neg_triple)
 
         kg.triples.extend(negative_triples)
@@ -739,7 +739,7 @@ class NegativeSampler:
                                 neg_triple = self._corrupt_triple_random(matching_triples[0], kg.individuals, original_triple=matching_triples[0])
                                 if neg_triple: neg_triple.metadata["source_type"] = "base"
 
-            if neg_triple and not self._is_positive_fact(neg_triple, kg):
+            if neg_triple and self.is_valid_negative(neg_triple):
                 negative_triples.append(neg_triple)
                 self.strategy_usage[strategy] += 1
                 
@@ -948,11 +948,17 @@ class NegativeSampler:
 
         return candidates if candidates else individuals
 
-    def _is_positive_fact(self, neg_triple: Triple, kg: KnowledgeGraph) -> bool:
-        """Check if a negative triple conflicts with a positive fact."""
+    def is_valid_negative(self, neg_triple: Triple) -> bool:
+        """
+        Check if a candidate negative triple is valid.
+        
+        A negative fact is valid ONLY if it does not appear in the positive deductive closure.
+        Logic: is_valid_negative(candidate_triple) = candidate_triple NOT IN all_positive_triples
+        """
         # Optimized O(1) lookup
         key = f"{neg_triple.subject.name}|{neg_triple.predicate.name}|{neg_triple.object.name}"
-        return key in self.existing_triples
+        # If it IS in existing triples, it's a positive fact, so it's NOT a valid negative.
+        return key not in self.existing_triples
 
     def _is_positive_membership(self, neg_mem: Membership, kg: KnowledgeGraph) -> bool:
         """Check if a negative membership conflicts with a positive one."""

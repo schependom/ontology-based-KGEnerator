@@ -229,6 +229,8 @@ class KGenerator:
             all_rules=self.parser.rules,
             constraints=self.parser.constraints,
             inverse_properties=self.parser.inverse_properties,
+            domains=self.parser.domains,
+            ranges=self.parser.ranges,
             max_recursion_depth=max_recursion,
             global_max_depth=global_max_depth,
             max_proofs_per_atom=max_proofs_per_atom,
@@ -274,6 +276,11 @@ class KGenerator:
             # Note: We are iterating the generator to get the list of proofs for THIS instance
             # Each call to generate_proof_trees potentially creates new individuals if variables are unbound
             current_proofs = list(self.chainer.generate_proof_trees(rule_name))
+            
+            # Register proofs to update chainer state for reuse
+            for p in current_proofs:
+                self.chainer.register_proof(p)
+                
             all_proofs.extend(current_proofs)
             
             # Optimization: Check if we have enough
@@ -326,6 +333,7 @@ class KGenerator:
             top_level_proofs = 0
 
             for top_level_proof in proof_generator:
+                self.chainer.register_proof(top_level_proof)
                 top_level_proofs += 1
                 stats["proofs_accepted"] += 1
 

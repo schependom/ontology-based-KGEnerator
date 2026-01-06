@@ -41,11 +41,13 @@ class BackwardChainer:
         all_rules: List[ExecutableRule],
         constraints: List[Constraint] = None,
         inverse_properties: Dict[str, Set[str]] = None,
+        domains: Dict[str, Set[str]] = None,
+        ranges: Dict[str, Set[str]] = None,
         max_recursion_depth: int = 2,
         global_max_depth: int = 5,
         max_proofs_per_atom: int = None,
         individual_pool_size: int = 50,
-        individual_reuse_prob: float = 0.7,
+        individual_reuse_prob: float = 0.85,
         use_signature_sampling: bool = True,
         verbose: bool = False,
         export_proof_visualizations: bool = False,
@@ -57,6 +59,8 @@ class BackwardChainer:
             all_rules (List[ExecutableRule]):   All rules from the ontology parser.
             constraints (List[Constraint]):     All constraints from the ontology parser.
             inverse_properties (Dict[str, Set[str]]): Mapping of inverse properties.
+            domains (Dict[str, Set[str]]):      Mapping of property domains.
+            ranges (Dict[str, Set[str]]):       Mapping of property ranges.
             max_recursion_depth (int):          Max number of times a recursive rule
                                                 can be used in a single proof path.
             global_max_depth (int):             Hard limit on total proof tree depth.
@@ -71,6 +75,8 @@ class BackwardChainer:
         self.all_rules = {rule.name: rule for rule in all_rules}
         self.constraints = constraints if constraints else []
         self.inverse_properties = inverse_properties if inverse_properties else {}
+        self.domains = domains if domains else {}
+        self.ranges = ranges if ranges else {}
         self.max_recursion_depth = max_recursion_depth
         self.global_max_depth = global_max_depth
         self.max_proofs_per_atom = max_proofs_per_atom
@@ -83,6 +89,9 @@ class BackwardChainer:
         self.individual_reuse_prob = individual_reuse_prob
         self.individual_pool: List[Individual] = []
         self._individual_counter = 0
+
+        # Track types of individuals across proofs to prevent invalid reuse
+        self.committed_individual_types: Dict[Individual, Set[str]] = defaultdict(set)
 
         # Index rules and find recursive ones
         self.rules_by_head = self._index_rules(all_rules)
@@ -111,6 +120,7 @@ class BackwardChainer:
         - functional_properties: Set[Relation] - set of properties that must have unique values
         """
         self.disjoint_classes: Dict[Class, Set[Class]] = defaultdict(set)
+        self.disjoint_class_names: Dict[str, Set[str]] = defaultdict(set)
         self.irreflexive_properties: Set[Relation] = set()
         self.functional_properties: Set[Relation] = set()
 
@@ -123,6 +133,8 @@ class BackwardChainer:
                     if isinstance(c1, Class) and isinstance(c2, Class):
                         self.disjoint_classes[c1].add(c2)
                         self.disjoint_classes[c2].add(c1)  # Symmetric
+                        self.disjoint_class_names[c1.name].add(c2.name)
+                        self.disjoint_class_names[c2.name].add(c1.name)
 
             elif constraint.constraint_type == OWL.IrreflexiveProperty:
                 # constraint.terms = [Property, Var('X')]
@@ -292,7 +304,7 @@ class BackwardChainer:
         # Create new individual
         idx = self._individual_counter
         self._individual_counter += 1
-        ind = Individual(index=idx, name=f"Ind_{idx}")
+        ind = Individual(index=idx, name=f"{self.individual_name_prefix}{idx}")
 
         # Add to pool if not full
         if len(self.individual_pool) < self.individual_pool_size:
@@ -300,11 +312,13 @@ class BackwardChainer:
 
         return ind
 
-    def reset_individual_pool(self):
+    def reset_individual_pool(self, name_prefix: str = "Ind_"):
         """Resets the individual pool (call between samples)."""
         self.individual_pool = []
         self._individual_counter = 0
         self._functional_property_values = {}
+        self.committed_individual_types = defaultdict(set)
+        self.individual_name_prefix = name_prefix
 
     def _rename_rule_vars(self, rule: ExecutableRule) -> ExecutableRule:
         """
@@ -671,7 +685,8 @@ class BackwardChainer:
                 if self.export_proof_visualizations:
                     # write out the valid proof
                     complete_proof.save_visualization(
-                        f"proof-trees/{start_rule_name}_{valid_proof_count}",
+                start_rule_name,
+                        valid_proof_count,
                         "pdf",
                         f"Proof #{valid_proof_count} for {ground_goal}",
                     )
@@ -681,6 +696,28 @@ class BackwardChainer:
                 print(
                     f"  ✗ Proof {proof_count} for {ground_goal} rejected due to constraint violation"
                 )
+
+    def register_proof(self, proof: Proof) -> None:
+        """
+        Registers a valid proof and updates individual type tracking.
+        Should be called when a proof is accepted into the dataset.
+        """
+        atoms = self._collect_all_atoms(proof)
+        for atom in atoms:
+            # Track class memberships
+            if atom.predicate == RDF.type and isinstance(atom.object, Class):
+                if isinstance(atom.subject, Individual):
+                    self.committed_individual_types[atom.subject].add(atom.object.name)
+            
+            # Track inferred types from domain/range
+            elif isinstance(atom.predicate, Relation):
+                if isinstance(atom.subject, Individual):
+                    domains = self.domains.get(atom.predicate.name, set())
+                    self.committed_individual_types[atom.subject].update(domains)
+                
+                if isinstance(atom.object, Individual):
+                    ranges = self.ranges.get(atom.predicate.name, set())
+                    self.committed_individual_types[atom.object].update(ranges)
 
     def _find_proofs_recursive(
         self,
@@ -1021,12 +1058,22 @@ class BackwardChainer:
     ) -> Term:
         """
         Tries to get an individual that doesn't violate constraints when added to substitution.
+        
+        Checks:
+        1. Domain/Range constraints against previously committed types (prevent invalid reuse)
+        2. Rule-local constraints (Irreflexive, Functional) via _is_substitution_valid
         """
+        required_classes = self._get_required_classes(var, rule)
+        
         # Try to reuse first
         for _ in range(10):  # Try 10 times to reuse
             ind = self._get_individual(reuse=True)
 
-            # Check if this individual causes a violation
+            # Check 1: Domain/Range consistency with committed types
+            if not self._is_individual_compatible(ind, required_classes):
+                continue
+            
+            # Check 2: Rule-local constraints
             temp_subst = current_subst.copy()
             temp_subst[var] = ind
 
@@ -1036,6 +1083,46 @@ class BackwardChainer:
         # If reuse fails, force a new individual (reuse=False)
         # A new individual is unlikely to violate constraints with existing ones
         return self._get_individual(reuse=False)
+
+    def _get_required_classes(self, var: Var, rule: ExecutableRule) -> Set[str]:
+        """Determine required classes for a variable based on domain/range usage in rule."""
+        required = set()
+        
+        # Check usage in premises and conclusion
+        # Atoms in premises imply requirements for the variable
+        # Atoms in conclusion imply what we are asserting (if we are proving the conclusion, the subject/object MUST also satisfy domain/range)
+        for atom in rule.premises + [rule.conclusion]:
+            if isinstance(atom.predicate, Relation):
+                if atom.subject == var:
+                     required.update(self.domains.get(atom.predicate.name, set()))
+                if atom.object == var:
+                     required.update(self.ranges.get(atom.predicate.name, set()))
+            elif atom.predicate == RDF.type and atom.subject == var:
+                 if isinstance(atom.object, Class):
+                     required.add(atom.object.name)
+        return required
+
+    def _is_individual_compatible(self, ind: Individual, required_classes: Set[str]) -> bool:
+        """Check if individual is compatible with required classes (no disjointness violation)."""
+        existing_types = self.committed_individual_types.get(ind, set())
+        
+        # If no requirements or no existing types, compatible
+        if not required_classes or not existing_types:
+            return True
+            
+        for req_cls_name in required_classes:
+            # Check if req_cls is disjoint with any existing type
+            # disjoint_class_names maps class_name -> set of disjoint class names
+            disjoint_with = self.disjoint_class_names.get(req_cls_name, set())
+            
+            # Intersection of existing types and disjoint set
+            if not existing_types.isdisjoint(disjoint_with):
+                if self.verbose:
+                    conflict = existing_types.intersection(disjoint_with)
+                    # print(f"[Constraint] Reuse rejected: {ind.name} is {existing_types}, required {req_cls_name} (disjoint with {conflict})")
+                return False
+                
+        return True
 
     def _get_proof_signature(self, proof: Proof) -> Tuple[str, ...]:
         """

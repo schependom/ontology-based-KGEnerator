@@ -244,12 +244,14 @@ class Validator:
                     G.add_edge(t.subject.name, t.object.name)
             
             # Check connected components
-            # Note: It's okay to have disconnected components in some KGs, 
-            # but usually we want a connected graph for training.
-            # We'll just warn if it's very fragmented (e.g., singleton nodes).
             if len(G.nodes) > 0:
                 components = list(nx.connected_components(G))
-                if len(components) > len(G.nodes) / 2: # Heuristic: >50% disconnected
-                    errors.append(f"Triviality: Graph is highly fragmented ({len(components)} components for {len(G.nodes)} nodes)")
+                largest_cc_size = max(len(c) for c in components)
+                ratio = largest_cc_size / len(G.nodes)
+                
+                # Check if LCC is too small (graph too fragmented)
+                # We want at least 80% of nodes to be in the main component for a healthy KG
+                if ratio < 0.8:
+                    errors.append(f"Wrapper: Graph is fragmented (LCC covers {ratio:.1%} of {len(G.nodes)} nodes). Ideal > 80%")
 
         return errors

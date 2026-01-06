@@ -243,7 +243,9 @@ class KGEDatasetGenerator:
         
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
             # Reset individual pool for each sample
-            self.generator.chainer.reset_individual_pool()
+            # INDUCTIVE SPLIT: Use different individual name prefix for Test set
+            prefix = "TestInd_" if sample_type == "TEST" else "Ind_"
+            self.generator.chainer.reset_individual_pool(name_prefix=prefix)
 
             sample = self._generate_one_sample(
                 min_individuals=min_individuals,
@@ -830,7 +832,7 @@ def main():
     parser.add_argument("--min-individuals", type=int, default=1)
     parser.add_argument("--max-individuals", type=int, default=1000)
     parser.add_argument("--min-proofs-per-rule", type=int, default=5, help="Minimum number of proofs to select per rule per sample")
-    parser.add_argument("--max-recursion", type=int, default=10)
+    parser.add_argument("--max-recursion", type=int, default=4)
     parser.add_argument("--global-max-depth", type=int, default=10)
     parser.add_argument("--max-proofs-per-atom", type=int, default=30)
     parser.add_argument(
@@ -839,7 +841,7 @@ def main():
     parser.add_argument(
         "--individual-reuse-prob",
         type=float,
-        default=0.2,
+        default=0.85,
         help="Probability of reusing individuals (0.0-1.0)",
     )
     parser.add_argument(
@@ -852,7 +854,7 @@ def main():
     parser.add_argument(
         "--neg-ratio",
         type=float,
-        default=1.0,
+        default=10.0,
         help="Ratio of negative to positive samples",
     )
     parser.add_argument(
