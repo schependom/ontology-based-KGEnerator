@@ -9,7 +9,8 @@ This generator addresses the challenge of evaluating KGE models on reasoning tas
 ### Mathematical Formulation
 
 Let $\Sigma = (\mathcal{S}, \mathcal{R})$ be an ontology, where $\mathcal{S}$ is the schema (classes, relations) and $\mathcal{R}$ is a set of Horn-like rules. A rule $r \in \mathcal{R}$ has the form:
-$$ \text{body}_1 \land \text{body}_2 \land \dots \land \text{body}_n \implies \text{head} $$
+
+$$\text{body}_1 \land \text{body}_2 \land \dots \land \text{body}_n \implies \text{head}$$
 
 The generation process $\mathcal{G}(\Sigma) \to \mathcal{K}$ follows these steps:
 

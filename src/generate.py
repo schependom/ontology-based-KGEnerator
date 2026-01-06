@@ -267,11 +267,22 @@ class KGenerator:
                 print(f"Rule '{rule_name}' not found.")
             return []
 
-            print(f"Error generating proofs for {rule_name}: {e}")
-            if self.verbose:
-                traceback.print_exc()
+        all_proofs = []
+        
+        for _ in range(n_instances):
+            # Generate proofs
+            # Note: We are iterating the generator to get the list of proofs for THIS instance
+            # Each call to generate_proof_trees potentially creates new individuals if variables are unbound
+            current_proofs = list(self.chainer.generate_proof_trees(rule_name))
+            all_proofs.extend(current_proofs)
+            
+            # Optimization: Check if we have enough
+            if max_proofs and len(all_proofs) >= max_proofs:
+                break
 
-        return proofs
+        if max_proofs:
+            return all_proofs[:max_proofs]
+        return all_proofs
 
     def generate_full_graph(self) -> KnowledgeGraph:
         """

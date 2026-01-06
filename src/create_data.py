@@ -17,7 +17,7 @@ import random
 import argparse
 import os
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import networkx as nx
 from tqdm import tqdm
 
