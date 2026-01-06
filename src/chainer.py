@@ -51,6 +51,7 @@ class BackwardChainer:
         use_signature_sampling: bool = True,
         verbose: bool = False,
         export_proof_visualizations: bool = False,
+        entity_prefix: str = "Ind_",
     ):
         """
         Initializes the chainer.
@@ -89,6 +90,7 @@ class BackwardChainer:
         self.individual_reuse_prob = individual_reuse_prob
         self.individual_pool: List[Individual] = []
         self._individual_counter = 0
+        self.individual_name_prefix = entity_prefix
 
         # Track types of individuals across proofs to prevent invalid reuse
         self.committed_individual_types: Dict[Individual, Set[str]] = defaultdict(set)

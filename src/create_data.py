@@ -244,7 +244,7 @@ class KGEDatasetGenerator:
         while len(samples) < n_samples and failed_attempts < max_failed_attempts:
             # Reset individual pool for each sample
             # INDUCTIVE SPLIT: Use different individual name prefix for Test set
-            prefix = "TestInd_" if sample_type == "TEST" else "Ind_"
+            prefix = "test_" if sample_type == "TEST" else "train_"
             self.generator.chainer.reset_individual_pool(name_prefix=prefix)
 
             sample = self._generate_one_sample(
@@ -769,6 +769,43 @@ def save_dataset_to_csv(
     print(f"Dataset saved to {output_dir}/")
 
 
+def save_explanations(
+    samples: List[KnowledgeGraph], 
+    output_dir: str, 
+    filename: str = "negatives_explanations.csv"
+) -> None:
+    """
+    Save explanations for negative samples to a separate CSV.
+    Format: sample_id, subject, predicate, object, explanation
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    file_path = output_path / filename
+    
+    print(f"Saving negative explanations to {file_path}")
+    
+    with open(file_path, "w", encoding="utf-8") as f:
+        # Header
+        f.write("sample_id,subject,predicate,object,explanation\n")
+        
+        count = 0
+        for idx, kg in enumerate(samples):
+            sample_id = f"sample_{idx:05d}"
+            
+            for t in kg.triples:
+                if not t.positive and "explanation" in t.metadata:
+                    # Escape CSV fields
+                    expl = t.metadata["explanation"].replace('"', '""')
+                    subj = getattr(t.subject, "name", str(t.subject))
+                    pred = getattr(t.predicate, "name", str(t.predicate))
+                    obj = getattr(t.object, "name", str(t.object))
+                    
+                    f.write(f'{sample_id},{subj},{pred},{obj},"{expl}"\n')
+                    count += 1
+                    
+    print(f"Saved {count} explanations.")
+
+
 def load_dataset_from_csv(
     input_dir: str,
     prefix: str = "sample",
@@ -904,7 +941,10 @@ def main():
 
     # Save to CSV
     save_dataset_to_csv(train_samples, f"{args.output}/train", prefix="train_sample")
+    save_explanations(train_samples, f"{args.output}/train")
+    
     save_dataset_to_csv(test_samples, f"{args.output}/test", prefix="test_sample")
+    save_explanations(test_samples, f"{args.output}/test")
 
     print("\nDataset generation complete!")
 

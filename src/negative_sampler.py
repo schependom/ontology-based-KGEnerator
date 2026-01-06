@@ -368,6 +368,9 @@ class NegativeSampler:
                 neg_triple = self._corrupt_triple_random(pos_triple, kg.individuals, original_triple=pos_triple)
                 if neg_triple:
                     neg_triple.metadata["source_type"] = "inferred" # Explicitly inferred since we target goal
+                    neg_triple.metadata["explanation"] = self._generate_explanation(
+                        pos_triple, neg_triple, "Corrupted Goal (Leaf)"
+                    )
             else:
                 # Corrupt a base fact from the proof
                 # This creates a negative that would break the inference chain
@@ -392,6 +395,9 @@ class NegativeSampler:
                     )
                     if neg_triple:
                         neg_triple.metadata["source_type"] = "base" # Explicitly base since we target base fact
+                        neg_triple.metadata["explanation"] = self._generate_explanation(
+                            base_triple, neg_triple, f"Corrupted Base Fact in proof for {pos_triple}"
+                        )
 
                     propagated_exported = False
 
@@ -454,7 +460,15 @@ class NegativeSampler:
                                         object=new_goal_atom.object,
                                         positive=False,
                                         proofs=[],
-                                        metadata={"source_type": "propagated_inferred"}
+                                        metadata={
+                                            "source_type": "propagated_inferred",
+                                            "explanation": (
+                                                f"Propagated from corrupted base fact "
+                                                f"({base_triple.subject.name} {base_triple.predicate.name} {base_triple.object.name} "
+                                                f"-> {neg_triple.subject.name} {neg_triple.predicate.name} {neg_triple.object.name}) "
+                                                f"via Rule {proof.rule.name if proof.rule else 'Unknown'}"
+                                            )
+                                        }
                                     )
                                     
                                     # Check if this new goal contradicts existing facts
@@ -796,6 +810,25 @@ class NegativeSampler:
             return Triple(
                 triple.subject, triple.predicate, new_obj, positive=False, proofs=[], metadata=metadata
             )
+
+    def _generate_explanation(self, original: Triple, corrupted: Triple, context: str) -> str:
+        """Helper to generate a human-readable explanation of the corruption."""
+        def get_name(term):
+            return getattr(term, "name", str(term))
+            
+        orig_s, orig_p, orig_o = get_name(original.subject), get_name(original.predicate), get_name(original.object)
+        curr_s, curr_p, curr_o = get_name(corrupted.subject), get_name(corrupted.predicate), get_name(corrupted.object)
+        
+        diff = []
+        if orig_s != curr_s:
+            diff.append(f"Subject: {orig_s} -> {curr_s}")
+        if orig_p != curr_p:
+            diff.append(f"Predicate: {orig_p} -> {curr_p}")
+        if orig_o != curr_o:
+            diff.append(f"Object: {orig_o} -> {curr_o}")
+            
+        diff_str = ", ".join(diff)
+        return f"{context}: {diff_str}"
 
     def _corrupt_membership_random(
         self, membership: Membership, classes: List[Class], original_membership: Membership = None
